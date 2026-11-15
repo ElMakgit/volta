@@ -901,11 +901,12 @@ impl App {
             ui.add_space(14.0);
             ui.separator();
             ui.add_space(8.0);
-            ui.label(RichText::new(self.t(if plan.choices.len() == 1 {
-                "plan.title.one"
-            } else {
-                "plan.title"
-            })).size(15.0).strong().color(fg));
+            let title_key = match plan.choices.len() {
+                1 => "plan.title.one",
+                2 => "plan.title.two",
+                _ => "plan.title",
+            };
+            ui.label(RichText::new(self.t(title_key)).size(15.0).strong().color(fg));
             ui.add_space(6.0);
 
             let mut pick = None;

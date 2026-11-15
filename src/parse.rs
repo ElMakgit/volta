@@ -427,9 +427,6 @@ pub fn parse(raw: &str) -> Parse {
     let action = action_groups
         .iter()
         .find_map(|(a, g)| (!hits(&text, g).is_empty()).then_some(*a));
-    if let Some(a) = action {
-        understood.push(a.label());
-    }
 
     let semantic = crate::templates::route(load, input);
     // A named lesson from the course books is more specific than the generic
@@ -448,6 +445,11 @@ pub fn parse(raw: &str) -> Parse {
     }
     if let Some(i) = lesson {
         understood.push(crate::lessons::ALL[i].title);
+    }
+    // The verb comes after the thing it applies to: "датчик газа · мигание"
+    // reads better than the other way round.
+    if let Some(a) = action {
+        understood.push(a.label());
     }
 
     // A sentence that names only an input still builds when the plan really

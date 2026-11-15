@@ -2121,6 +2121,8 @@ const ALIASES: &[(&str, usize)] = &[
 pub const PHOTORESISTOR: usize = 9;
 /// The PWM fade lesson in [`ALL`].
 pub const PWM: usize = 1;
+/// The MQ-2 gas sensor lesson.
+pub const GAS: usize = 13;
 
 /// The thermistor/DS18B20 lesson in [`ALL`].
 pub const THERMISTOR: usize = 10;
@@ -2143,35 +2145,66 @@ pub fn find(text: &str) -> Option<usize> {
 /// wins over an alias.
 pub fn find_with(text: &str, aliases: bool) -> Option<usize> {
     let text = crate::words::normalize(text);
-    find_pass(&text, false).or_else(|| if aliases { find_pass(&text, true) } else { None })
+    let exact = find_pass(&text, false);
+    // A first pass may have matched only an action word ("мигает" in the
+    // blink lesson). Before settling for that, let the everyday names vote:
+    // "датчик света, который мигает" is about the photoresistor, and a
+    // generic verb must not hide the part the sentence actually names.
+    if exact.map(|(score, _)| score.0 > 0).unwrap_or(false) {
+        return exact.map(|(_, i)| i);
+    }
+    if aliases {
+        if let Some((score, i)) = find_pass(&text, true) {
+            if score.0 > 0 || exact.is_none() {
+                return Some(i);
+            }
+        }
+    }
+    exact.map(|(_, i)| i)
 }
 
-fn find_pass(text: &str, aliases: bool) -> Option<usize> {
-    let mut best: Option<((usize, usize), usize)> = None;
+/// Keys that name an action rather than a part. A lesson matched only by one
+/// of these must not beat a lesson whose own sensor was named: "датчик газа,
+/// который мигает" is about the gas sensor, not about blinking in general.
+const GENERIC_KEYS: &[&str] = &["мигает", "плавн", "свечен"];
+
+fn find_pass(text: &str, aliases: bool) -> Option<((usize, usize, usize), usize)> {
+    // Score: a part name first, then the number of hits, then the longest
+    // word. Without the first component an action word ("мигает" in the LED
+    // lesson) would outrank "газ" from the gas lesson on length alone.
+    let mut best: Option<((usize, usize, usize), usize)> = None;
     for (i, lesson) in ALL.iter().enumerate() {
+        let mut specific = 0;
         let mut hits = 0;
         let mut longest = 0;
         for key in lesson.keys {
             if crate::words::mentions(text, key) {
                 hits += 1;
                 longest = longest.max(key.len());
+                if !GENERIC_KEYS.contains(key) {
+                    specific += 1;
+                }
             }
         }
         if aliases {
             for (word, target) in ALIASES {
                 if *target == i && crate::words::mentions(text, word) {
                     hits += 1;
+                    specific += 1;
                 }
             }
         }
         if hits == 0 {
             continue;
         }
-        if best.map(|(score, _)| (hits, longest) > score).unwrap_or(true) {
-            best = Some(((hits, longest), i));
+        if best
+            .map(|(score, _)| (specific, hits, longest) > score)
+            .unwrap_or(true)
+        {
+            best = Some(((specific, hits, longest), i));
         }
     }
-    best.map(|(_, i)| i)
+    best
 }
 
 #[cfg(test)]

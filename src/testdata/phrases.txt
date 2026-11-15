@@ -334,6 +334,11 @@ gas sensor | lesson:13
 color sensor | lesson:50
 humidity sensor | lesson:11
 pressure sensor | lesson:12
+датчик газа который мигает когда много газа | lesson:13
+газовый датчик мигает лампой | lesson:13
+mq-2 включает светодиод при газе | lesson:13
+датчик газа и светодиод | lesson:13
+датчик света который мигает | lesson:9
 
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse
