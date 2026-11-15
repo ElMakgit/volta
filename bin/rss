@@ -1,0 +1,70 @@
+#!/usr/bin/env sh
+# Check the memory budget.
+#
+# Launches the app on X11/XWayland, zooms the bench in and out a hundred times
+# and fails if the resident set ever passes 150 MiB. Zooming is what used to
+# grow the glyph atlas, so it is the honest stress test for this window.
+#
+# Usage: bin/rss [limit-in-MiB]
+set -eu
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+bin="$here/target/release/volta"
+limit=${1:-150}
+limit_kb=$((limit * 1024))
+
+if [ ! -x "$bin" ]; then
+    echo "build first: $bin is missing" >&2
+    exit 1
+fi
+
+export DISPLAY=${DISPLAY:-:0}
+unset WAYLAND_DISPLAY
+
+log=${TMPDIR:-/tmp}/volta-rss.log
+setsid env VOLTA_FULLSCREEN=1 VOLTA_MODE=manual "$bin" >"$log" 2>&1 </dev/null &
+sleep 5
+
+pid=$(pgrep -n -x volta || true)
+if [ -z "$pid" ]; then
+    echo "the app did not start, see $log" >&2
+    exit 1
+fi
+
+peak=0
+sample() {
+    rss=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
+    if [ -n "$rss" ] && [ "$rss" -gt "$peak" ]; then
+        peak=$rss
+    fi
+}
+
+sample
+if command -v xdotool >/dev/null 2>&1; then
+    xdotool mousemove 1100 500 >/dev/null 2>&1 || true
+    i=0
+    while [ "$i" -lt 120 ]; do
+        if [ $((i % 2)) -eq 0 ]; then
+            xdotool click 4 >/dev/null 2>&1 || true
+        else
+            xdotool click 5 >/dev/null 2>&1 || true
+        fi
+        sample
+        sleep 0.05
+        i=$((i + 1))
+    done
+else
+    echo "xdotool is missing: measuring an idle window" >&2
+fi
+
+sleep 2
+sample
+
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+
+printf 'peak RSS: %s MiB (limit %s MiB)\n' "$((peak / 1024))" "$limit"
+if [ "$peak" -gt "$limit_kb" ]; then
+    echo "over budget" >&2
+    exit 1
+fi

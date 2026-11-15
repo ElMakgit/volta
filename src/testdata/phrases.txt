@@ -1,0 +1,359 @@
+# Корпус фраз для офлайн-разбора.
+# Формат: фраза | ожидание.
+#   lesson:N  — должен выбраться урок N из lessons::ALL
+#   load:X    — нагрузка, load:X+Y — нагрузка и вход (button/pot/ldr)
+#   refuse    — честный отказ без готовой схемы
+#   alt       — есть кнопки-уточнения (неоднозначность)
+# Строки с # и пустые не считаются.
+
+# ---------- уроки: название урока ----------
+Светодиод: первая программа | lesson:0
+Плавное свечение: ШИМ | lesson:1
+Цветной светодиод RGB | lesson:2
+Мощная нагрузка: MOSFET | lesson:3
+Геркон | lesson:4
+Реле | lesson:6
+Монитор порта | lesson:7
+Пьезоизлучатель | lesson:8
+Фоторезистор | lesson:9
+Термистор и DS18B20 | lesson:10
+DHT11 и DHT22 | lesson:11
+Давление: BMP180, BMP280, BME280 | lesson:12
+Датчик газа MQ-2 | lesson:13
+Датчик движения HC-SR501 | lesson:14
+Ультразвуковой дальномер HC-SR04 | lesson:15
+ИК-датчик препятствия TCRT5000 | lesson:16
+ИК-пульт: TSOP1838 | lesson:17
+Энергонезависимая память EEPROM | lesson:18
+Текстовый дисплей LCD1602 по I2C | lesson:19
+Текстовый дисплей LCD2004 по I2C | lesson:20
+Одноразрядный семисегментный индикатор | lesson:21
+Четырёхразрядный индикатор по I2C | lesson:22
+Матрица 8×8 на MAX7219 | lesson:23
+Графический дисплей Nokia 5110 | lesson:24
+OLED 0.96 на SSD1306 | lesson:25
+Цветной TFT 1.44 | lesson:26
+Сенсорный TFT 2.4 | lesson:27
+Вывод на телевизор TV OUT | lesson:28
+Монохромная панель P10 | lesson:29
+Цветная панель P10 RGB | lesson:30
+Часы реального времени DS3231 | lesson:31
+RGB-кольцо WS2812 | lesson:32
+ИК-излучатель | lesson:33
+Клавиатура PS/2 | lesson:34
+Карта памяти SD | lesson:35
+Датчик звука | lesson:36
+MP3-плеер DFPlayer | lesson:37
+Управление DTMF: MT8870 | lesson:38
+Датчик магнитного поля | lesson:39
+Датчик радиации | lesson:40
+Датчик тока ACS712 | lesson:41
+Энкодер | lesson:42
+Датчик линии | lesson:43
+Гироскоп и акселерометр MPU6050 | lesson:44
+Ёмкостная кнопка TTP223 | lesson:45
+Весы на HX711 | lesson:46
+Модуль отпечатка пальцев | lesson:47
+Элемент Пельтье | lesson:48
+Датчик этилового спирта MQ-3 | lesson:49
+Датчик цвета TCS3200 | lesson:50
+
+# ---------- уроки: имя платы в обычной фразе ----------
+подключить занятие 6 к ардуино | lesson:0
+нужен занятие 6 | lesson:0
+занятие 6 на ардуино | lesson:0
+подключить занятие 7 к ардуино | lesson:1
+нужен занятие 7 | lesson:1
+занятие 7 на ардуино | lesson:1
+подключить rgb к ардуино | lesson:2
+нужен rgb | lesson:2
+rgb на ардуино | lesson:2
+подключить irlz44n к ардуино | lesson:3
+нужен irlz44n | lesson:3
+irlz44n на ардуино | lesson:3
+подключить reed к ардуино | lesson:4
+нужен reed | lesson:4
+reed на ардуино | lesson:4
+подключить занятие 11 к ардуино | lesson:5
+нужен занятие 11 | lesson:5
+занятие 11 на ардуино | lesson:5
+подключить relay к ардуино | lesson:6
+нужен relay | lesson:6
+relay на ардуино | lesson:6
+подключить занятие 13 к ардуино | lesson:7
+нужен занятие 13 | lesson:7
+занятие 13 на ардуино | lesson:7
+подключить занятие 14 к ардуино | lesson:8
+нужен занятие 14 | lesson:8
+занятие 14 на ардуино | lesson:8
+подключить занятие 15 к ардуино | lesson:9
+нужен занятие 15 | lesson:9
+занятие 15 на ардуино | lesson:9
+подключить ds18b20 к ардуино | lesson:10
+нужен ds18b20 | lesson:10
+ds18b20 на ардуино | lesson:10
+подключить dht11 к ардуино | lesson:11
+нужен dht11 | lesson:11
+dht11 на ардуино | lesson:11
+подключить bmp085 к ардуино | lesson:12
+нужен bmp085 | lesson:12
+bmp085 на ардуино | lesson:12
+подключить mq-2 к ардуино | lesson:13
+нужен mq-2 | lesson:13
+mq-2 на ардуино | lesson:13
+подключить pir к ардуино | lesson:14
+нужен pir | lesson:14
+pir на ардуино | lesson:14
+подключить hc-sr04 к ардуино | lesson:15
+нужен hc-sr04 | lesson:15
+hc-sr04 на ардуино | lesson:15
+подключить tcrt5000 к ардуино | lesson:16
+нужен tcrt5000 | lesson:16
+tcrt5000 на ардуино | lesson:16
+подключить tsop к ардуино | lesson:17
+нужен tsop | lesson:17
+tsop на ардуино | lesson:17
+подключить eeprom к ардуино | lesson:18
+нужен eeprom | lesson:18
+eeprom на ардуино | lesson:18
+подключить lcd1602 к ардуино | lesson:19
+нужен lcd1602 | lesson:19
+lcd1602 на ардуино | lesson:19
+подключить lcd2004 к ардуино | lesson:20
+нужен lcd2004 | lesson:20
+lcd2004 на ардуино | lesson:20
+подключить 7seg-1 к ардуино | lesson:21
+нужен 7seg-1 | lesson:21
+7seg-1 на ардуино | lesson:21
+подключить 7seg-4 к ардуино | lesson:22
+нужен 7seg-4 | lesson:22
+7seg-4 на ардуино | lesson:22
+подключить max7219 к ардуино | lesson:23
+нужен max7219 | lesson:23
+max7219 на ардуино | lesson:23
+подключить nokia к ардуино | lesson:24
+нужен nokia | lesson:24
+nokia на ардуино | lesson:24
+подключить oled к ардуино | lesson:25
+нужен oled | lesson:25
+oled на ардуино | lesson:25
+подключить tft 1.44 к ардуино | lesson:26
+нужен tft 1.44 | lesson:26
+tft 1.44 на ардуино | lesson:26
+подключить tft 2.4 к ардуино | lesson:27
+нужен tft 2.4 | lesson:27
+tft 2.4 на ардуино | lesson:27
+подключить tv out к ардуино | lesson:28
+нужен tv out | lesson:28
+tv out на ардуино | lesson:28
+подключить p10 к ардуино | lesson:29
+нужен p10 | lesson:29
+p10 на ардуино | lesson:29
+подключить p10 rgb к ардуино | lesson:30
+нужен p10 rgb | lesson:30
+p10 rgb на ардуино | lesson:30
+подключить ds3231 к ардуино | lesson:31
+нужен ds3231 | lesson:31
+ds3231 на ардуино | lesson:31
+подключить ws2812 к ардуино | lesson:32
+нужен ws2812 | lesson:32
+ws2812 на ардуино | lesson:32
+подключить ir led к ардуино | lesson:33
+нужен ir led | lesson:33
+ir led на ардуино | lesson:33
+подключить ps/2 к ардуино | lesson:34
+нужен ps/2 | lesson:34
+ps/2 на ардуино | lesson:34
+подключить sd-карт к ардуино | lesson:35
+нужен sd-карт | lesson:35
+sd-карт на ардуино | lesson:35
+подключить sound sensor к ардуино | lesson:36
+нужен sound sensor | lesson:36
+sound sensor на ардуино | lesson:36
+подключить dfplayer к ардуино | lesson:37
+нужен dfplayer | lesson:37
+dfplayer на ардуино | lesson:37
+подключить mt8870 к ардуино | lesson:38
+нужен mt8870 | lesson:38
+mt8870 на ардуино | lesson:38
+подключить hall к ардуино | lesson:39
+нужен hall | lesson:39
+hall на ардуино | lesson:39
+подключить acs712 к ардуино | lesson:41
+нужен acs712 | lesson:41
+acs712 на ардуино | lesson:41
+подключить encoder к ардуино | lesson:42
+нужен encoder | lesson:42
+encoder на ардуино | lesson:42
+подключить line sensor к ардуино | lesson:43
+нужен line sensor | lesson:43
+line sensor на ардуино | lesson:43
+подключить mpu6050 к ардуино | lesson:44
+нужен mpu6050 | lesson:44
+mpu6050 на ардуино | lesson:44
+подключить ttp223 к ардуино | lesson:45
+нужен ttp223 | lesson:45
+ttp223 на ардуино | lesson:45
+подключить hx711 к ардуино | lesson:46
+нужен hx711 | lesson:46
+hx711 на ардуино | lesson:46
+подключить fingerprint к ардуино | lesson:47
+нужен fingerprint | lesson:47
+fingerprint на ардуино | lesson:47
+подключить peltier к ардуино | lesson:48
+нужен peltier | lesson:48
+peltier на ардуино | lesson:48
+подключить mq-3 к ардуино | lesson:49
+нужен mq-3 | lesson:49
+mq-3 на ардуино | lesson:49
+подключить tcs3200 к ардуино | lesson:50
+нужен tcs3200 | lesson:50
+tcs3200 на ардуино | lesson:50
+
+# ---------- живые формулировки ----------
+светодиод мигает | lesson:0
+хочу мигать светодиодом | load:led
+лампочка плавно гаснет | lesson:1
+плавное свечение светодиода | lesson:1
+rgb светодиод | lesson:2
+трехцветный светодиод | lesson:2
+мощная нагрузка на mosfet | lesson:3
+геркон и светодиод | lesson:4
+кнопка включает светодиод | load:led+button
+реле для насоса | lesson:6
+монитор порта | lesson:7
+пьезоизлучатель пищит | lesson:8
+фоторезистор и светодиод | lesson:9
+ночник на фоторезисторе | lesson:9
+термистор | lesson:10
+температура | lesson:10
+датчик температуры | lesson:10
+термометр | lesson:10
+измерить температуру | lesson:10
+градусник | lesson:10
+dht22 | lesson:11
+влажность воздуха | lesson:11
+барометр | lesson:12
+датчик давления | lesson:12
+датчик газа | lesson:13
+утечка газа | lesson:13
+датчик движения | lesson:14
+pir датчик | lesson:14
+дальномер | lesson:15
+измерить расстояние | lesson:15
+ультразвуковой датчик | lesson:15
+датчик препятствия | lesson:16
+ик пульт | lesson:17
+eeprom | lesson:18
+lcd1602 | lesson:19
+lcd 20x4 | lesson:20
+семисегментный индикатор | lesson:21
+четырехразрядный индикатор | lesson:22
+матрица max7219 | lesson:23
+nokia 5110 | lesson:24
+oled дисплей | lesson:25
+tft 1.44 | lesson:26
+сенсорный tft | lesson:27
+вывод на телевизор | lesson:28
+панель p10 | lesson:29
+цветная панель p10 | lesson:30
+часы реального времени | lesson:31
+ds3231 | lesson:31
+rgb кольцо ws2812 | lesson:32
+ик-излучатель | lesson:33
+клавиатура ps/2 | lesson:34
+карта памяти microsd | lesson:35
+датчик звука | lesson:36
+уровень шума | lesson:36
+mp3 плеер | lesson:37
+dtmf | lesson:38
+датчик магнитного поля | lesson:39
+датчик радиации | lesson:40
+датчик тока | lesson:41
+энкодер | lesson:42
+датчик линии | lesson:43
+гироскоп | lesson:44
+акселерометр | lesson:44
+емкостная кнопка | lesson:45
+весы | lesson:46
+отпечаток пальца | lesson:47
+элемент пельтье | lesson:48
+датчик спирта | lesson:49
+датчик цвета | lesson:50
+определить цвет | lesson:50
+tcs3200 | lesson:50
+мотор | load:motor
+моторчик | load:motor
+двигатель постоянного тока | load:motor
+вентилятор | load:motor
+насос | load:motor
+мотор с кнопкой | load:motor+button
+мотор и потенциометр | load:motor+pot
+регулировать скорость мотора потенциометром | load:motor+pot
+моторчик ускорялся по нажатиям | load:motor+button
+шаговик 28byj-48 | load:stepper
+шаговый двигатель | load:stepper
+сервопривод | load:servo
+серво по потенциометру | load:servo+pot
+повернуть заслонку сервой | load:servo
+пищалка | load:buzzer
+динамик играет мелодию | load:buzzer
+пьезо | load:buzzer
+rfid метка | load:rfid
+радио 433 | load:radio433
+nrf24l01 | load:radionrf
+bluetooth модуль hc-05 | load:bluetooth
+gsm модем | load:gsm
+ethernet w5100 | load:ethernet
+ночник | load:led
+гирлянда | load:led
+фонарь | load:led
+лампочка | load:led
+светодиод кнопкой | load:led+button
+крутилка и мотор | load:motor+pot
+диммер для лампы | load:led
+датчик света | lesson:9
+люксметр | lesson:9
+освещенность | lesson:9
+термоментр | lesson:10
+термистр | lesson:10
+дтчик температры | lesson:10
+светодиот | load:led
+мигат светодиот | load:led
+ryjgrf | load:led+button
+blink an led | load:led
+servo with a potentiometer | load:servo+pot
+read temperature | lesson:10
+light sensor | load:led+ldr
+distance sensor | lesson:15
+smoke detector | lesson:13
+fingerprint scanner | lesson:47
+clock module | lesson:31
+weight scale | lesson:46
+gas sensor | lesson:13
+color sensor | lesson:50
+humidity sensor | lesson:11
+pressure sensor | lesson:12
+
+# ---------- понятный отказ вместо выдуманной схемы ----------
+погода | refuse
+напиши стихи | refuse
+посчитай на питоне | refuse
+расскажи анекдот | refuse
+купи хлеба | refuse
+позвони маме | refuse
+что такое любовь | refuse
+переведи текст | refuse
+свет | refuse
+робот | refuse
+полив цветов | refuse
+открыть дверь | refuse
+включи музыку | refuse
+сколько времени | refuse
+нарисуй кота | refuse
+
+# ---------- неоднозначность: нужны кнопки-уточнения ----------
+мотор и серво | alt
+кнопка и потенциометр | alt
+потенциометр | alt
+мотор с кнопкой и потенциометром | alt

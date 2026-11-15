@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Build the release binary next to the sources.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+exec cargo build --release --locked --manifest-path "$here/Cargo.toml" "$@"

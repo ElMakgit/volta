@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Run the test suite.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+exec cargo test --manifest-path "$here/Cargo.toml" "$@"

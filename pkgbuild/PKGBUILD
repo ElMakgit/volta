@@ -1,0 +1,24 @@
+# Maintainer: elmak
+# Personal package: builds the working tree next to this folder.
+pkgname=volta
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Breadboard schematic, Arduino sketch and checks from a task sentence"
+arch=('x86_64')
+url="https://localhost/volta"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'librsvg')
+makedepends=('rust' 'cargo')
+source=()
+sha256sums=()
+
+build() {
+  cargo build --release --locked --manifest-path "$startdir/../Cargo.toml"
+}
+
+package() {
+  install -Dm755 "$startdir/../target/release/volta" "$pkgdir/usr/bin/volta"
+  install -Dm644 "$startdir/volta.desktop" "$pkgdir/usr/share/applications/volta.desktop"
+  install -Dm644 "$startdir/volta.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/volta.svg"
+}

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=volta
+Comment=Breadboard schematic, sketch and checks from a task
+Comment[ru]=Схема на макетке, скетч и проверки из текста задачи
+Exec=volta
+TryExec=volta
+Icon=volta
+Terminal=false
+Categories=Utility;Science;
+Keywords=arduino;breadboard;circuit;schematic;electronics;макетка;схема;
+StartupWMClass=volta
+StartupNotify=true
