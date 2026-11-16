@@ -467,6 +467,40 @@ fn search_text(raw: &str) -> String {
 }
 
 pub fn parse(raw: &str) -> Parse {
+    parse_inner(raw, true)
+}
+
+fn parse_inner(raw: &str, books: bool) -> Parse {
+    // The four course books are the base: a task copied from them word for
+    // word is answered by the lesson that teaches it, without guessing from
+    // a keyword. The user's own sentence stays in `raw`, so numbers in it
+    // ("на 49 карт") still reach the sketch. A seed is only a fallback: a
+    // task that names a button must keep its button.
+    if books {
+        match crate::book_tasks::solution_for(raw) {
+            Some(crate::book_tasks::Solution::Lesson(i)) => {
+                let mut parsed = parse_inner(crate::lessons::ALL[i].title.ru, false);
+                // A bare title such as "Кнопка" is also an everyday word, so
+                // the title alone may route elsewhere. The book already says
+                // which lesson the task belongs to.
+                parsed.intent.lesson = Some(i);
+                parsed.unsupported = None;
+                parsed.alternatives.clear();
+                parsed.intent.raw = raw.to_string();
+                return parsed;
+            }
+            Some(crate::book_tasks::Solution::Seed(seed)) => {
+                let normal = parse_inner(raw, false);
+                if normal.unsupported.is_some() {
+                    let mut parsed = parse_inner(seed, false);
+                    parsed.intent.raw = raw.to_string();
+                    return parsed;
+                }
+                return normal;
+            }
+            None => {}
+        }
+    }
     let text = search_text(raw);
     let mut matched = Vec::new();
     let mut understood = Vec::new();

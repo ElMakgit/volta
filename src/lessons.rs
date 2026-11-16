@@ -1983,7 +1983,7 @@ void loop() {
         book: 3,
         number: 19,
         title: L::new("Датчик этилового спирта MQ-3", "The MQ-3 alcohol sensor"),
-        keys: &["mq-3", "mq3", "алкогол", "спирт"],
+        keys: &["mq-3", "mq3", "алкогол", "алкометр", "спирт"],
         boards: &[board("MQ-3", 2.0, 54.0)],
         wires: &[("AO", "A0"), ("DO", "D2")],
         extras: NO_EXTRA,

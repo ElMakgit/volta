@@ -419,6 +419,33 @@ pub enum End {
     Hole(Hole),
 }
 
+/// A stable number for a wire end. Two cables that meet the same pin but come
+/// from different places get different numbers, which gives each its own step
+/// at the header and its own colour.
+pub fn end_hash(end: End) -> u32 {
+    match end {
+        End::Pin(p) => (p as u32).wrapping_mul(2).wrapping_add(1),
+        End::Hole(Hole::Col(c, r)) => 0x1000_0000u32
+            .wrapping_add((c as u32) << 9)
+            .wrapping_add(r.idx() as u32 * 2),
+        End::Hole(Hole::Rail(rail, half, i)) => 0x2000_0000u32
+            .wrapping_add((rail as u32) << 12)
+            .wrapping_add((half as u32) << 8)
+            .wrapping_add(i as u32 * 2),
+        End::Hole(Hole::OffBoard) => 0x3FFF_FFFF,
+    }
+}
+
+/// A well-mixed number for both ends together. Pin indices are small and
+/// mostly odd, so a plain sum would only reach half the colours in the box.
+pub fn wire_seed(a: End, b: End) -> u32 {
+    let mut h = end_hash(a).wrapping_mul(0x9E37_79B9)
+        ^ end_hash(b).wrapping_mul(0xC2B2_AE35);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^ h >> 15
+}
+
 /// How cables are routed across the bench.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum WireStyle {
@@ -670,7 +697,7 @@ impl Circuit {
         }
         let a = self.end_pos(w.a);
         let b = self.end_pos(w.b);
-        match style {
+        let mut pts = match style {
             WireStyle::Straight => vec![a, b],
             WireStyle::Ortho => self
                 .wire_legs(w, style)
@@ -681,6 +708,67 @@ impl Circuit {
                 let (p1, p2) = self.wire_controls(w);
                 bezier(a, p1, p2, b, 18)
             }
+        };
+        // A tidy build meets its pins square, which makes cables that share a
+        // run merge into one line right at the header. A short step beside the
+        // pin keeps every cable visible up to its own terminal.
+        if style == WireStyle::Ortho {
+            self.elbow_at(&mut pts, w, true);
+            self.elbow_at(&mut pts, w, false);
+        }
+        pts
+    }
+
+    /// A small square step beside a pin: out, along, back, then into the
+    /// terminal. Two cables on the same pin, or on neighbours in one header,
+    /// leave in their own lanes instead of one thick line.
+    fn elbow_at(&self, pts: &mut Vec<Pt>, w: &Wire, start: bool) {
+        let end = if start { w.a } else { w.b };
+        if !matches!(end, End::Pin(_)) || pts.len() < 2 {
+            return;
+        }
+        let (pin, next) = if start {
+            (pts[0], pts[1])
+        } else {
+            (pts[pts.len() - 1], pts[pts.len() - 2])
+        };
+        let (dx, dy) = (next.x - pin.x, next.y - pin.y);
+        // The step is built from the terminal run and its perpendicular, so
+        // it stays square like the rest of an angled cable.
+        if (dx.abs() > 1e-3) == (dy.abs() > 1e-3) {
+            return;
+        }
+        /// Length of the step, and how far from the pin it starts.
+        const LEAD: f32 = 1.6;
+        if dx.abs() + dy.abs() < LEAD * 2.2 {
+            return;
+        }
+        let d = Pt::new(if dx.abs() > 1e-3 { dx.signum() } else { 0.0 },
+                        if dy.abs() > 1e-3 { dy.signum() } else { 0.0 });
+        // The two ends of one cable pick the same side of their runs, while
+        // cables that share a pin differ: the hash covers both terminals.
+        let h = wire_seed(w.a, w.b);
+        let side = if h % 2 == 0 { 1.0 } else { -1.0 };
+        let s = 0.7 + 0.2 * ((h / 2) % 3) as f32;
+        let n = if dx.abs() > 1e-3 {
+            Pt::new(0.0, side)
+        } else {
+            Pt::new(side, 0.0)
+        };
+        let at = |k: f32| Pt::new(pin.x + d.x * LEAD * k, pin.y + d.y * LEAD * k);
+        let mut step = Vec::with_capacity(4);
+        if start {
+            step.push(Pt::new(pin.x + n.x * s, pin.y + n.y * s));
+            step.push(Pt::new(step[0].x + d.x * LEAD, step[0].y + d.y * LEAD));
+            step.push(at(1.0));
+            pts.splice(1..1, step);
+        } else {
+            let last = pts.len() - 1;
+            step.push(at(2.0));
+            step.push(Pt::new(step[0].x + n.x * s, step[0].y + n.y * s));
+            step.push(Pt::new(step[1].x - d.x * LEAD, step[1].y - d.y * LEAD));
+            step.push(at(1.0));
+            pts.splice(last..last, step);
         }
     }
 
@@ -2071,6 +2159,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// At a pin an angled cable makes a short step aside and back, so a
+    /// bundle of cables still parts into its own lines at the header.
+    #[test]
+    fn a_pin_lead_has_a_small_step() {
+        let c = wired();
+        let has_step = |pts: &[Pt]| {
+            pts.windows(2).any(|s| {
+                let d = s[0].dist(s[1]);
+                (0.55..=1.15).contains(&d)
+                    && ((s[0].x - s[1].x).abs() < 1e-3 || (s[0].y - s[1].y).abs() < 1e-3)
+            })
+        };
+        let mut stepped = 0;
+        for w in &c.wires {
+            let pts = c.wire_points(w, WireStyle::Ortho);
+            if matches!(w.a, End::Pin(_)) && has_step(&pts) {
+                stepped += 1;
+            }
+            if matches!(w.b, End::Pin(_)) && has_step(&pts) {
+                stepped += 1;
+            }
+        }
+        assert!(stepped > 0, "no pin-ended cable has a step");
     }
 
     /// A bend pulled by hand is honoured: the cable goes through it, and it

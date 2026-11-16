@@ -337,12 +337,33 @@ const WIRE_GND: Rgba = Rgba::rgb(0x30, 0x30, 0x33);
 const WIRE_SIG: Rgba = Rgba::rgb(0x37, 0xA6, 0x4C);
 const WIRE_AN: Rgba = Rgba::rgb(0x2C, 0x7B, 0xD1);
 
-fn run_color(class: NetClass) -> Rgba {
-    match class {
+/// The colour box of a real jumper set, as Tinkercad offers it. Power stays
+/// red and ground black, the way a schematic reads; signal cables take a
+/// colour of their own so a bundle does not look like one wire.
+const WIRE_SIGNALS: [Rgba; 10] = [
+    WIRE_SIG,
+    Rgba::rgb(0xE8, 0x59, 0x0C), // orange
+    WIRE_AN,
+    Rgba::rgb(0x70, 0x48, 0xE8), // purple
+    Rgba::rgb(0x0C, 0xA6, 0x78), // teal
+    Rgba::rgb(0xD6, 0x33, 0x6C), // magenta
+    Rgba::rgb(0x9C, 0x8A, 0x00), // olive
+    Rgba::rgb(0x8B, 0x5A, 0x2B), // brown
+    Rgba::rgb(0x10, 0x98, 0xAD), // cyan
+    Rgba::rgb(0x5C, 0x94, 0x0D), // lime
+];
+
+fn run_color(w: &Wire) -> Rgba {
+    match w.class {
         NetClass::Vcc => WIRE_VCC,
         NetClass::Gnd => WIRE_GND,
-        NetClass::Signal => WIRE_SIG,
-        NetClass::Analog => WIRE_AN,
+        // The colour follows the two ends, so the same connection keeps its
+        // colour between repaints and exports.
+        NetClass::Signal | NetClass::Analog => {
+            let h = crate::model::wire_seed(w.a, w.b)
+                .wrapping_add(if w.class == NetClass::Analog { 5 } else { 0 });
+            WIRE_SIGNALS[(h % WIRE_SIGNALS.len() as u32) as usize]
+        }
     }
 }
 
@@ -1576,7 +1597,7 @@ impl D {
             let core = if self.on_dark && w.class == NetClass::Gnd {
                 Rgba::rgb(0xD6, 0xD6, 0xDA)
             } else {
-                run_color(w.class)
+                run_color(w)
             };
             // The active cable sits a touch higher, so it is easy to see which
             // one the grips belong to.
@@ -1822,10 +1843,33 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
 mod tests {
     use super::*;
     use crate::checks;
+    use crate::model::{End, NetClass, Wire};
     use crate::parse::Intent;
     use crate::templates;
     use crate::text::Lang;
     use crate::theme::Theme;
+
+    /// Signal jumpers come out of a whole colour box, while the two power
+    /// rails keep the colours a schematic expects.
+    #[test]
+    fn signal_wires_take_colours_from_the_box() {
+        let wire = |pin: usize, class| Wire {
+            a: End::Pin(pin),
+            b: End::Pin(23),
+            class,
+            lift: 0.0,
+            via: vec![],
+        };
+        let mut colours = std::collections::BTreeSet::new();
+        for pin in 1..20 {
+            colours.insert(run_color(&wire(pin, NetClass::Signal)).0);
+        }
+        assert!(colours.len() >= 6, "only {} cable colours", colours.len());
+        assert!(!colours.contains(&WIRE_VCC.0), "signal took the power red");
+        assert!(!colours.contains(&WIRE_GND.0), "signal took the ground black");
+        assert_eq!(run_color(&wire(3, NetClass::Vcc)).0, WIRE_VCC.0);
+        assert_eq!(run_color(&wire(3, NetClass::Gnd)).0, WIRE_GND.0);
+    }
 
     fn all() -> Vec<(String, crate::model::Circuit)> {
         let cases = [
