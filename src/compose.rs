@@ -115,7 +115,19 @@ pub fn detect(
             _ => return None,
         }
     };
-    let behavior = match sink {
+    let behavior = behavior_for(sink, action);
+    Some(Composition {
+        source: source.id,
+        sink,
+        behavior,
+        condition,
+    })
+}
+
+/// The verb a sink does when it is switched by a condition. The action only
+/// changes one case: a lamp asked to "toggle" is held on, not blinked.
+pub fn behavior_for(sink: SinkId, action: Option<Action>) -> Behavior {
+    match sink {
         SinkId::Led => match action {
             Some(Action::Toggle) => Behavior::Solid,
             _ => Behavior::Blink,
@@ -126,13 +138,7 @@ pub fn detect(
         SinkId::Servo => Behavior::Turn,
         SinkId::Motor => Behavior::Spin,
         SinkId::Rgb => Behavior::Color,
-    };
-    Some(Composition {
-        source: source.id,
-        sink,
-        behavior,
-        condition,
-    })
+    }
 }
 
 /// The words "Понял так" shows for a composition: source · condition · action.

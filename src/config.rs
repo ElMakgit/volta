@@ -94,6 +94,76 @@ pub fn save_export_dir_at(path: &Path, dir: &Path) -> std::io::Result<()> {
     put(path, "export_dir", serde_json::Value::from(text))
 }
 
+/// The format of the last export, so one button can repeat what the user did
+/// last time instead of asking again.
+pub fn load_export_kind() -> Option<String> {
+    load_export_kind_at(&config_path())
+}
+
+pub fn load_export_kind_at(path: &Path) -> Option<String> {
+    read(path)
+        .get("export_kind")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+pub fn save_export_kind(key: &str) {
+    let _ = save_export_kind_at(&config_path(), key);
+}
+
+pub fn save_export_kind_at(path: &Path, key: &str) -> std::io::Result<()> {
+    put(path, "export_kind", serde_json::Value::from(key))
+}
+
+/// The task left unfinished last time. An empty task is no draft at all.
+pub fn load_draft() -> Option<(String, bool)> {
+    load_draft_at(&config_path())
+}
+
+pub fn load_draft_at(path: &Path) -> Option<(String, bool)> {
+    let doc = read(path);
+    let task = doc.get("draft").and_then(|d| d.get("task"))?.as_str()?;
+    if task.trim().is_empty() {
+        return None;
+    }
+    let manual = doc
+        .get("draft")
+        .and_then(|d| d.get("mode"))
+        .and_then(|m| m.as_str())
+        .map(|m| m == "manual")
+        .unwrap_or(false);
+    Some((task.to_owned(), manual))
+}
+
+pub fn save_draft(task: &str, manual: bool) {
+    let _ = save_draft_at(&config_path(), task, manual);
+}
+
+pub fn save_draft_at(path: &Path, task: &str, manual: bool) -> std::io::Result<()> {
+    let draft = serde_json::json!({
+        "task": task,
+        "mode": if manual { "manual" } else { "ai" },
+    });
+    put(path, "draft", draft)
+}
+
+pub fn clear_draft() {
+    let _ = clear_draft_at(&config_path());
+}
+
+pub fn clear_draft_at(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut doc = read(path);
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("draft");
+    }
+    let mut body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
+    body.push('\n');
+    std::fs::write(path, body)
+}
+
 fn read(path: &Path) -> serde_json::Value {
     std::fs::read_to_string(path)
         .ok()
@@ -156,6 +226,34 @@ mod tests {
         assert_eq!(load_wire_style_at(&path), WireStyle::Arc);
         assert!(load_bench_dark_at(&path));
         assert_eq!(load_export_dir_at(&path).as_deref(), Some(Path::new("/tmp/somewhere")));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_last_export_and_the_draft_survive_a_save() {
+        let path = scratch("draft");
+        assert!(load_export_kind_at(&path).is_none());
+        assert!(load_draft_at(&path).is_none());
+        save_export_kind_at(&path, "png").unwrap();
+        save_draft_at(&path, "температура выше 30 серво", true).unwrap();
+        assert_eq!(load_export_kind_at(&path).as_deref(), Some("png"));
+        assert_eq!(
+            load_draft_at(&path),
+            Some(("температура выше 30 серво".into(), true))
+        );
+        // One key does not forget the others.
+        assert_eq!(load_wire_style_at(&path), WireStyle::Ortho);
+        clear_draft_at(&path).unwrap();
+        assert!(load_draft_at(&path).is_none());
+        assert_eq!(load_export_kind_at(&path).as_deref(), Some("png"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_blank_task_is_not_a_draft() {
+        let path = scratch("blank-draft");
+        save_draft_at(&path, "   ", false).unwrap();
+        assert!(load_draft_at(&path).is_none());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

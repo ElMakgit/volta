@@ -20,9 +20,10 @@ use crate::manual::{self, Draft, Place};
 use crate::model::{Circuit, Pt, WireStyle};
 use crate::parse::{self, Parse};
 use crate::scene::{self, Anchor, Prim, Rgba, Scene};
+use crate::spec::{self, Behavior, Composition, Condition, SINKS, SOURCES};
 use crate::svg;
 use crate::templates::{self, Built, Plan};
-use crate::text::{Lang, Tr};
+use crate::text::{Lang, L, Tr};
 use crate::theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,16 @@ impl SaveKind {
             SaveKind::Bundle => "bundle",
         }
     }
+    fn from_key(key: &str) -> Option<SaveKind> {
+        match key {
+            "png" => Some(SaveKind::Png),
+            "svg" => Some(SaveKind::Svg),
+            "sketch" => Some(SaveKind::Sketch),
+            "csv" => Some(SaveKind::Csv),
+            "bundle" => Some(SaveKind::Bundle),
+            _ => None,
+        }
+    }
     fn default_name(self) -> &'static str {
         match self {
             SaveKind::Png => "circuit.png",
@@ -70,7 +81,82 @@ impl SaveKind {
             SaveKind::Bundle => "circuit",
         }
     }
+    /// The format tag on the one Export button.
+    fn short(self) -> &'static str {
+        match self {
+            SaveKind::Png => "PNG",
+            SaveKind::Svg => "SVG",
+            SaveKind::Sketch => ".ino",
+            SaveKind::Csv => "CSV",
+            SaveKind::Bundle => "SVG+.ino",
+        }
+    }
 }
+
+/// Which field of "I read it as" a chip is offering to change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chip {
+    Source,
+    Condition,
+    Sink,
+}
+
+/// The mini-picker behind a chip. It holds the whole recipe, so changing one
+/// field keeps the other two exactly as the user last saw them.
+struct RecipeAsk {
+    chip: Chip,
+    recipe: Composition,
+    /// The number the threshold buttons apply.
+    number: f32,
+}
+
+/// One ready-made circuit on the start screen.
+struct Sample {
+    icon: Icon,
+    task: L,
+}
+
+/// Six circuits that the composer already understands, one click each. The
+/// phrases are the same ones `volta plan` accepts, so a card cannot promise a
+/// circuit the planner would refuse.
+const GALLERY: [Sample; 6] = [
+    Sample {
+        icon: Icon::Module("DS18B20"),
+        task: L::new(
+            "температура выше 30 включи вентилятор",
+            "temperature above 30 turn on the motor",
+        ),
+    },
+    Sample {
+        icon: Icon::Module("MQ-2"),
+        task: L::new("газ выше 400 включи сирену", "gas above 400 turn on the buzzer"),
+    },
+    Sample {
+        icon: Icon::Module("HC-SR04"),
+        task: L::new(
+            "расстояние меньше 20 пищалка",
+            "distance below 20 turn on the buzzer",
+        ),
+    },
+    Sample {
+        icon: Icon::Module("DHT22"),
+        task: L::new(
+            "влажность ниже 40 включи насос",
+            "humidity below 40 turn on the motor",
+        ),
+    },
+    Sample {
+        icon: Icon::Module("HC-SR501"),
+        task: L::new("движение включи светодиод", "motion turn on the led"),
+    },
+    Sample {
+        icon: Icon::Part(Place::Relay),
+        task: L::new(
+            "температура ниже 18 включи реле",
+            "temperature below 18 turn on the relay",
+        ),
+    },
+];
 
 /// The save window: a folder to browse, a name to type. It replaces the
 /// silent write into `~/Pictures/volta` that used to happen on export.
@@ -208,6 +294,16 @@ pub struct App {
     save_ask: Option<SaveAsk>,
     /// White sheet or black: the circuit background the user picked.
     bench_dark: bool,
+    /// The format the one Export button repeats.
+    export_kind: SaveKind,
+    /// A task left unfinished last time, offered at start.
+    resume: Option<(String, bool)>,
+    /// Side panels folded away to icons, with the canvas taking the window.
+    narrow: bool,
+    /// Checks show every line, not just the failures.
+    checks_all: bool,
+    /// The chip of "I read it as" whose picker is open.
+    recipe_ask: Option<RecipeAsk>,
 }
 
 impl App {
@@ -251,6 +347,14 @@ impl App {
             saved_png: false,
             save_ask: None,
             bench_dark: crate::config::load_bench_dark(),
+            export_kind: crate::config::load_export_kind()
+                .as_deref()
+                .and_then(SaveKind::from_key)
+                .unwrap_or(SaveKind::Png),
+            resume: crate::config::load_draft(),
+            narrow: false,
+            checks_all: false,
+            recipe_ask: None,
         }
     }
 
@@ -268,7 +372,18 @@ impl App {
         }
         if let Ok(task) = std::env::var("VOLTA_TASK") {
             self.task = task;
+            // A screenshot hook starts a fresh task: the continuation offer
+            // belongs to a normal start, not to a scripted one.
+            self.resume = None;
             self.plan_now();
+        }
+        match std::env::var("VOLTA_RESUME").as_deref() {
+            Ok("1") => self.resume = crate::config::load_draft(),
+            Ok(_) => self.resume = None,
+            Err(_) => {}
+        }
+        if std::env::var("VOLTA_NARROW").is_ok() {
+            self.narrow = true;
         }
         if std::env::var("VOLTA_MODE").map(|m| m == "manual").unwrap_or(false) {
             if self.built.is_some() {
@@ -351,6 +466,7 @@ impl App {
             return;
         }
         self.plan_parsed(parse::parse(&self.task));
+        self.stash_draft();
     }
 
     /// Build the bench from an already parsed sentence. A sentence the parser
@@ -398,6 +514,62 @@ impl App {
             alternatives: Vec::new(),
         };
         self.plan_parsed(next);
+    }
+
+    /// Change one field of the read recipe and rebuild the bench, without
+    /// touching the sentence the user typed.
+    fn apply_recipe(&mut self, recipe: Composition) {
+        let Some(parsed) = self.parsed.clone() else { return };
+        let mut intent = parsed.intent;
+        intent.recipe = Some(recipe);
+        intent.condition = recipe.condition;
+        let next = parse::Parse {
+            intent,
+            matched: Vec::new(),
+            understood: crate::compose::recipe_words(recipe),
+            unsupported: None,
+            alternatives: Vec::new(),
+        };
+        self.plan_parsed(next);
+        crate::config::save_draft(&self.task, self.mode == Mode::Manual);
+    }
+
+    /// The draft follows the sentence as it is typed, so a closed window does
+    /// not throw away the work.
+    fn stash_draft(&self) {
+        // Only the sentence is a project that can be rebuilt exactly; a
+        // hand-made bench is not serialised, so it is not promised back.
+        crate::config::save_draft(&self.task, false);
+    }
+
+    fn resume_task(&mut self) {
+        let Some((task, manual)) = self.resume.take() else { return };
+        self.task = task;
+        if manual {
+            self.switch_mode(Mode::Manual);
+        } else {
+            self.switch_mode(Mode::Ai);
+            self.plan_now();
+        }
+        self.status = self.t("status.ready");
+        self.status_bad = false;
+    }
+
+    fn start_fresh(&mut self) {
+        self.resume = None;
+        self.task.clear();
+        self.parsed = None;
+        self.plan = None;
+        self.built = None;
+        self.scene = None;
+        self.error = None;
+        self.draft.clear();
+        self.draft_scene = None;
+        self.manual_report = None;
+        self.mode = Mode::Ai;
+        crate::config::clear_draft();
+        self.status = self.t("status.ready");
+        self.status_bad = false;
     }
 
     fn build_now(&mut self) {
@@ -544,16 +716,30 @@ impl App {
         self.status_bad = false;
     }
 
-    fn export_png(&mut self) {
-        self.ask_save(SaveKind::Png);
-    }
-
     fn export_files(&mut self) {
         self.ask_save(SaveKind::Bundle);
     }
 
     fn save_sketch(&mut self) {
         self.ask_save(SaveKind::Sketch);
+    }
+
+    /// The one Export button: repeat the format chosen last time.
+    fn export_kind_now(&mut self) {
+        let kind = match (self.export_kind, self.mode) {
+            // A manual bench has no sketch, so the pair reads as an SVG.
+            (SaveKind::Sketch, Mode::Manual) => SaveKind::Bundle,
+            (kind, _) => kind,
+        };
+        self.ask_save(kind);
+    }
+
+    /// A format picked from the Export menu becomes the one the big button
+    /// repeats next time.
+    fn pick_export(&mut self, kind: SaveKind) {
+        self.export_kind = kind;
+        crate::config::save_export_kind(kind.key());
+        self.ask_save(kind);
     }
 
     /// Open the save window. It starts in the folder of the last export, or in
@@ -565,6 +751,7 @@ impl App {
         if kind == SaveKind::Sketch && self.built.is_none() {
             return;
         }
+        crate::config::save_export_kind(kind.key());
         let mut dir = crate::config::load_export_dir()
             .filter(|p| p.is_dir())
             .unwrap_or_else(crate::png::default_dir);
@@ -695,7 +882,7 @@ impl App {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        let (ctrl, shift, enter, s, e, z, q, f, r, esc, del, quest) = ctx.input(|i| {
+        let (ctrl, shift, enter, s, e, z, q, f, r, esc, del, quest, b) = ctx.input(|i| {
             (
                 i.modifiers.ctrl,
                 i.modifiers.shift,
@@ -709,6 +896,7 @@ impl App {
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
                 i.key_pressed(egui::Key::Questionmark),
+                i.key_pressed(egui::Key::B),
             )
         });
         let typing = ctx.memory(|m| m.focused().is_some());
@@ -726,15 +914,17 @@ impl App {
             self.plan_now();
         }
         if ctrl && s {
-            self.export_png();
+            self.export_kind_now();
         }
         if ctrl && e {
             self.export_files();
         }
-        if ctrl && z {
+        if ctrl && b && !typing {
+            self.narrow = !self.narrow;
+        }
+        if ctrl && z && self.mode == Mode::Manual {
             let changed = if shift { self.draft.redo() } else { self.draft.undo() };
             if changed {
-                self.mode = Mode::Manual;
                 self.hover = None;
                 self.refresh_manual();
             }
@@ -771,6 +961,7 @@ impl App {
         if esc {
             self.help = false;
             self.quit_ask = false;
+            self.recipe_ask = None;
             self.draft.pending = None;
             self.tool = Tool::Select;
         }
@@ -950,28 +1141,79 @@ impl eframe::App for App {
                 });
             });
 
-        egui::Panel::left("task")
-            .resizable(true)
-            .default_size(if self.mode == Mode::Ai { 340.0 } else { 290.0 })
-            .size_range(260.0..=520.0)
-            .frame(Frame::NONE.fill(panel).inner_margin(Margin::same(crate::style::PAD as i8)))
-            .show(root, |ui| {
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.mode {
-                    Mode::Ai => self.task_panel(ui, accent, fg, muted),
-                    Mode::Manual => self.palette_panel(ui, accent, fg, muted),
+        if self.narrow {
+            // Folded to icons: the canvas gets the window, but the way back
+            // and the two lists stay one click away.
+            egui::Panel::left("task")
+                .exact_size(38.0)
+                .frame(Frame::NONE.fill(panel).inner_margin(Margin::symmetric(4, 8)))
+                .show(root, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let open = Button::new(RichText::new("›").size(15.0))
+                            .min_size(vec2(26.0, 26.0));
+                        if ui.add(open).on_hover_text(self.t("narrow.open")).clicked() {
+                            self.narrow = false;
+                        }
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(self.t(if self.mode == Mode::Ai {
+                                "mode.ai"
+                            } else {
+                                "mode.manual"
+                            }))
+                            .size(10.0)
+                            .color(muted),
+                        );
+                    });
                 });
-            });
+            egui::Panel::right("side")
+                .exact_size(38.0)
+                .frame(Frame::NONE.fill(panel).inner_margin(Margin::symmetric(4, 8)))
+                .show(root, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let open = Button::new(RichText::new("‹").size(15.0))
+                            .min_size(vec2(26.0, 26.0));
+                        if ui.add(open).on_hover_text(self.t("narrow.open")).clicked() {
+                            self.narrow = false;
+                        }
+                        ui.add_space(12.0);
+                        let parts = Button::new(RichText::new("▤").size(14.0))
+                            .min_size(vec2(26.0, 26.0));
+                        if ui.add(parts).on_hover_text(self.t("tab.parts")).clicked() {
+                            self.tab = Tab::Parts;
+                        }
+                        ui.add_space(6.0);
+                        let checks = Button::new(RichText::new("✓").size(14.0))
+                            .min_size(vec2(26.0, 26.0));
+                        if ui.add(checks).on_hover_text(self.t("tab.checks")).clicked() {
+                            self.tab = Tab::Checks;
+                        }
+                    });
+                });
+        } else {
+            egui::Panel::left("task")
+                .resizable(true)
+                .default_size(if self.mode == Mode::Ai { 340.0 } else { 290.0 })
+                .size_range(260.0..=520.0)
+                .frame(Frame::NONE.fill(panel).inner_margin(Margin::same(crate::style::PAD as i8)))
+                .show(root, |ui| {
+                    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.mode {
+                        Mode::Ai => self.task_panel(ui, accent, fg, muted),
+                        Mode::Manual => self.palette_panel(ui, accent, fg, muted),
+                    });
+                });
 
-        egui::Panel::right("side")
-            .resizable(true)
-            .default_size(290.0)
-            .size_range(240.0..=440.0)
-            .frame(Frame::NONE.fill(panel).inner_margin(Margin::same(crate::style::PAD as i8)))
-            .show(root, |ui| {
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    self.side_panel(ui, accent, fg, muted);
+            egui::Panel::right("side")
+                .resizable(true)
+                .default_size(290.0)
+                .size_range(240.0..=440.0)
+                .frame(Frame::NONE.fill(panel).inner_margin(Margin::same(crate::style::PAD as i8)))
+                .show(root, |ui| {
+                    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        self.side_panel(ui, accent, fg, muted);
+                    });
                 });
-            });
+        }
 
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(bg).inner_margin(Margin::symmetric(12, 10)))
@@ -983,6 +1225,7 @@ impl eframe::App for App {
         self.author_window(ctx, accent, fg, muted, panel, radius);
         self.value_window(ctx, accent, fg, muted, panel, radius);
         self.save_window(ctx, accent, fg, muted, panel, radius);
+        self.recipe_window(ctx, accent, fg, muted, panel, radius);
     }
 }
 
@@ -1002,31 +1245,30 @@ impl App {
         );
         if resp.changed() {
             self.scene = None;
+            self.stash_draft();
         }
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for key in ["task.example1", "task.example2", "task.example3"] {
-                let text = self.t(key);
-                let short = if text.chars().count() > 32 {
-                    format!("{}…", text.chars().take(32).collect::<String>())
-                } else {
-                    text
-                };
-                if ui
-                    .add(
-                        Button::new(RichText::new(short).size(11.0))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::new(1.0, muted.gamma_multiply(0.6)))
-                            .corner_radius(crate::style::RADIUS),
-                    )
-                    .on_hover_text(self.t(key))
-                    .clicked()
-                {
-                    self.task = self.t(key);
-                    self.plan_now();
+        // Six ready circuits instead of three text examples: one click from
+        // an empty window to a finished bench.
+        ui.label(RichText::new(self.t("task.gallery")).size(11.0).color(muted));
+        ui.add_space(4.0);
+        let width = ui.available_width();
+        let col = ((width - crate::style::GAP) / 2.0).max(80.0);
+        let mut sample_pick: Option<L> = None;
+        for row in GALLERY.chunks(2) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = crate::style::GAP;
+                for sample in row {
+                    if sample_card(ui, sample, col, self.lang, accent, fg, muted).clicked() {
+                        sample_pick = Some(sample.task);
+                    }
                 }
-            }
-        });
+            });
+        }
+        if let Some(task) = sample_pick {
+            self.task = task.get(self.lang).to_string();
+            self.plan_now();
+        }
         ui.add_space(8.0);
         let go = Button::new(RichText::new(self.t("task.plan")).size(14.0).strong())
             .fill(accent)
@@ -1041,10 +1283,32 @@ impl App {
             ui.label(RichText::new(e).size(12.0).color(Color32::from_rgb(0xD2, 0x4B, 0x45)));
         }
 
-        // What the parser actually heard. Without it a wrong circuit looks
-        // like magic; with it the user sees which word was taken how.
+        // What the parser actually heard. A composition is a row of chips,
+        // and each chip opens the picker for its own field: a wrong sensor
+        // costs one click, not a re-typed sentence.
         if let Some(p) = &self.parsed {
-            if !p.understood.is_empty() {
+            if let Some(recipe) = p.intent.recipe {
+                let chips = recipe_chips(recipe, self.lang);
+                let mut ask: Option<Chip> = None;
+                ui.add_space(6.0);
+                ui.label(RichText::new(self.t("task.understood")).size(11.0).color(muted));
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (chip, text, hint) in chips {
+                        let button = Button::new(RichText::new(format!("{text} ▾")).size(11.5))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                            .corner_radius(crate::style::RADIUS);
+                        if ui.add(button).on_hover_text(hint).clicked() {
+                            ask = Some(chip);
+                        }
+                    }
+                });
+                if let Some(chip) = ask {
+                    let number = recipe_number(recipe);
+                    self.recipe_ask = Some(RecipeAsk { chip, recipe, number });
+                }
+            } else if !p.understood.is_empty() {
                 let heard: Vec<&str> = p.understood.iter().map(|l| l.get(self.lang)).collect();
                 ui.add_space(6.0);
                 ui.label(
@@ -1218,30 +1482,6 @@ impl App {
                     self.refresh_manual();
                 }
             });
-        });
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(self.t("wire.style")).size(11.5).color(muted));
-            for (style, key) in [
-                (WireStyle::Arc, "wire.arc"),
-                (WireStyle::Straight, "wire.straight"),
-                (WireStyle::Ortho, "wire.ortho"),
-            ] {
-                let on = self.wire_style == style;
-                if ui
-                    .add(
-                        Button::new(RichText::new(self.t(key)).size(11.5))
-                            .fill(if on { accent.gamma_multiply(0.85) } else { Color32::TRANSPARENT })
-                            .stroke(Stroke::new(1.0, muted.gamma_multiply(0.5)))
-                            .corner_radius(crate::style::RADIUS),
-                    )
-                    .clicked()
-                {
-                    self.set_wire_style(style);
-                    self.refresh_manual();
-                }
-            }
         });
 
         ui.add_space(8.0);
@@ -1429,6 +1669,7 @@ impl App {
             return;
         };
         let bom = templates::bom(circuit, self.lang);
+        let parts: usize = bom.iter().map(|(_, _, count)| *count).sum();
         let sim_summary = match self.mode {
             Mode::Ai => self.built.as_ref().map(|b| {
                 (
@@ -1454,53 +1695,88 @@ impl App {
                 ui.add_space(10.0);
             }
         }
-        ui.label(RichText::new(self.t("bom.title")).size(13.0).strong().color(fg));
-        ui.add_space(4.0);
-        for (value, kind, count) in &bom {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{count}")).size(12.0).color(accent));
-                ui.label(RichText::new(value).size(12.0).color(fg));
-                ui.label(RichText::new(kind).size(11.0).color(muted));
+        // The full list lives in its own tab, the way Tinkercad keeps the
+        // Component List out of the editing panel. Here it is one line and a
+        // door, not a second copy that can drift.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(self.t("bom.title")).size(13.0).strong().color(fg));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(parts.to_string()).size(12.0).color(accent));
             });
+        });
+        ui.add_space(3.0);
+        let open_bom = Button::new(RichText::new(self.t("bom.open")).size(11.5))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, muted.gamma_multiply(0.5)))
+            .corner_radius(crate::style::RADIUS)
+            .min_size(vec2(ui.available_width(), 26.0));
+        if ui.add(open_bom).clicked() {
+            self.tab = Tab::Parts;
         }
 
         ui.add_space(14.0);
         ui.separator();
         ui.add_space(8.0);
-        let full = vec2(ui.available_width(), 30.0);
-        if ui
-            .add(
-                Button::new(RichText::new(self.t("canvas.screenshot")).size(12.5))
-                    .min_size(full)
-                    .corner_radius(crate::style::RADIUS),
-            )
-            .clicked()
-        {
-            self.export_png();
-        }
+        // One Export button and a small menu of formats. The big button
+        // repeats whatever was picked last time.
+        let kind = match (self.export_kind, self.mode) {
+            (SaveKind::Sketch, Mode::Manual) => SaveKind::Bundle,
+            (kind, _) => kind,
+        };
+        let main_label = format!("{} {}", self.t("export.title"), kind.short());
+        let hint = format!(
+            "{} · {}",
+            self.t(&format!("save.{}", kind.key())),
+            self.t("export.more")
+        );
+        let save_png = self.t("save.png");
+        let save_svg = self.t("save.svg");
+        let save_bundle = self.t("save.bundle");
+        let save_sketch = self.t("save.sketch");
+        let save_csv = self.t("save.csv");
+        let mut picked: Option<SaveKind> = None;
         ui.horizontal(|ui| {
-            let half = (ui.available_width() - 6.0) / 2.0;
-            if ui
-                .add(Button::new(RichText::new(self.t("canvas.export")).size(12.0)).min_size(vec2(half, 28.0)))
-                .clicked()
-            {
-                self.export_files();
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let arrow = 30.0;
+            let main_w = (ui.available_width() - arrow - 4.0).max(60.0);
+            let export = Button::new(RichText::new(main_label).size(12.5))
+                .min_size(vec2(main_w, 30.0))
+                .corner_radius(crate::style::RADIUS);
+            if ui.add(export).on_hover_text(&hint).clicked() {
+                self.export_kind_now();
             }
-            if self.mode == Mode::Ai
-                && ui
-                    .add(
-                        Button::new(RichText::new(self.t("code.save")).size(12.0))
-                            .min_size(vec2(ui.available_width(), 28.0)),
-                    )
-                    .clicked()
-            {
-                self.save_sketch();
-            }
+            let arrow_resp = ui.menu_button("▾", |ui| {
+                if ui.button(save_png).clicked() {
+                    picked = Some(SaveKind::Png);
+                    ui.close();
+                }
+                if ui.button(save_svg).clicked() {
+                    picked = Some(SaveKind::Svg);
+                    ui.close();
+                }
+                if ui.button(save_bundle).clicked() {
+                    picked = Some(SaveKind::Bundle);
+                    ui.close();
+                }
+                if self.mode == Mode::Ai && ui.button(save_sketch).clicked() {
+                    picked = Some(SaveKind::Sketch);
+                    ui.close();
+                }
+                if ui.button(save_csv).clicked() {
+                    picked = Some(SaveKind::Csv);
+                    ui.close();
+                }
+            });
+            arrow_resp.response.on_hover_text(self.t("export.more"));
         });
+        if let Some(kind) = picked {
+            self.pick_export(kind);
+        }
 
         if self.mode == Mode::Ai && self.built.is_some() {
             ui.add_space(8.0);
             // The way out of the generated circuit: keep it, fix it by hand.
+            // Undo and redo belong to that bench, not to this one.
             if ui
                 .add(
                     Button::new(RichText::new(self.t("manual.edit")).size(12.0))
@@ -1548,69 +1824,82 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.tab == Tab::Circuit {
-                    let fit = Button::new(RichText::new("⤢").size(13.0)).min_size(vec2(26.0, 22.0));
-                    if ui.add(fit).on_hover_text(self.t("canvas.fit")).clicked() {
-                        self.view = View::default();
-                    }
-                    let (icon, next, mode_key) = match self.wire_style {
-                        WireStyle::Arc => ("∿", WireStyle::Straight, "wire.arc"),
-                        WireStyle::Straight => ("╱", WireStyle::Ortho, "wire.straight"),
-                        WireStyle::Ortho => ("⌐", WireStyle::Arc, "wire.ortho"),
-                    };
-                    let wire = Button::new(RichText::new(icon).size(13.0))
-                        .fill(if self.wire_style == WireStyle::Straight {
-                            accent.gamma_multiply(0.8)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .min_size(vec2(26.0, 22.0));
-                    let hint = format!("{}: {}", self.t("wire.style"), self.t(mode_key));
-                    if ui.add(wire).on_hover_text(hint).clicked() {
-                        self.set_wire_style(next);
-                        match self.mode {
-                            Mode::Ai => self.refresh_ai(),
-                            Mode::Manual => self.refresh_manual(),
-                        }
-                    }
-                    let mut labels = self.labels;
-                    let tag = Button::new(RichText::new("Aa").size(12.0))
-                        .fill(if self.labels {
-                            accent.gamma_multiply(0.8)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .min_size(vec2(28.0, 22.0));
-                    if ui
-                        .add(tag)
-                        .on_hover_text(self.t("canvas.labels"))
-                        .clicked()
-                    {
-                        labels = !labels;
-                    }
-                    // One small button for the sheet colour: sun for the
-                    // white Tinkercad canvas, moon for the black one.
-                    let dark = self.bench_dark;
-                    let bg = Button::new(RichText::new(if dark { "☾" } else { "☀" }).size(12.5))
-                        .fill(if dark {
-                            accent.gamma_multiply(0.8)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .min_size(vec2(26.0, 22.0));
-                    if ui
-                        .add(bg)
-                        .on_hover_text(self.t(if dark { "bg.black" } else { "bg.white" }))
-                        .clicked()
-                    {
-                        self.toggle_bench();
-                    }
                     ui.label(
                         RichText::new(format!("{}%", (self.view.zoom * 100.0).round() as i32))
                             .size(11.0)
                             .color(muted),
                     );
-                    if labels != self.labels {
-                        self.labels = labels;
+                    // One door to every drawing choice: background, labels,
+                    // cable routing and "fit". Four buttons were four guesses.
+                    let view_label = format!("{} ▾", self.t("view.title"));
+                    let mut toggle_labels = false;
+                    let mut toggle_bg = false;
+                    let mut fit = false;
+                    let mut style: Option<WireStyle> = None;
+                    let labels_on = self.labels;
+                    let dark = self.bench_dark;
+                    let current = self.wire_style;
+                    let (arc_lbl, straight_lbl, ortho_lbl) = (
+                        self.t("wire.arc"),
+                        self.t("wire.straight"),
+                        self.t("wire.ortho"),
+                    );
+                    let (labels_lbl, fit_lbl) = (
+                        self.t("canvas.labels"),
+                        self.t("canvas.fit"),
+                    );
+                    let (bg_now, narrow_lbl) = (
+                        self.t(if dark { "bg.black" } else { "bg.white" }),
+                        self.t("view.narrow"),
+                    );
+                    ui.menu_button(view_label, |ui| {
+                        let mark = |on: bool| if on { "✓ " } else { "  " };
+                        if ui
+                            .button(format!("{}{}", mark(labels_on), labels_lbl))
+                            .clicked()
+                        {
+                            toggle_labels = true;
+                            ui.close();
+                        }
+                        if ui.button(format!("{}{}", mark(dark), bg_now)).clicked() {
+                            toggle_bg = true;
+                            ui.close();
+                        }
+                        if ui.button(fit_lbl).clicked() {
+                            fit = true;
+                            ui.close();
+                        }
+                        if ui.button(narrow_lbl).clicked() {
+                            self.narrow = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        for (choice, lbl, on) in [
+                            (WireStyle::Arc, arc_lbl, current == WireStyle::Arc),
+                            (WireStyle::Straight, straight_lbl, current == WireStyle::Straight),
+                            (WireStyle::Ortho, ortho_lbl, current == WireStyle::Ortho),
+                        ] {
+                            if ui.button(format!("{}{}", mark(on), lbl)).clicked() {
+                                style = Some(choice);
+                                ui.close();
+                            }
+                        }
+                    });
+                    if fit {
+                        self.view = View::default();
+                    }
+                    if toggle_bg {
+                        self.toggle_bench();
+                    }
+                    if let Some(style) = style {
+                        self.set_wire_style(style);
+                        match self.mode {
+                            Mode::Ai => self.refresh_ai(),
+                            Mode::Manual => self.refresh_manual(),
+                        }
+                    }
+                    if toggle_labels {
+                        self.labels = !self.labels;
                         self.hover = None;
                         match self.mode {
                             Mode::Ai => self.refresh_ai(),
@@ -1893,6 +2182,24 @@ impl App {
                 }
             }
             hit.pin = best.1;
+            // A part under the pointer says what it is and why it is here.
+            // The hint follows the pointer and disappears with it, so it
+            // never competes with the bench for room.
+            if let Some(i) = part_under(&circuit, w) {
+                if hit.pin.is_none() {
+                    let p = &circuit.parts[i];
+                    let text = format!(
+                        "{} {} · {}",
+                        p.label,
+                        p.value,
+                        part_why(p.kind, self.lang)
+                    );
+                    let ink = self.c32(self.theme.fg);
+                    resp.clone().on_hover_ui_at_pointer(|ui| {
+                        ui.label(RichText::new(text).size(12.0).color(ink));
+                    });
+                }
+            }
         }
 
         // A rubber cable while a wire is half-pulled.
@@ -2248,19 +2555,42 @@ impl App {
             ui.label(RichText::new(self.t("checks.none")).size(12.0).color(muted));
             return;
         };
+        let warned = r.checks.iter().filter(|c| c.sev == Sev::Warn).count();
+        let failed = r.failed();
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{} {}", r.passed(), self.t("checks.passed")))
+                RichText::new(format!("{} ✓", r.passed()))
                     .size(12.0)
                     .color(accent),
             );
-            if r.failed() > 0 {
+            if warned > 0 {
                 ui.label(
-                    RichText::new(format!("{} {}", r.failed(), self.t("checks.failed")))
+                    RichText::new(format!("{warned} !"))
+                        .size(12.0)
+                        .color(Color32::from_rgb(0xD8, 0xA3, 0x2E)),
+                );
+            }
+            if failed > 0 {
+                ui.label(
+                    RichText::new(format!("{failed} ×"))
                         .size(12.0)
                         .color(Color32::from_rgb(0xD2, 0x4B, 0x45)),
                 );
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, key) = if self.checks_all {
+                    (self.t("checks.only_bad"), "checks.only_bad")
+                } else {
+                    (self.t("checks.all"), "checks.all")
+                };
+                let _ = key;
+                if ui
+                    .add(Button::new(RichText::new(label).size(11.0)).corner_radius(radius))
+                    .clicked()
+                {
+                    self.checks_all = !self.checks_all;
+                }
+            });
         });
         ui.add_space(6.0);
         Frame::NONE
@@ -2269,7 +2599,19 @@ impl App {
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for c in &r.checks {
+                    // The failures are the reason this tab was opened; the
+                    // green lines are evidence, shown on request.
+                    let shown: Vec<&checks::Check> = r
+                        .checks
+                        .iter()
+                        .filter(|c| self.checks_all || c.sev != Sev::Pass)
+                        .collect();
+                    if shown.is_empty() {
+                        ui.label(
+                            RichText::new(self.t("checks.clean")).size(12.0).color(accent),
+                        );
+                    }
+                    for c in shown {
                         let (mark, col) = match c.sev {
                             Sev::Pass => ("✓", accent),
                             Sev::Warn => ("!", Color32::from_rgb(0xD8, 0xA3, 0x2E)),
@@ -2463,6 +2805,137 @@ impl App {
         }
     }
 
+    /// The picker behind a chip of "I read it as". One field changes; the
+    /// sentence, the other two fields and the reader's intent stay as they
+    /// were.
+    fn recipe_window(
+        &mut self,
+        ctx: &egui::Context,
+        accent: Color32,
+        fg: Color32,
+        muted: Color32,
+        panel: Color32,
+        radius: CornerRadius,
+    ) {
+        let Some(chip) = self.recipe_ask.as_ref().map(|a| a.chip) else {
+            return;
+        };
+        let title = self.t("recipe.title");
+        let threshold_lbl = self.t("recipe.threshold");
+        let above_lbl = self.t("recipe.above");
+        let below_lbl = self.t("recipe.below");
+        let active_lbl = self.t("recipe.active");
+        let close_lbl = self.t("recipe.close");
+        let source_head = self.t("recipe.source");
+        let condition_head = self.t("recipe.condition");
+        let sink_head = self.t("recipe.sink");
+        let action = self.parsed.as_ref().and_then(|p| p.intent.action);
+        let Some(ask) = self.recipe_ask.as_mut() else { return };
+        let mut picked = false;
+        let mut close = false;
+        egui::Window::new(title.clone())
+            .id(egui::Id::unique("recipe-window"))
+            .anchor(Align2::LEFT_TOP, [360.0, 120.0])
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                Frame::NONE
+                    .fill(panel)
+                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                    .corner_radius(radius)
+                    .inner_margin(Margin::same(12)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&title).size(13.0).strong().color(accent));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(&close_lbl).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                match chip {
+                    Chip::Source => {
+                        ui.label(RichText::new(&source_head).size(11.0).color(muted));
+                        ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            for s in SOURCES {
+                                let on = ask.recipe.source == s.id;
+                                let text = format!(
+                                    "{} — {}",
+                                    s.short.get(self.lang),
+                                    s.title.get(self.lang)
+                                );
+                                if ui.selectable_label(on, RichText::new(text).size(12.0)).clicked() {
+                                    ask.recipe.source = s.id;
+                                    picked = true;
+                                }
+                            }
+                        });
+                    }
+                    Chip::Condition => {
+                        ui.label(RichText::new(&condition_head).size(11.0).color(muted));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&threshold_lbl).size(11.5).color(muted));
+                            ui.add(egui::DragValue::new(&mut ask.number).speed(1.0));
+                        });
+                        ui.add_space(6.0);
+                        let n = ask.number;
+                        for (text, condition) in [
+                            (format!("{above_lbl} {n}"), Condition::Above(n)),
+                            (format!("{below_lbl} {n}"), Condition::Below(n)),
+                            (active_lbl.clone(), Condition::Active),
+                        ] {
+                            if ui
+                                .add(
+                                    Button::new(RichText::new(text).size(12.0))
+                                        .min_size(vec2(ui.available_width(), 26.0))
+                                        .corner_radius(crate::style::RADIUS),
+                                )
+                                .clicked()
+                            {
+                                ask.recipe.condition = Some(condition);
+                                picked = true;
+                            }
+                        }
+                    }
+                    Chip::Sink => {
+                        ui.label(RichText::new(&sink_head).size(11.0).color(muted));
+                        ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            for s in SINKS {
+                                let on = ask.recipe.sink == s.id;
+                                let text = s.title.get(self.lang);
+                                let verb = crate::compose::behavior_for(s.id, action);
+                                if ui
+                                    .selectable_label(
+                                        on,
+                                        RichText::new(format!("{text} · {}", verb.label().get(self.lang)))
+                                            .size(12.0),
+                                    )
+                                    .clicked()
+                                {
+                                    ask.recipe.sink = s.id;
+                                    ask.recipe.behavior = verb;
+                                    picked = true;
+                                }
+                            }
+                        });
+                    }
+                }
+                let _ = fg;
+            });
+        if picked {
+            let recipe = ask.recipe;
+            self.recipe_ask = None;
+            self.apply_recipe(recipe);
+        } else if close {
+            self.recipe_ask = None;
+        }
+    }
+
     fn value_window(
         &mut self,
         ctx: &egui::Context,
@@ -2598,11 +3071,87 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         accent: Color32,
-        _fg: Color32,
+        fg: Color32,
         muted: Color32,
         panel: Color32,
         radius: CornerRadius,
     ) {
+        // A task from the last session: continue it or start clean. The
+        // draft is written on every plan, so closing the window is not work
+        // lost any more.
+        if let Some((task, _manual)) = self.resume.clone() {
+            let screen = ctx.content_rect();
+            let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("resume-dim"));
+            ctx.layer_painter(layer)
+                .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(150));
+            let title = self.t("resume.title");
+            let body = self.t("resume.body");
+            let yes = self.t("resume.yes");
+            let no = self.t("resume.no");
+            let mut resume = false;
+            let mut fresh = false;
+            egui::Window::new(title.clone())
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .title_bar(false)
+                .frame(
+                    Frame::NONE
+                        .fill(panel)
+                        .stroke(Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                        .corner_radius(radius)
+                        .inner_margin(Margin::same(18)),
+                )
+                .show(ctx, |ui| {
+                    ui.set_width(400.0);
+                    ui.label(RichText::new(&title).size(16.0).strong().color(accent));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&body).size(12.0).color(muted));
+                    ui.add_space(8.0);
+                    Frame::NONE
+                        .fill(ui.visuals().extreme_bg_color)
+                        .corner_radius(crate::style::RADIUS)
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            let short = if task.chars().count() > 180 {
+                                format!("{}…", task.chars().take(180).collect::<String>())
+                            } else {
+                                task.clone()
+                            };
+                            ui.label(RichText::new(short).size(12.5).color(fg));
+                        });
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                Button::new(RichText::new(&yes).strong().size(12.5))
+                                    .fill(accent)
+                                    .corner_radius(crate::style::RADIUS)
+                                    .min_size(vec2(150.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            resume = true;
+                        }
+                        if ui
+                            .add(
+                                Button::new(RichText::new(&no).size(12.5))
+                                    .corner_radius(crate::style::RADIUS)
+                                    .min_size(vec2(150.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            fresh = true;
+                        }
+                    });
+                });
+            if resume {
+                self.resume_task();
+            } else if fresh {
+                self.start_fresh();
+            }
+        }
+
         if self.help {
             let screen = ctx.content_rect();
             let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("help-dim"));
@@ -2610,7 +3159,7 @@ impl App {
                 .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(160));
             let keys: [(&str, &str); 13] = [
                 ("Ctrl+Enter", "help.plan"),
-                ("Ctrl+S", "help.screen"),
+                ("Ctrl+S", "export.title"),
                 ("Ctrl+E", "help.export"),
                 ("Ctrl+Z", "manual.undo"),
                 ("Ctrl+Shift+Z", "manual.redo"),
@@ -2618,10 +3167,10 @@ impl App {
                 ("Shift+R", "manual.rotate_board"),
                 ("Delete", "manual.delete_hint"),
                 ("F", "help.fit"),
+                ("Ctrl+B", "view.narrow"),
                 ("?", "help.title"),
                 ("Q", "help.quit"),
                 ("Esc", "help.close"),
-                ("—", "help.build"),
             ];
             egui::Window::new(self.t("help.title"))
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2641,9 +3190,6 @@ impl App {
                     });
                     ui.add_space(8.0);
                     for (k, key) in keys {
-                        if key == "help.build" {
-                            continue;
-                        }
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(k).monospace().size(12.0).color(accent));
                             ui.label(RichText::new(self.t(key)).size(12.0).color(muted));
@@ -2824,6 +3370,160 @@ fn palette_button(
         fg,
     );
     resp
+}
+
+/// A card of the start gallery: pictogram, phrase, one click.
+fn sample_card(
+    ui: &mut egui::Ui,
+    sample: &Sample,
+    width: f32,
+    lang: Lang,
+    accent: Color32,
+    fg: Color32,
+    muted: Color32,
+) -> egui::Response {
+    let text = sample.task.get(lang);
+    let galley = ui
+        .painter()
+        .layout(text.to_owned(), FontId::proportional(11.0), fg, width - 16.0);
+    let height = (galley.size().y + 36.0).max(52.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let fill = if resp.hovered() {
+        ui.visuals().panel_fill.lerp_to_gamma(Color32::WHITE, 0.05)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let border = if resp.hovered() {
+        accent
+    } else {
+        muted.gamma_multiply(0.45)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, crate::style::RADIUS, fill);
+    painter.rect_stroke(
+        rect,
+        crate::style::RADIUS,
+        Stroke::new(1.0, border),
+        StrokeKind::Inside,
+    );
+    let icon_rect =
+        egui::Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(18.0, 18.0));
+    icons::paint(painter, icon_rect, sample.icon, accent);
+    painter.galley(pos2(rect.left() + 8.0, rect.top() + 30.0), galley, fg);
+    resp
+}
+
+/// The three chips of a composition: sensor, condition, output.
+fn recipe_chips(c: Composition, lang: Lang) -> Vec<(Chip, String, String)> {
+    let source = spec::source(c.source);
+    let sink = spec::sink(c.sink);
+    vec![
+        (
+            Chip::Source,
+            source.short.get(lang).to_owned(),
+            L::new("Источник: изменить", "Source: change")
+                .get(lang)
+                .to_owned(),
+        ),
+        (
+            Chip::Condition,
+            condition_text(c, lang),
+            L::new("Условие: изменить", "Condition: change")
+                .get(lang)
+                .to_owned(),
+        ),
+        (
+            Chip::Sink,
+            sink.title.get(lang).to_owned(),
+            format!(
+                "{}: {}",
+                L::new("Приёмник", "Output").get(lang),
+                c.behavior.label().get(lang)
+            ),
+        ),
+    ]
+}
+
+/// The threshold the source falls back to when the sentence named none.
+fn default_condition(c: Composition) -> Condition {
+    spec::source(c.source)
+        .variants
+        .first()
+        .map(|v| v.condition)
+        .unwrap_or(Condition::Active)
+}
+
+/// The number the condition picker starts with.
+fn recipe_number(c: Composition) -> f32 {
+    match c.condition.unwrap_or_else(|| default_condition(c)) {
+        Condition::Above(n)
+        | Condition::Below(n)
+        | Condition::AboveBand { on: n, .. }
+        | Condition::BelowBand { on: n, .. }
+        | Condition::Between { low: n, .. } => n,
+        Condition::Active => 20.0,
+    }
+}
+
+/// A threshold as a chip would say it: "выше 30", "есть сигнал", "20…30".
+fn condition_text(c: Composition, lang: Lang) -> String {
+    if c.behavior == Behavior::Show {
+        return L::new("показание", "the reading").get(lang).to_owned();
+    }
+    let above = L::new("выше", "above").get(lang);
+    let below = L::new("ниже", "below").get(lang);
+    let back = L::new("возврат", "return").get(lang);
+    match c.condition.unwrap_or_else(|| default_condition(c)) {
+        Condition::Above(n) => format!("{above} {n}"),
+        Condition::Below(n) => format!("{below} {n}"),
+        Condition::Active => L::new("есть сигнал", "signal present").get(lang).to_owned(),
+        Condition::AboveBand { on, off } => format!("{above} {on} · {back} {off}"),
+        Condition::BelowBand { on, off } => format!("{below} {on} · {back} {off}"),
+        Condition::Between { low, high } => format!("{low}…{high}"),
+    }
+}
+
+/// Why a part is on the bench, in a few words: the tooltip that answers "what
+/// is this doing here" without another panel.
+fn part_why(kind: crate::model::Kind, lang: Lang) -> &'static str {
+    use crate::model::Kind;
+    let (ru, en) = match kind {
+        Kind::Arduino => ("мозг схемы", "the brain of the circuit"),
+        Kind::Resistor => ("ограничивает ток", "limits the current"),
+        Kind::Led => ("показывает результат", "shows the result"),
+        Kind::Diode => ("не пускает ток назад", "blocks the reverse current"),
+        Kind::Nmos | Kind::Npn => ("ключает нагрузку", "switches the load"),
+        Kind::Button | Kind::Reed => ("ввод от человека", "a human input"),
+        Kind::Motor | Kind::Servo | Kind::Buzzer | Kind::Speaker | Kind::Relay | Kind::Peltier => {
+            ("исполнитель: делает то, что просили", "the output: it does the work")
+        }
+        Kind::Pot => ("регулятор", "a knob"),
+        Kind::Ldr => ("измеряет свет", "reads the light"),
+        Kind::Tmp36 => ("измеряет температуру", "reads the temperature"),
+        Kind::Capacitor | Kind::Electrolytic => ("сглаживает питание", "smooths the supply"),
+        Kind::Module => ("готовая плата: датчик или экран", "a ready board: a sensor or a screen"),
+        _ => ("деталь схемы", "a part of the circuit"),
+    };
+    if lang == Lang::Ru {
+        ru
+    } else {
+        en
+    }
+}
+
+/// The smallest part whose footprint is under the pointer.
+fn part_under(c: &Circuit, at: Pt) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, p) in c.parts.iter().enumerate() {
+        let r = c.part_rect(p);
+        if r.inflate(0.8).contains(at) {
+            let area = r.w * r.h;
+            if best.map(|(_, a)| area < a).unwrap_or(true) {
+                best = Some((i, area));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 fn install_fonts(ctx: &egui::Context) {
