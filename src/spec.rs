@@ -77,6 +77,12 @@ pub enum Behavior {
     Switch,
     /// The reading goes to a screen instead of driving a threshold.
     Show,
+    /// A servo moves to a working angle and returns when the condition clears.
+    Turn,
+    /// A motor runs while the condition holds.
+    Spin,
+    /// An RGB LED shows one colour for the condition and another without it.
+    Color,
 }
 
 impl Behavior {
@@ -88,6 +94,9 @@ impl Behavior {
             Behavior::Beep => L::new("пищать", "beep"),
             Behavior::Switch => L::new("щёлкать", "switch"),
             Behavior::Show => L::new("показывать", "show"),
+            Behavior::Turn => L::new("поворачивать", "turn"),
+            Behavior::Spin => L::new("вращаться", "spin"),
+            Behavior::Color => L::new("подсвечивать", "light up in colour"),
         }
     }
 }
@@ -101,6 +110,9 @@ pub enum SinkId {
     Lcd,
     Lcd2004,
     Oled,
+    Servo,
+    Motor,
+    Rgb,
 }
 
 /// How a sink reaches the Uno. A single pin is allocated from the free list;
@@ -169,6 +181,9 @@ pub struct SinkSpec {
     pub title: L,
     /// Candidate Uno pins, best first. For an I2C board: SDA and SCL.
     pub pins: &'static [&'static str],
+    /// How many of those pins the sink takes: one for a lamp, three for an
+    /// RGB LED. The I2C bus ignores it.
+    pub take: usize,
     pub current_ma: u16,
     pub wiring: SinkWiring,
     /// The ready-made board dropped on the bench, for display sinks.
@@ -898,6 +913,7 @@ pub const SINKS: &[SinkSpec] = &[
         id: SinkId::Led,
         title: L::new("светодиод", "LED"),
         pins: &["D9", "D10", "D11", "D6", "D5"],
+        take: 1,
         current_ma: 20,
         wiring: SinkWiring::Pin,
         module: None,
@@ -911,6 +927,7 @@ pub const SINKS: &[SinkSpec] = &[
         id: SinkId::Buzzer,
         title: L::new("пищалка", "buzzer"),
         pins: &["D8", "D7", "D6", "D5"],
+        take: 1,
         current_ma: 30,
         wiring: SinkWiring::Pin,
         module: None,
@@ -924,6 +941,7 @@ pub const SINKS: &[SinkSpec] = &[
         id: SinkId::Relay,
         title: L::new("реле", "relay"),
         pins: &["D7", "D6", "D5"],
+        take: 1,
         current_ma: 70,
         wiring: SinkWiring::Pin,
         module: None,
@@ -937,6 +955,7 @@ pub const SINKS: &[SinkSpec] = &[
         id: SinkId::Lcd,
         title: L::new("дисплей LCD1602", "an LCD1602 display"),
         pins: &["A4", "A5"],
+        take: 2,
         current_ma: 25,
         wiring: SinkWiring::I2c,
         module: Some("LCD1602"),
@@ -950,6 +969,7 @@ pub const SINKS: &[SinkSpec] = &[
         id: SinkId::Lcd2004,
         title: L::new("дисплей LCD2004", "an LCD2004 display"),
         pins: &["A4", "A5"],
+        take: 2,
         current_ma: 30,
         wiring: SinkWiring::I2c,
         module: Some("LCD2004"),
@@ -963,6 +983,7 @@ pub const SINKS: &[SinkSpec] = &[
         id: SinkId::Oled,
         title: L::new("дисплей OLED 0.96", "an OLED 0.96 display"),
         pins: &["A4", "A5"],
+        take: 2,
         current_ma: 15,
         wiring: SinkWiring::I2c,
         module: Some("OLED 0.96"),
@@ -971,6 +992,49 @@ pub const SINKS: &[SinkSpec] = &[
         globals: "Adafruit_SSD1306 display(128, 64, &Wire, -1);\n",
         setup: "  Wire.begin();\n  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println(F(\"no SSD1306\"));\n  display.clearDisplay();\n  display.setTextColor(SSD1306_WHITE);\n",
         show: "  display.clearDisplay();\n  display.setTextSize(1);\n  display.setCursor(0, 0);\n  display.print(F(\"<<NAME>>\"));\n  display.setTextSize(2);\n  display.setCursor(0, 20);\n  display.print(value, <<DECIMALS>>);\n  display.display();\n",
+    },
+    SinkSpec {
+        id: SinkId::Servo,
+        title: L::new("сервопривод", "a servo"),
+        pins: &["D9", "D10", "D11", "D6", "D5"],
+        take: 1,
+        current_ma: 250,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "#include <Servo.h>\n",
+        globals: "Servo arm;\n",
+        setup: "  arm.attach(SINK_PIN);\n",
+        show: "",
+    },
+    SinkSpec {
+        id: SinkId::Motor,
+        title: L::new("мотор", "a motor"),
+        // PWM pins only: the sketch drives the switch with analogWrite.
+        pins: &["D9", "D10", "D11", "D6", "D5"],
+        take: 1,
+        current_ma: 250,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "",
+        globals: "",
+        setup: "",
+        show: "",
+    },
+    SinkSpec {
+        id: SinkId::Rgb,
+        title: L::new("RGB-светодиод", "an RGB LED"),
+        pins: &["D9", "D10", "D11", "D6", "D5"],
+        take: 3,
+        current_ma: 60,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "",
+        globals: "",
+        setup: "",
+        show: "",
     },
 ];
 

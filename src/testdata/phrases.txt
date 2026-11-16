@@ -383,6 +383,14 @@ colour above 300 led | compose:Color/Led/Blink
 temperature on the display | compose:Temperature/Lcd/Show
 pressure on the oled | compose:Pressure/Oled/Show
 температура на lcd2004 | compose:Temperature/Lcd2004/Show
+расстояние меньше 20 серво | compose:Range/Servo/Turn
+температура выше 30 мотор | compose:Temperature/Motor/Spin
+газ выше 400 rgb | compose:Gas/Rgb/Color
+влажность выше 60 включи вентилятор | compose:Humidity/Motor/Spin
+движение включи мотор | compose:Motion/Motor/Spin
+distance below 20 servo | compose:Range/Servo/Turn
+temperature above 30 motor | compose:Temperature/Motor/Spin
+gas above 400 rgb | compose:Gas/Rgb/Color
 
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse

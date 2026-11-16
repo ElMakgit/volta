@@ -1262,7 +1262,7 @@ impl B {
         self.axial(Kind::Led, label, value, col, row, 1)
     }
 
-    fn diode(&mut self, label: &str, value: &str, x: f32, y: f32) -> (End, End) {
+    pub(crate) fn diode(&mut self, label: &str, value: &str, x: f32, y: f32) -> (End, End) {
         let a = Pt::new(x, y);
         let k = Pt::new(x + 10.0, y);
         let p = self.c.add_part(
@@ -1280,7 +1280,7 @@ impl B {
     }
 
     /// TO-92 transistor standing legs-down in three adjacent columns.
-    fn to92(
+    pub(crate) fn to92(
         &mut self,
         kind: Kind,
         label: &str,
@@ -1375,7 +1375,7 @@ impl B {
         End::Pin(self.c.pin(part, name))
     }
 
-    fn rgb(&mut self, label: &str, value: &str, col: u8, row: Row) -> Vec<End> {
+    pub(crate) fn rgb(&mut self, label: &str, value: &str, col: u8, row: Row) -> Vec<End> {
         let b = self.c.board;
         let names = ["R", "G", "B", "-"];
         let mut pins = Vec::new();

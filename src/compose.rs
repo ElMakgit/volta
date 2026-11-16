@@ -71,6 +71,20 @@ pub fn detect(
         || text.contains("siren")
     {
         SinkId::Buzzer
+    } else if text.contains("серво") || text.contains("servo") {
+        SinkId::Servo
+    } else if text.contains("мотор")
+        || text.contains("motor")
+        || text.contains("двигател")
+        || text.contains("вентилятор")
+        || text.contains("насос")
+    {
+        SinkId::Motor
+    } else if text.contains("rgb")
+        || text.contains("трехцвет")
+        || text.contains("цветной светодиод")
+    {
+        SinkId::Rgb
     } else if names_screen {
         // A character display is the plainer readout: it is what "дисплей"
         // means by default, and the one the lessons put first. OLED has to be
@@ -97,6 +111,9 @@ pub fn detect(
         SinkId::Buzzer => Behavior::Beep,
         SinkId::Relay => Behavior::Switch,
         SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled => Behavior::Show,
+        SinkId::Servo => Behavior::Turn,
+        SinkId::Motor => Behavior::Spin,
+        SinkId::Rgb => Behavior::Color,
     };
     Some(Composition {
         source: source.id,
@@ -171,11 +188,19 @@ fn resolve(c: &Composition, variant: usize) -> Option<Resolved<'static>> {
     let sink_pins = match sink.wiring {
         // A part cannot land on a pin the source already uses. The first free
         // candidate wins, which keeps the drawing stable between runs.
-        SinkWiring::Pin => vec![sink
-            .pins
-            .iter()
-            .copied()
-            .find(|p| !v.pins.contains(p))?],
+        SinkWiring::Pin => {
+            let free: Vec<&'static str> = sink
+                .pins
+                .iter()
+                .copied()
+                .filter(|p| !v.pins.contains(p))
+                .take(sink.take)
+                .collect();
+            if free.len() < sink.take {
+                return None;
+            }
+            free
+        }
         // The bus is shared on purpose: an I2C source and an I2C screen are
         // two devices on the same two wires.
         SinkWiring::I2c => sink.pins.to_vec(),
@@ -208,6 +233,9 @@ fn action_phrase(sink: SinkId, behavior: Behavior, lang: Lang) -> &'static str {
         (SinkId::Lcd, _) => tr(lang, "вывод на LCD1602", "an LCD1602 readout"),
         (SinkId::Lcd2004, _) => tr(lang, "вывод на LCD2004", "an LCD2004 readout"),
         (SinkId::Oled, _) => tr(lang, "вывод на OLED", "an OLED readout"),
+        (SinkId::Servo, _) => tr(lang, "серво по условию", "a servo on condition"),
+        (SinkId::Motor, _) => tr(lang, "мотор по условию", "a motor on condition"),
+        (SinkId::Rgb, _) => tr(lang, "цвет по условию", "a colour on condition"),
     }
 }
 
@@ -358,6 +386,18 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
             "OLED на шине I2C: SDA на A4, SCL на A5; адрес бывает 0x3C или 0x3D.",
             "The OLED sits on I2C: SDA on A4, SCL on A5; its address is 0x3C or 0x3D.",
         ),
+        SinkId::Servo => L::new(
+            "Серво поворачивается в 90° по условию и возвращается в 0. SG90 питается от 5 В.",
+            "The servo turns to 90° while the condition holds and back to 0. An SG90 runs on 5 V.",
+        ),
+        SinkId::Motor => L::new(
+            "Мотор включает MOSFET низкой стороны; диод гасит выброс обмотки.",
+            "A low-side MOSFET switches the motor; the diode absorbs the coil's kickback.",
+        ),
+        SinkId::Rgb => L::new(
+            "RGB-светодиод: красный и зелёный с общим катодом, по резистору на канал.",
+            "The RGB LED has red and green channels and a common cathode, one resistor each.",
+        ),
     });
     // A screen has no threshold to tune: the reading goes out as it is.
     if r.behavior != Behavior::Show {
@@ -489,6 +529,45 @@ fn place_sink(b: &mut B, r: &Resolved) -> Option<()> {
             b.w(rl[4], siren[1], NetClass::Signal);
             b.w(siren[0], b.uno_pin("GND1"), NetClass::Gnd);
         }
+        SinkId::Servo => {
+            let s = b.bench(Kind::Servo, "S1", "SG90", Pt::new(50.0, 54.0));
+            b.w(b.uno_pin(pin), s[2], NetClass::Signal);
+            b.w(s[1], b.uno_pin("5V"), NetClass::Vcc);
+            b.w(s[0], b.uno_pin("GND1"), NetClass::Gnd);
+        }
+        SinkId::Motor => {
+            // The lesson's low-side switch, moved to the free half of the
+            // bench so the source board keeps its corner.
+            let (ra, rb) = b.res("R3", "220 Ом", 21, Row::A, 3);
+            let q = b.to92(Kind::Nmos, "Q1", "IRLZ44N", 25, Row::E, ["G", "S", "D"]);
+            let (_r4a, r4b) = b.res("R4", "10 кОм", 25, Row::A, 3);
+            let m = b.bench(Kind::Motor, "M1", "5 В DC", Pt::new(52.0, 54.0));
+            let d = b.diode("D1", "1N4007", 52.0, 82.0);
+            let vcc = b.vcc(82.0);
+            b.w(b.uno_pin(pin), ra, NetClass::Signal);
+            b.w(rb, q[0], NetClass::Signal);
+            b.w(r4b, b.gnd(74.0), NetClass::Gnd);
+            b.w(q[1], b.gnd(70.0), NetClass::Gnd);
+            b.w(q[2], m[1], NetClass::Signal);
+            b.w(m[0], vcc, NetClass::Vcc);
+            b.w(d.1, m[0], NetClass::Vcc);
+            b.w(d.0, m[1], NetClass::Signal);
+        }
+        SinkId::Rgb => {
+            // Three channels, three resistors: the strip joins each resistor
+            // to its own leg of the LED.
+            let (ra, rb) = b.res("R3", "220 Ом", 20, Row::A, 3);
+            let (ga, gb) = b.res("R4", "220 Ом", 21, Row::B, 3);
+            let (ba, bb) = b.res("R5", "220 Ом", 22, Row::C, 3);
+            let led = b.rgb("D1", "RGB общий катод", 26, Row::E);
+            for (target, start) in r.sink_pins.iter().zip([ra, ga, ba]) {
+                b.w(b.uno_pin(target), start, NetClass::Signal);
+            }
+            for (end, leg) in [(rb, led[0]), (gb, led[1]), (bb, led[2])] {
+                b.w(end, leg, NetClass::Signal);
+            }
+            b.w(led[3], b.gnd(52.0), NetClass::Gnd);
+        }
         SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled => {
             let spec = sink(r.sink);
             let name = spec.module?;
@@ -559,21 +638,50 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
                 "",
                 "  digitalWrite(SINK_PIN, active ? LOW : HIGH);\n",
             ),
+            (SinkId::Servo, _) => ("", "  arm.write(active ? 90 : 0);\n"),
+            (SinkId::Motor, _) => ("", "  analogWrite(SINK_PIN, active ? 255 : 0);\n"),
+            (SinkId::Rgb, _) => (
+                "",
+                "  digitalWrite(R_PIN, active ? HIGH : LOW);\n  digitalWrite(G_PIN, active ? LOW : HIGH);\n  digitalWrite(B_PIN, active ? LOW : HIGH);\n",
+            ),
             // Screens are handled by the branch above; this keeps the match
             // exhaustive without pretending a display has a threshold.
             (SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled, _) => ("", ""),
         };
         (extra.to_string(), active, action.to_string())
     };
-    let pins = if show {
-        String::new()
+    let (pins, output) = if show {
+        (String::new(), String::new())
+    } else if r.sink == SinkId::Rgb {
+        let numbers: Vec<&str> = r
+            .sink_pins
+            .iter()
+            .map(|p| p.trim_start_matches('D'))
+            .collect();
+        (
+            format!(
+                "const uint8_t R_PIN = {};\nconst uint8_t G_PIN = {};\nconst uint8_t B_PIN = {};\n",
+                numbers[0], numbers[1], numbers[2]
+            ),
+            "  pinMode(R_PIN, OUTPUT);\n  pinMode(G_PIN, OUTPUT);\n  pinMode(B_PIN, OUTPUT);\n"
+                .to_string(),
+        )
     } else {
-        format!(
-            "const uint8_t SINK_PIN = {};\n",
-            r.sink_pins[0].trim_start_matches('D')
+        // The servo library claims its pin in attach(), so a pinMode here
+        // would only fight it.
+        let output = if r.sink == SinkId::Servo {
+            String::new()
+        } else {
+            "  pinMode(SINK_PIN, OUTPUT);\n".to_string()
+        };
+        (
+            format!(
+                "const uint8_t SINK_PIN = {};\n",
+                r.sink_pins[0].trim_start_matches('D')
+            ),
+            output,
         )
     };
-    let output = if show { "" } else { "  pinMode(SINK_PIN, OUTPUT);\n" };
     let includes = join_unique(r.variant.includes, spec.includes);
     let globals = join_unique(r.variant.globals, spec.globals);
     let setup = format!("{}{}", r.variant.setup, spec.setup);
@@ -608,7 +716,7 @@ void loop() {
         ("PINS", pins.as_str()),
         ("EXTRA", extra.as_str()),
         ("SETUP", setup.as_str()),
-        ("SETUP_PIN", output),
+        ("SETUP_PIN", output.as_str()),
         ("SAMPLE", r.variant.sample),
         ("ACTIVE", active.as_str()),
         ("ACTION", action.as_str()),
@@ -702,6 +810,9 @@ mod tests {
                     (SinkId::Lcd, Behavior::Show),
                     (SinkId::Lcd2004, Behavior::Show),
                     (SinkId::Oled, Behavior::Show),
+                    (SinkId::Servo, Behavior::Turn),
+                    (SinkId::Motor, Behavior::Spin),
+                    (SinkId::Rgb, Behavior::Color),
                 ] {
                     let c = Composition {
                         source: source.id,
@@ -883,6 +994,56 @@ mod tests {
         };
         assert!(uses("A4") && uses("A5"));
         assert_eq!(built.code.matches("#include <Wire.h>").count(), 1);
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// A servo turns to its working angle while the condition holds and
+    /// returns to zero when it clears.
+    #[test]
+    fn a_servo_turns_on_the_condition() {
+        let p = parse("расстояние меньше 20 серво");
+        let recipe = p.intent.recipe.expect("the ranger composes");
+        assert_eq!(recipe.sink, SinkId::Servo);
+        assert_eq!(recipe.behavior, Behavior::Turn);
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("#include <Servo.h>"));
+        assert!(built.code.contains("arm.attach(SINK_PIN)"));
+        assert!(built.code.contains("arm.write(active ? 90 : 0)"));
+        assert!(!built.code.contains("pinMode(SINK_PIN"));
+        assert!(built.circuit.parts.iter().any(|q| q.kind == Kind::Servo));
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// A motor is switched by a MOSFET with a gate resistor, a pulldown and a
+    /// flyback diode — the checks insist on all three.
+    #[test]
+    fn a_motor_gets_a_switch_and_a_diode() {
+        let p = parse("температура выше 30 мотор");
+        let recipe = p.intent.recipe.expect("composes");
+        assert_eq!(recipe.sink, SinkId::Motor);
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("analogWrite(SINK_PIN, active ? 255 : 0)"));
+        for kind in [Kind::Motor, Kind::Nmos, Kind::Diode, Kind::Resistor] {
+            assert!(
+                built.circuit.parts.iter().any(|q| q.kind == kind),
+                "{kind:?} missing"
+            );
+        }
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// An RGB LED takes three free pins and shows one colour for the
+    /// condition, another without it.
+    #[test]
+    fn an_rgb_led_takes_three_pins() {
+        let p = parse("газ выше 400 rgb");
+        let recipe = p.intent.recipe.expect("composes");
+        assert_eq!(recipe.sink, SinkId::Rgb);
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        for pin in ["R_PIN", "G_PIN", "B_PIN"] {
+            assert!(built.code.contains(&format!("const uint8_t {pin}")), "{pin}");
+        }
+        assert!(built.code.contains("digitalWrite(R_PIN, active ? HIGH : LOW)"));
         assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
     }
 
