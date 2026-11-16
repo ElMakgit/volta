@@ -75,6 +75,8 @@ pub enum Behavior {
     Solid,
     Beep,
     Switch,
+    /// The reading goes to a screen instead of driving a threshold.
+    Show,
 }
 
 impl Behavior {
@@ -85,6 +87,7 @@ impl Behavior {
             Behavior::Solid => L::new("гореть", "light up"),
             Behavior::Beep => L::new("пищать", "beep"),
             Behavior::Switch => L::new("щёлкать", "switch"),
+            Behavior::Show => L::new("показывать", "show"),
         }
     }
 }
@@ -95,6 +98,17 @@ pub enum SinkId {
     Led,
     Buzzer,
     Relay,
+    Lcd,
+    Lcd2004,
+    Oled,
+}
+
+/// How a sink reaches the Uno. A single pin is allocated from the free list;
+/// an I2C board uses the bus, which a source may already be on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SinkWiring {
+    Pin,
+    I2c,
 }
 
 /// One source, one sink, one condition. This is what the parser stores in an
@@ -149,14 +163,24 @@ pub struct SourceSpec {
 
 pub struct SinkSpec {
     /// Kept even when only the tests read it: the id ties the table to the
-    /// enum, and the title is what a future plan card shows.
+    /// enum, and the title is what the plan card shows.
     #[allow(dead_code)]
     pub id: SinkId,
-    #[allow(dead_code)]
     pub title: L,
-    /// Candidate Uno pins, best first.
+    /// Candidate Uno pins, best first. For an I2C board: SDA and SCL.
     pub pins: &'static [&'static str],
     pub current_ma: u16,
+    pub wiring: SinkWiring,
+    /// The ready-made board dropped on the bench, for display sinks.
+    pub module: Option<&'static str>,
+    /// Where that board sits.
+    pub at: (f32, f32),
+    /// Sketch fragments the board brings.
+    pub includes: &'static str,
+    pub globals: &'static str,
+    pub setup: &'static str,
+    /// What goes into the loop when the sink is a screen.
+    pub show: &'static str,
 }
 
 const WARMUP: L = L::new(
@@ -875,18 +899,78 @@ pub const SINKS: &[SinkSpec] = &[
         title: L::new("светодиод", "LED"),
         pins: &["D9", "D10", "D11", "D6", "D5"],
         current_ma: 20,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "",
+        globals: "",
+        setup: "",
+        show: "",
     },
     SinkSpec {
         id: SinkId::Buzzer,
         title: L::new("пищалка", "buzzer"),
         pins: &["D8", "D7", "D6", "D5"],
         current_ma: 30,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "",
+        globals: "",
+        setup: "",
+        show: "",
     },
     SinkSpec {
         id: SinkId::Relay,
         title: L::new("реле", "relay"),
         pins: &["D7", "D6", "D5"],
         current_ma: 70,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "",
+        globals: "",
+        setup: "",
+        show: "",
+    },
+    SinkSpec {
+        id: SinkId::Lcd,
+        title: L::new("дисплей LCD1602", "an LCD1602 display"),
+        pins: &["A4", "A5"],
+        current_ma: 25,
+        wiring: SinkWiring::I2c,
+        module: Some("LCD1602"),
+        at: (44.0, 64.0),
+        includes: "#include <Wire.h>\n#include <LiquidCrystal_I2C.h>\n",
+        globals: "LiquidCrystal_I2C lcd(0x27, 16, 2);\n",
+        setup: "  lcd.init();\n  lcd.backlight();\n",
+        show: "  lcd.clear();\n  lcd.setCursor(0, 0);\n  lcd.print(F(\"<<NAME>>\"));\n  lcd.setCursor(0, 1);\n  lcd.print(value, <<DECIMALS>>);\n",
+    },
+    SinkSpec {
+        id: SinkId::Lcd2004,
+        title: L::new("дисплей LCD2004", "an LCD2004 display"),
+        pins: &["A4", "A5"],
+        current_ma: 30,
+        wiring: SinkWiring::I2c,
+        module: Some("LCD2004"),
+        at: (36.0, 64.0),
+        includes: "#include <Wire.h>\n#include <LiquidCrystal_I2C.h>\n",
+        globals: "LiquidCrystal_I2C lcd(0x27, 20, 4);\n",
+        setup: "  lcd.init();\n  lcd.backlight();\n",
+        show: "  lcd.clear();\n  lcd.setCursor(0, 0);\n  lcd.print(F(\"<<NAME>>\"));\n  lcd.setCursor(0, 1);\n  lcd.print(value, <<DECIMALS>>);\n",
+    },
+    SinkSpec {
+        id: SinkId::Oled,
+        title: L::new("дисплей OLED 0.96", "an OLED 0.96 display"),
+        pins: &["A4", "A5"],
+        current_ma: 15,
+        wiring: SinkWiring::I2c,
+        module: Some("OLED 0.96"),
+        at: (44.0, 64.0),
+        includes: "#include <Wire.h>\n#include <Adafruit_GFX.h>\n#include <Adafruit_SSD1306.h>\n",
+        globals: "Adafruit_SSD1306 display(128, 64, &Wire, -1);\n",
+        setup: "  Wire.begin();\n  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println(F(\"no SSD1306\"));\n  display.clearDisplay();\n  display.setTextColor(SSD1306_WHITE);\n",
+        show: "  display.clearDisplay();\n  display.setTextSize(1);\n  display.setCursor(0, 0);\n  display.print(F(\"<<NAME>>\"));\n  display.setTextSize(2);\n  display.setCursor(0, 20);\n  display.print(value, <<DECIMALS>>);\n  display.display();\n",
     },
 ];
 

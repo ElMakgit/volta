@@ -376,6 +376,13 @@ sound above 500 blinks | compose:Sound/Led/Blink
 красный цвет выше 300 светодиод | compose:Color/Led/Blink
 weight above 100 relay | compose:Weight/Relay/Switch
 colour above 300 led | compose:Color/Led/Blink
+температура на дисплее | compose:Temperature/Lcd/Show
+давление покажи на OLED | compose:Pressure/Oled/Show
+газ lcd | compose:Gas/Lcd/Show
+влажность выше 60 на экране | compose:Humidity/Lcd/Show
+temperature on the display | compose:Temperature/Lcd/Show
+pressure on the oled | compose:Pressure/Oled/Show
+температура на lcd2004 | compose:Temperature/Lcd2004/Show
 
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse

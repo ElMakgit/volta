@@ -21,16 +21,28 @@ pub fn detect(
     condition: Option<Condition>,
 ) -> Option<Composition> {
     let text = crate::words::normalize(raw);
-    // Only a sentence that asks the circuit to do something is composed.
-    // "Измерь температуру" stays the lesson that teaches the sensor. A named
-    // relay or buzzer is itself a request to act: "влажность выше 60, реле".
+    // Only a sentence that asks the circuit to do something is composed:
+    // "Измерь температуру" stays the lesson that teaches the sensor.
+    // A screen named outright is a sink on its own: "температура на дисплее"
+    // has no verb the action table catches, yet it asks for a readout. The
+    // serial port is not a screen, so "вывести в порт" stays a lesson.
+    let names_screen = !text.contains("порт")
+        && (text.contains("диспле")
+            || text.contains("экран")
+            || text.contains("табло")
+            || text.contains("lcd")
+            || text.contains("oled")
+            || text.contains("display"));
+    // A named relay, buzzer or screen is itself a request to act:
+    // "влажность выше 60, реле".
     let explicit_sink = text.contains("реле")
         || text.contains("relay")
         || text.contains("пищал")
         || text.contains("сирен")
         || text.contains("зуммер")
         || text.contains("buzzer")
-        || text.contains("siren");
+        || text.contains("siren")
+        || names_screen;
     let asks_action = matches!(
         action,
         Some(Action::Blink | Action::Alarm | Action::Toggle)
@@ -59,6 +71,17 @@ pub fn detect(
         || text.contains("siren")
     {
         SinkId::Buzzer
+    } else if names_screen {
+        // A character display is the plainer readout: it is what "дисплей"
+        // means by default, and the one the lessons put first. OLED has to be
+        // asked for by name.
+        if text.contains("2004") {
+            SinkId::Lcd2004
+        } else if text.contains("oled") || text.contains("графическ") {
+            SinkId::Oled
+        } else {
+            SinkId::Lcd
+        }
     } else {
         match load {
             Load::Led => SinkId::Led,
@@ -73,6 +96,7 @@ pub fn detect(
         },
         SinkId::Buzzer => Behavior::Beep,
         SinkId::Relay => Behavior::Switch,
+        SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled => Behavior::Show,
     };
     Some(Composition {
         source: source.id,
@@ -85,6 +109,11 @@ pub fn detect(
 /// The words "Понял так" shows for a composition: source · condition · action.
 pub fn recipe_words(c: Composition) -> Vec<L> {
     let source = source(c.source);
+    // A screen shows the reading itself, so a threshold would be a lie: the
+    // recipe names the board instead of a condition.
+    if c.behavior == Behavior::Show {
+        return vec![source.short, sink(c.sink).title];
+    }
     let condition = c.condition.unwrap_or_else(|| {
         source
             .variants
@@ -122,7 +151,9 @@ struct Resolved<'a> {
     variant: &'a Variant,
     condition: Condition,
     sink: SinkId,
-    sink_pin: &'static str,
+    /// The Uno pins the sink lands on. A single free pin for a part, or the
+    /// two wires of the I2C bus, which a source may already be on.
+    sink_pins: Vec<&'static str>,
     behavior: Behavior,
     /// The number the sentence gave, if it gave one: a comparator variant has
     /// to say that the number does not reach its sketch.
@@ -137,19 +168,24 @@ fn resolve(c: &Composition, variant: usize) -> Option<Resolved<'static>> {
         Logic::Number => c.condition.unwrap_or(v.condition),
     };
     let sink = sink(c.sink);
-    // A sink cannot land on a pin the source already uses. The first free
-    // candidate wins, which keeps the drawing stable between runs.
-    let sink_pin = sink
-        .pins
-        .iter()
-        .copied()
-        .find(|p| !v.pins.contains(p))?;
+    let sink_pins = match sink.wiring {
+        // A part cannot land on a pin the source already uses. The first free
+        // candidate wins, which keeps the drawing stable between runs.
+        SinkWiring::Pin => vec![sink
+            .pins
+            .iter()
+            .copied()
+            .find(|p| !v.pins.contains(p))?],
+        // The bus is shared on purpose: an I2C source and an I2C screen are
+        // two devices on the same two wires.
+        SinkWiring::I2c => sink.pins.to_vec(),
+    };
     Some(Resolved {
         source,
         variant: v,
         condition,
         sink: c.sink,
-        sink_pin,
+        sink_pins,
         behavior: c.behavior,
         spoken: c.condition,
     })
@@ -169,6 +205,9 @@ fn action_phrase(sink: SinkId, behavior: Behavior, lang: Lang) -> &'static str {
         (SinkId::Led, _) => tr(lang, "светодиод по условию", "an LED on condition"),
         (SinkId::Buzzer, _) => tr(lang, "пищалка по порогу", "a buzzer on threshold"),
         (SinkId::Relay, _) => tr(lang, "реле с нагрузкой", "a relay with a load"),
+        (SinkId::Lcd, _) => tr(lang, "вывод на LCD1602", "an LCD1602 readout"),
+        (SinkId::Lcd2004, _) => tr(lang, "вывод на LCD2004", "an LCD2004 readout"),
+        (SinkId::Oled, _) => tr(lang, "вывод на OLED", "an OLED readout"),
     }
 }
 
@@ -192,42 +231,63 @@ fn number(v: f32, decimals: u8) -> String {
 }
 
 fn choice(r: &Resolved, lang: Lang) -> Choice {
-    let threshold = match r.condition {
-        Condition::Above(v) | Condition::Below(v) => {
-            format!("{} {}", number(v, r.variant.decimals), r.variant.unit.get(lang))
-        }
-        Condition::Active => r.variant.unit.get(lang).to_string(),
-    };
     let mut cons = Vec::new();
-    if r.spoken.is_some() && r.variant.logic == Logic::Flag {
+    if r.behavior != Behavior::Show && r.spoken.is_some() && r.variant.logic == Logic::Flag {
         cons.push(L::new(
             "Число из фразы не попадает в скетч: этот порог задаёт подстроечник на модуле",
             "The number from the sentence does not reach the sketch: the trimmer on the module sets this threshold",
         ));
     }
+    let current = format!(
+        "{} мА",
+        r.variant_current() + sink(r.sink).current_ma
+    );
+    let effort = templates::spec_line(
+        &level_name(r.variant.level, lang),
+        L::new("Сложность", "Effort"),
+    );
+    let (pros, specs) = if r.behavior == Behavior::Show {
+        (
+            vec![L::new(
+                "Значение видно на экране, порт остаётся свободным",
+                "The value shows on the screen and the port stays free",
+            )],
+            vec![
+                templates::spec_line("I2C: A4, A5", L::new("Шина", "Bus")),
+                templates::spec_line(sink(r.sink).title.get(lang), L::new("Экран", "Screen")),
+                templates::spec_line(&current, L::new("Ток", "Current")),
+                effort,
+            ],
+        )
+    } else {
+        let threshold = match r.condition {
+            Condition::Above(v) | Condition::Below(v) => {
+                format!("{} {}", number(v, r.variant.decimals), r.variant.unit.get(lang))
+            }
+            Condition::Active => r.variant.unit.get(lang).to_string(),
+        };
+        (
+            vec![
+                L::new(
+                    "Значение видно в мониторе порта",
+                    "The value goes to the serial monitor",
+                ),
+                r.condition.label(),
+            ],
+            vec![
+                templates::spec_line(&threshold, L::new("Порог", "Threshold")),
+                templates::spec_line(&r.sink_pins.join(", "), L::new("Выход", "Output")),
+                templates::spec_line(&current, L::new("Ток", "Current")),
+                effort,
+            ],
+        )
+    };
     Choice {
         name: r.variant.name,
         blurb: r.variant.blurb,
-        pros: vec![
-            L::new(
-                "Значение видно в мониторе порта",
-                "The value goes to the serial monitor",
-            ),
-            r.condition.label(),
-        ],
+        pros,
         cons,
-        specs: vec![
-            templates::spec_line(&threshold, L::new("Порог", "Threshold")),
-            templates::spec_line(r.sink_pin, L::new("Выход", "Output")),
-            templates::spec_line(
-                &format!(
-                    "{} мА",
-                    r.variant_current() + sink(r.sink).current_ma
-                ),
-                L::new("Ток", "Current"),
-            ),
-            templates::spec_line(&level_name(r.variant.level, lang), L::new("Сложность", "Effort")),
-        ],
+        specs,
         level: r.variant.level,
     }
 }
@@ -286,17 +346,32 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
             "Модуль реле активен низким уровнем; контакты COM и NO развязаны.",
             "The relay module is active low; COM and NO are isolated contacts.",
         ),
-    });
-    notes.push(match r.condition {
-        Condition::Above(_) | Condition::Below(_) => L::new(
-            "Порог можно подобрать по выводу в мониторе порта.",
-            "Tune the threshold from the serial monitor.",
+        SinkId::Lcd => L::new(
+            "Экран на шине I2C: SDA на A4, SCL на A5, адрес 0x27 проверь сканером шины.",
+            "The screen sits on I2C: SDA on A4, SCL on A5; check the 0x27 address with a bus scanner.",
         ),
-        Condition::Active => L::new(
-            "Условие — уровень с модуля: подстроечник задаёт его на месте.",
-            "The condition is the module's level; its trimmer sets it on the spot.",
+        SinkId::Lcd2004 => L::new(
+            "Экран 20x4 на шине I2C: SDA на A4, SCL на A5, адрес 0x27.",
+            "The 20x4 screen sits on I2C: SDA on A4, SCL on A5, address 0x27.",
+        ),
+        SinkId::Oled => L::new(
+            "OLED на шине I2C: SDA на A4, SCL на A5; адрес бывает 0x3C или 0x3D.",
+            "The OLED sits on I2C: SDA on A4, SCL on A5; its address is 0x3C or 0x3D.",
         ),
     });
+    // A screen has no threshold to tune: the reading goes out as it is.
+    if r.behavior != Behavior::Show {
+        notes.push(match r.condition {
+            Condition::Above(_) | Condition::Below(_) => L::new(
+                "Порог можно подобрать по выводу в мониторе порта.",
+                "Tune the threshold from the serial monitor.",
+            ),
+            Condition::Active => L::new(
+                "Условие — уровень с модуля: подстроечник задаёт его на месте.",
+                "The condition is the module's level; its trimmer sets it on the spot.",
+            ),
+        });
+    }
     Some(Built {
         tid: Tid::Composed,
         title: plan.title_text(lang),
@@ -311,37 +386,44 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
 fn circuit(r: &Resolved, lang: Lang) -> Option<Circuit> {
     let mut b = B::new(lang);
     place_source(&mut b, r.source, r.variant)?;
-    place_sink(&mut b, r.sink, r.sink_pin)?;
+    place_sink(&mut b, r)?;
     templates::feeds(&mut b);
     Some(b.finish())
+}
+
+/// Drop a ready-made board on the bench and wire its supply pins. Its signal
+/// pins are left to the caller: a source and a screen bring their own.
+fn place_board(b: &mut B, label: &str, name: &str, at: (f32, f32)) -> usize {
+    let part = b.breakout(label, name, Pt::new(at.0, at.1));
+    if let Some(m) = crate::modules::find(name) {
+        for (pin, dx, _) in m.pins.iter().copied() {
+            match pin {
+                "GND" => {
+                    let g = b.gnd(at.0 + dx);
+                    b.w(b.mp(part, pin), g, NetClass::Gnd);
+                }
+                "VCC" | "+5V" | "+12V" | "+" => {
+                    if m.three_three {
+                        b.w(b.uno_pin("3V3"), b.mp(part, pin), NetClass::Vcc);
+                    } else {
+                        let p = b.vcc(at.0 + dx);
+                        b.w(b.mp(part, pin), p, NetClass::Vcc);
+                    }
+                }
+                "3V3" => {
+                    b.w(b.uno_pin("3V3"), b.mp(part, pin), NetClass::Vcc);
+                }
+                _ => {}
+            }
+        }
+    }
+    part
 }
 
 fn place_source(b: &mut B, source: &SourceSpec, v: &Variant) -> Option<()> {
     match source.place {
         Place::Board { name, at } => {
-            let part = b.breakout("U1", name, Pt::new(at.0, at.1));
-            if let Some(m) = crate::modules::find(name) {
-                for (pin, dx, _) in m.pins.iter().copied() {
-                    match pin {
-                        "GND" => {
-                            let g = b.gnd(at.0 + dx);
-                            b.w(b.mp(part, pin), g, NetClass::Gnd);
-                        }
-                        "VCC" | "+5V" | "+12V" | "+" => {
-                            if m.three_three {
-                                b.w(b.uno_pin("3V3"), b.mp(part, pin), NetClass::Vcc);
-                            } else {
-                                let p = b.vcc(at.0 + dx);
-                                b.w(b.mp(part, pin), p, NetClass::Vcc);
-                            }
-                        }
-                        "3V3" => {
-                            b.w(b.uno_pin("3V3"), b.mp(part, pin), NetClass::Vcc);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            let part = place_board(b, "U1", name, at);
             for (pin, target) in v.signals.iter().copied() {
                 if b.c.parts[part]
                     .pins
@@ -381,8 +463,9 @@ fn place_source(b: &mut B, source: &SourceSpec, v: &Variant) -> Option<()> {
     Some(())
 }
 
-fn place_sink(b: &mut B, sink: SinkId, pin: &'static str) -> Option<()> {
-    match sink {
+fn place_sink(b: &mut B, r: &Resolved) -> Option<()> {
+    let pin = r.sink_pins.first().copied()?;
+    match r.sink {
         SinkId::Led => {
             let (ra, _rb) = b.res("R1", "220 Ом", 20, Row::A, 3);
             let (_a, k) = b.led("D1", "красный 5 мм", 23, Row::E);
@@ -406,38 +489,94 @@ fn place_sink(b: &mut B, sink: SinkId, pin: &'static str) -> Option<()> {
             b.w(rl[4], siren[1], NetClass::Signal);
             b.w(siren[0], b.uno_pin("GND1"), NetClass::Gnd);
         }
+        SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled => {
+            let spec = sink(r.sink);
+            let name = spec.module?;
+            let part = place_board(b, "DS1", name, spec.at);
+            // The supply is already on the rails; the bus lines go to the
+            // shared A4/A5 pair, where the source may already sit.
+            let sda = *r.sink_pins.first()?;
+            let scl = *r.sink_pins.get(1)?;
+            for (pin_name, target) in [("SDA", sda), ("SCL", scl)] {
+                if b.c.parts[part]
+                    .pins
+                    .iter()
+                    .any(|&p| b.c.pins[p].name == pin_name)
+                {
+                    b.w(b.mp(part, pin_name), b.uno_pin(target), NetClass::Signal);
+                }
+            }
+        }
     }
     Some(())
 }
 
+/// Join two sketch fragments, keeping a line only once: an I2C source and an
+/// I2C screen both ask for `#include <Wire.h>`.
+fn join_unique(a: &str, b: &str) -> String {
+    let mut out = String::new();
+    for line in a.lines().chain(b.lines()) {
+        if line.is_empty() || out.lines().any(|seen| seen == line) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn sketch(r: &Resolved, lang: Lang) -> String {
-    let threshold = match r.condition {
-        Condition::Above(v) | Condition::Below(v) => number(v, r.variant.decimals),
-        Condition::Active => "0".to_string(),
+    let spec = sink(r.sink);
+    let show = r.behavior == Behavior::Show;
+    let (extra, active, action) = if show {
+        // A screen takes the reading as it is: there is nothing to compare
+        // and no output pin to drive.
+        (String::new(), String::new(), spec.show.to_string())
+    } else {
+        let threshold = match r.condition {
+            Condition::Above(v) | Condition::Below(v) => number(v, r.variant.decimals),
+            Condition::Active => "0".to_string(),
+        };
+        let active = match r.condition {
+            Condition::Above(_) => format!("  bool active = value > {threshold};\n"),
+            Condition::Below(_) => format!("  bool active = value < {threshold};\n"),
+            Condition::Active => "  bool active = value != 0;\n".to_string(),
+        };
+        let (extra, action) = match (r.sink, r.behavior) {
+            (SinkId::Led, Behavior::Blink) => (
+                "bool lit = false;\n",
+                "  if (active) {\n    lit = !lit;\n    digitalWrite(SINK_PIN, lit ? HIGH : LOW);\n  } else {\n    lit = false;\n    digitalWrite(SINK_PIN, LOW);\n  }\n",
+            ),
+            (SinkId::Led, _) => (
+                "",
+                "  digitalWrite(SINK_PIN, active ? HIGH : LOW);\n",
+            ),
+            (SinkId::Buzzer, _) => (
+                "",
+                "  if (active) {\n    tone(SINK_PIN, 1200);\n  } else {\n    noTone(SINK_PIN);\n  }\n",
+            ),
+            (SinkId::Relay, _) => (
+                "",
+                "  digitalWrite(SINK_PIN, active ? LOW : HIGH);\n",
+            ),
+            // Screens are handled by the branch above; this keeps the match
+            // exhaustive without pretending a display has a threshold.
+            (SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled, _) => ("", ""),
+        };
+        (extra.to_string(), active, action.to_string())
     };
-    let active = match r.condition {
-        Condition::Above(_) => format!("  bool active = value > {threshold};\n"),
-        Condition::Below(_) => format!("  bool active = value < {threshold};\n"),
-        Condition::Active => "  bool active = value != 0;\n".to_string(),
+    let pins = if show {
+        String::new()
+    } else {
+        format!(
+            "const uint8_t SINK_PIN = {};\n",
+            r.sink_pins[0].trim_start_matches('D')
+        )
     };
-    let (extra, action) = match (r.sink, r.behavior) {
-        (SinkId::Led, Behavior::Blink) => (
-            "bool lit = false;\n",
-            "  if (active) {\n    lit = !lit;\n    digitalWrite(SINK_PIN, lit ? HIGH : LOW);\n  } else {\n    lit = false;\n    digitalWrite(SINK_PIN, LOW);\n  }\n",
-        ),
-        (SinkId::Led, _) => (
-            "",
-            "  digitalWrite(SINK_PIN, active ? HIGH : LOW);\n",
-        ),
-        (SinkId::Buzzer, _) => (
-            "",
-            "  if (active) {\n    tone(SINK_PIN, 1200);\n  } else {\n    noTone(SINK_PIN);\n  }\n",
-        ),
-        (SinkId::Relay, _) => (
-            "",
-            "  digitalWrite(SINK_PIN, active ? LOW : HIGH);\n",
-        ),
-    };
+    let output = if show { "" } else { "  pinMode(SINK_PIN, OUTPUT);\n" };
+    let includes = join_unique(r.variant.includes, spec.includes);
+    let globals = join_unique(r.variant.globals, spec.globals);
+    let setup = format!("{}{}", r.variant.setup, spec.setup);
     let title = format!(
         "{}: {}",
         r.source.title.get(lang),
@@ -445,14 +584,11 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
     );
     let mut s = String::from(
         r#"// <<C0>>
-<<INCLUDES>><<GLOBALS>>
-const uint8_t SINK_PIN = <<OUTNUM>>;
-const uint16_t PERIOD_MS = <<PERIOD>>;
+<<INCLUDES>><<GLOBALS>><<PINS>>const uint16_t PERIOD_MS = <<PERIOD>>;
 uint32_t last = 0;
 <<EXTRA>>
 void setup() {
-<<SETUP>>  pinMode(SINK_PIN, OUTPUT);
-  Serial.begin(9600);
+<<SETUP>><<SETUP_PIN>>  Serial.begin(9600);
 }
 
 void loop() {
@@ -467,19 +603,22 @@ void loop() {
     );
     for (k, v) in [
         ("C0", title.as_str()),
-        ("INCLUDES", r.variant.includes),
-        ("GLOBALS", r.variant.globals),
-        ("OUTNUM", r.sink_pin.trim_start_matches('D')),
-        ("EXTRA", extra),
-        ("SETUP", r.variant.setup),
+        ("INCLUDES", includes.as_str()),
+        ("GLOBALS", globals.as_str()),
+        ("PINS", pins.as_str()),
+        ("EXTRA", extra.as_str()),
+        ("SETUP", setup.as_str()),
+        ("SETUP_PIN", output),
         ("SAMPLE", r.variant.sample),
         ("ACTIVE", active.as_str()),
-        ("ACTION", action),
+        ("ACTION", action.as_str()),
         ("PRINT", r.variant.print),
     ] {
         s = s.replace(&format!("<<{k}>>"), v);
     }
     s = s.replace("<<PERIOD>>", &r.source.period_ms.to_string());
+    s = s.replace("<<NAME>>", r.source.short.get(lang));
+    s = s.replace("<<DECIMALS>>", &r.variant.decimals.to_string());
     s
 }
 
@@ -560,6 +699,9 @@ mod tests {
                     (SinkId::Led, Behavior::Solid),
                     (SinkId::Buzzer, Behavior::Beep),
                     (SinkId::Relay, Behavior::Switch),
+                    (SinkId::Lcd, Behavior::Show),
+                    (SinkId::Lcd2004, Behavior::Show),
+                    (SinkId::Oled, Behavior::Show),
                 ] {
                     let c = Composition {
                         source: source.id,
@@ -681,6 +823,75 @@ mod tests {
         assert_eq!(recipe.condition, Some(Condition::Above(1.5)));
         let built = build(recipe, 0, Lang::Ru).unwrap();
         assert!(built.code.contains("value > 1.50"), "{}", built.code);
+    }
+
+    /// A screen is a sink too: "температура на дисплее" composes an LCD, the
+    /// sketch prints the reading, and there is no output pin to drive.
+    #[test]
+    fn a_screen_shows_the_reading() {
+        let p = parse("температура на дисплее");
+        let recipe = p.intent.recipe.expect("the sentence composes");
+        assert_eq!(recipe.sink, SinkId::Lcd);
+        assert_eq!(recipe.behavior, Behavior::Show);
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("LiquidCrystal_I2C lcd"));
+        assert!(built.code.contains("lcd.print(value, 1)"));
+        assert!(!built.code.contains("SINK_PIN"));
+        assert!(!built.code.contains("bool active"));
+        assert!(built.circuit.parts.iter().any(|q| q.value == "LCD1602"));
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// An OLED has to be named: a bare "дисплей" means the plain LCD.
+    #[test]
+    fn an_oled_is_named() {
+        let p = parse("давление покажи на OLED");
+        let recipe = p.intent.recipe.expect("the sentence composes");
+        assert_eq!(recipe.source, SourceId::Pressure);
+        assert_eq!(recipe.sink, SinkId::Oled);
+        assert_eq!(recipe.behavior, Behavior::Show);
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("Adafruit_SSD1306 display"));
+        assert!(!built.code.contains("SINK_PIN"));
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// Two I2C boards share A4/A5: the gyro and the screen are devices on one
+    /// bus, so the builder must not refuse the second one.
+    #[test]
+    fn an_i2c_screen_shares_the_bus_with_an_i2c_source() {
+        let c = Composition {
+            source: SourceId::Tilt,
+            sink: SinkId::Oled,
+            behavior: Behavior::Show,
+            condition: None,
+        };
+        assert!(fits(c));
+        let built = build(c, 0, Lang::Ru).unwrap();
+        let uses = |pin: &str| {
+            built
+                .circuit
+                .parts
+                .iter()
+                .find(|p| p.kind == Kind::Arduino)
+                .map(|p| {
+                    p.pins
+                        .iter()
+                        .any(|&i| built.circuit.pins[i].name == pin)
+                })
+                .unwrap_or(false)
+        };
+        assert!(uses("A4") && uses("A5"));
+        assert_eq!(built.code.matches("#include <Wire.h>").count(), 1);
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// A request to print in the serial port is not a request for a screen.
+    #[test]
+    fn a_serial_port_is_not_a_display() {
+        let p = parse("вывести температуру в порт");
+        assert!(p.intent.recipe.is_none());
+        assert!(crate::templates::plan(&p.intent, Lang::Ru).is_some());
     }
 
     #[test]
