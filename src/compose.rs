@@ -62,6 +62,18 @@ pub fn detect(
     let source = lesson
         .and_then(source_for_lesson)
         .or_else(|| source_in(&text))?;
+    // A window belongs to one reading. If the sentence names a second
+    // sensor, its threshold is not this sensor's: refuse rather than show a
+    // range that mixes two boards.
+    if matches!(condition, Some(Condition::Between { .. })) {
+        let names_other = SOURCES.iter().any(|s| {
+            s.id != source.id
+                && s.keys.iter().any(|k| crate::words::mentions(&text, k))
+        });
+        if names_other {
+            return None;
+        }
+    }
     let sink = if text.contains("реле") || text.contains("relay") {
         SinkId::Relay
     } else if text.contains("пищал")
@@ -1146,6 +1158,15 @@ mod tests {
         let built = build(recipe, 0, Lang::Ru).unwrap();
         assert!(built.code.contains("value > 20.0 && value < 30.0"));
         assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// A window belongs to one reading: two sensors in one sentence are not
+    /// squeezed into one range, the sentence stays a lesson.
+    #[test]
+    fn a_window_with_a_second_sensor_is_refused() {
+        let p = parse("температура выше 20 и влажность ниже 60 реле");
+        assert!(p.intent.recipe.is_none());
+        assert!(crate::templates::plan(&p.intent, Lang::Ru).is_some());
     }
 
     /// A request to print in the serial port is not a request for a screen.
