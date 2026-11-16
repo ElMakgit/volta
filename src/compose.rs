@@ -499,7 +499,7 @@ fn place_board(b: &mut B, label: &str, name: &str, at: (f32, f32)) -> usize {
 fn place_source(b: &mut B, source: &SourceSpec, v: &Variant) -> Option<()> {
     match source.place {
         Place::Board { name, at } => {
-            let part = place_board(b, "U1", name, at);
+            let part = place_board(b, "U2", name, at);
             for (pin, target) in v.signals.iter().copied() {
                 if b.c.parts[part]
                     .pins

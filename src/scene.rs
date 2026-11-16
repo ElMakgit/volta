@@ -350,6 +350,10 @@ struct D {
     s: Scene,
     opt: Opts,
     accent: Rgba,
+    /// Caption ink, and whether the bench is dark. Both follow the chosen
+    /// background so the drawing stays readable on white and on black.
+    ink: Rgba,
+    on_dark: bool,
     /// The circuit's frame in bench millimetres. Labels are nudged inside it so
     /// a caption for a part on the left edge is never cropped.
     frame: Rect,
@@ -1088,7 +1092,7 @@ impl D {
         for (i, (_, dx, dy)) in bench_pins(Kind::Pot, "").iter().enumerate() {
             let p = Pt::new(at.x + dx, at.y + dy);
             self.line(Pt::new(p.x, at.y + 12.0), p, 0.45, SILVER.darken(0.2));
-            self.text(Pt::new(p.x, p.y + 2.4), 0.9, (i + 1).to_string(), LABEL.lighten(0.2), Anchor::Center);
+            self.text(Pt::new(p.x, p.y + 2.4), 0.9, (i + 1).to_string(), self.ink.lighten(0.2), Anchor::Center);
         }
     }
 
@@ -1537,7 +1541,7 @@ impl D {
                 self.frame.bottom() - margin - h / 2.0,
             );
         }
-        self.text(Pt::new(x, y), size, text, LABEL, Anchor::Center);
+        self.text(Pt::new(x, y), size, text, self.ink, Anchor::Center);
     }
 
     /// A visible frame and corner grips, so the user can tell which part is
@@ -1567,7 +1571,13 @@ impl D {
             let a = c.end_pos(w.a);
             let b = c.end_pos(w.b);
             let pts = c.wire_points(w, self.opt.style);
-            let core = run_color(w.class);
+            // The ground run is nearly black on a light bench; on a black
+            // one it has to step up or the cable disappears.
+            let core = if self.on_dark && w.class == NetClass::Gnd {
+                Rgba::rgb(0xD6, 0xD6, 0xDA)
+            } else {
+                run_color(w.class)
+            };
             // The active cable sits a touch higher, so it is easy to see which
             // one the grips belong to.
             let active = self.opt.active_wire == Some(i);
@@ -1714,14 +1724,22 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
         Some(f) => f,
         None => c.bbox_with(opt.style).inflate(PAD),
     };
+    let bench = opt.bench.unwrap_or(theme.bg);
+    let on_dark = (0.299 * bench.0 as f32 + 0.587 * bench.1 as f32 + 0.114 * bench.2 as f32) < 120.0;
     let mut d = D {
         s: Scene {
             prims: Vec::new(),
-            bg: opt.bench.unwrap_or(theme.bg),
+            bg: bench,
             w: bb.w,
             h: bb.h,
             origin: Pt::new(bb.x, bb.y),
         },
+        ink: if on_dark {
+            Rgba::rgb(0xE6, 0xE2, 0xDA)
+        } else {
+            LABEL
+        },
+        on_dark,
         opt: Opts {
             labels: opt.labels,
             hover: opt.hover,

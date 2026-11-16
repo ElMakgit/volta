@@ -5,6 +5,7 @@
 //! a palette and a wire tool. Both feed the same `Circuit`, so the checks and
 //! the PNG export are identical.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,8 +34,52 @@ enum Mode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Circuit,
+    Parts,
     Code,
     Checks,
+}
+
+/// What the save window is about to write. Each kind picks its own default
+/// name and its own writer, but the folder part is shared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveKind {
+    Png,
+    Svg,
+    Sketch,
+    Csv,
+    /// SVG plus the sketch in one folder.
+    Bundle,
+}
+
+impl SaveKind {
+    fn key(self) -> &'static str {
+        match self {
+            SaveKind::Png => "png",
+            SaveKind::Svg => "svg",
+            SaveKind::Sketch => "sketch",
+            SaveKind::Csv => "csv",
+            SaveKind::Bundle => "bundle",
+        }
+    }
+    fn default_name(self) -> &'static str {
+        match self {
+            SaveKind::Png => "circuit.png",
+            SaveKind::Svg => "circuit.svg",
+            SaveKind::Sketch => "sketch.ino",
+            SaveKind::Csv => "components.csv",
+            SaveKind::Bundle => "circuit",
+        }
+    }
+}
+
+/// The save window: a folder to browse, a name to type. It replaces the
+/// silent write into `~/Pictures/volta` that used to happen on export.
+struct SaveAsk {
+    kind: SaveKind,
+    dir: PathBuf,
+    folders: Vec<String>,
+    name: String,
+    error: Option<String>,
 }
 
 /// One cell of the palette: a plain part or a named ready-made board.
@@ -159,6 +204,10 @@ pub struct App {
     status_bad: bool,
     error: Option<String>,
     saved_png: bool,
+    /// The save window, open while the user picks a folder and a name.
+    save_ask: Option<SaveAsk>,
+    /// White sheet or black: the circuit background the user picked.
+    bench_dark: bool,
 }
 
 impl App {
@@ -200,6 +249,8 @@ impl App {
             status_bad: false,
             error: None,
             saved_png: false,
+            save_ask: None,
+            bench_dark: crate::config::load_bench_dark(),
         }
     }
 
@@ -251,6 +302,31 @@ impl App {
         // The about window is a screenshot hook too: it needs a click otherwise.
         if std::env::var("VOLTA_ABOUT").is_ok() {
             self.about = true;
+        }
+        if std::env::var("VOLTA_LABELS").is_ok() {
+            self.labels = true;
+            match self.mode {
+                Mode::Ai => self.refresh_ai(),
+                Mode::Manual => self.refresh_manual(),
+            }
+        }
+        if let Ok(tab) = std::env::var("VOLTA_TAB") {
+            self.tab = match tab.as_str() {
+                "parts" => Tab::Parts,
+                "code" => Tab::Code,
+                "checks" => Tab::Checks,
+                _ => Tab::Circuit,
+            };
+        }
+        if std::env::var("VOLTA_BENCH").map(|b| b == "dark").unwrap_or(false) {
+            self.bench_dark = true;
+            match self.mode {
+                Mode::Ai => self.refresh_ai(),
+                Mode::Manual => self.refresh_manual(),
+            }
+        }
+        if std::env::var("VOLTA_SAVE").is_ok() {
+            self.ask_save(SaveKind::Png);
         }
         self
     }
@@ -347,7 +423,7 @@ impl App {
             &scene::Opts {
                 labels: self.labels,
                 hover: self.hover,
-                bench: None,
+                bench: self.bench(),
                 style: self.wire_style,
                 selected: None,
                 frame: None,
@@ -366,7 +442,7 @@ impl App {
             &scene::Opts {
                 labels: self.labels,
                 hover: self.hover,
-                bench: None,
+                bench: self.bench(),
                 style: self.wire_style,
                 selected: self.draft.selected_part(),
                 frame: self.drag.frame,
@@ -447,57 +523,157 @@ impl App {
 
     // ---------------------------------------------------------------- export
 
-    fn export_png(&mut self) {
-        let Some(sc) = self.active_scene().cloned() else { return };
-        let dir = crate::png::default_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let svg_src = svg::render(&sc, 1.0);
-        let png_path = dir.join("circuit.png");
-        match crate::png::png_from_svg(&svg_src, &png_path, 2400) {
-            Ok(()) => {
-                let _ = std::fs::write(dir.join("circuit.svg"), &svg_src);
-                if let Some(b) = &self.built {
-                    if self.mode == Mode::Ai {
-                        let _ = std::fs::write(dir.join("sketch.ino"), &b.code);
-                    }
-                }
-                self.saved_png = true;
-                self.status = format!("{}: {}", self.t("shot.saved"), png_path.display());
-                self.status_bad = false;
-            }
-            Err(e) => {
-                self.status = format!("{}: {e}", self.t("shot.failed"));
-                self.status_bad = true;
-            }
-        }
+    /// The chosen bench colour. White is the default, because a circuit
+    /// printed for a notebook or a class looks like the Tinkercad canvas.
+    fn bench(&self) -> Option<Rgba> {
+        Some(if self.bench_dark {
+            Rgba::rgb(0x14, 0x14, 0x16)
+        } else {
+            Rgba::rgb(0xFF, 0xFF, 0xFF)
+        })
     }
 
-    fn export_files(&mut self) {
-        let Some(sc) = self.active_scene().cloned() else { return };
-        let dir = crate::png::default_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("circuit.svg"), svg::render(&sc, 1.0));
-        if let (Mode::Ai, Some(b)) = (self.mode, &self.built) {
-            let _ = std::fs::write(dir.join("sketch.ino"), &b.code);
+    fn toggle_bench(&mut self) {
+        self.bench_dark = !self.bench_dark;
+        crate::config::save_bench_dark(self.bench_dark);
+        match self.mode {
+            Mode::Ai => self.refresh_ai(),
+            Mode::Manual => self.refresh_manual(),
         }
-        self.saved_png = true;
-        self.status = format!("{}: {}", self.t("export.saved"), dir.display());
+        self.status = self.t(if self.bench_dark { "bg.black" } else { "bg.white" });
         self.status_bad = false;
     }
 
+    fn export_png(&mut self) {
+        self.ask_save(SaveKind::Png);
+    }
+
+    fn export_files(&mut self) {
+        self.ask_save(SaveKind::Bundle);
+    }
+
     fn save_sketch(&mut self) {
-        let Some(b) = &self.built else { return };
-        let dir = crate::png::default_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("sketch.ino");
-        match std::fs::write(&path, &b.code) {
-            Ok(()) => {
-                self.status = format!("{}: {}", self.t("export.saved"), path.display());
+        self.ask_save(SaveKind::Sketch);
+    }
+
+    /// Open the save window. It starts in the folder of the last export, or in
+    /// `~/Pictures/volta`, and pre-fills the name that suits the kind.
+    fn ask_save(&mut self, kind: SaveKind) {
+        if self.active_scene().is_none() {
+            return;
+        }
+        if kind == SaveKind::Sketch && self.built.is_none() {
+            return;
+        }
+        let mut dir = crate::config::load_export_dir()
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(crate::png::default_dir);
+        if !dir.is_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        if !dir.is_dir() {
+            dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        }
+        self.save_ask = Some(SaveAsk {
+            kind,
+            folders: folders_in(&dir),
+            dir,
+            name: kind.default_name().to_string(),
+            error: None,
+        });
+    }
+
+    /// Write what the window promises. A bad name or a failed write keeps the
+    /// window open with the reason, instead of losing the user's choice.
+    fn finish_save(&mut self) {
+        let Some(ask) = self.save_ask.take() else { return };
+        let name = ask.name.trim().to_string();
+        if name.is_empty() || name.contains('/') {
+            let mut ask = ask;
+            ask.error = Some(self.t("save.badname"));
+            self.save_ask = Some(ask);
+            return;
+        }
+        let path = ask.dir.join(&name);
+        let csv_lang = self.lang;
+        let result: Result<PathBuf, String> = match ask.kind {
+            SaveKind::Png => {
+                let Some(sc) = self.active_scene().cloned() else {
+                    return;
+                };
+                let out = with_ext(&path, "png");
+                let src = svg::render(&sc, 1.0);
+                crate::png::png_from_svg(&src, &out, 2400).map(|()| out)
+            }
+            SaveKind::Svg => {
+                let Some(sc) = self.active_scene().cloned() else {
+                    return;
+                };
+                let out = with_ext(&path, "svg");
+                match std::fs::write(&out, svg::render(&sc, 1.0)) {
+                    Ok(()) => Ok(out),
+                    Err(e) => Err(format!("{}: {e}", out.display())),
+                }
+            }
+            SaveKind::Sketch => {
+                let Some(b) = &self.built else { return };
+                let out = with_ext(&path, "ino");
+                match std::fs::write(&out, &b.code) {
+                    Ok(()) => Ok(out),
+                    Err(e) => Err(format!("{}: {e}", out.display())),
+                }
+            }
+            SaveKind::Csv => {
+                let Some(circuit) = self.active_circuit().cloned() else {
+                    return;
+                };
+                let rows = templates::component_rows(&circuit, csv_lang);
+                let out = with_ext(&path, "csv");
+                match std::fs::write(&out, templates::component_csv(&rows)) {
+                    Ok(()) => Ok(out),
+                    Err(e) => Err(format!("{}: {e}", out.display())),
+                }
+            }
+            SaveKind::Bundle => {
+                let Some(sc) = self.active_scene().cloned() else {
+                    return;
+                };
+                let svg_out = path.with_extension("svg");
+                match std::fs::write(&svg_out, svg::render(&sc, 1.0)) {
+                    Err(e) => Err(format!("{}: {e}", svg_out.display())),
+                    Ok(()) => match (self.mode, &self.built) {
+                        (Mode::Ai, Some(b)) => {
+                            let ino_out = path.with_extension("ino");
+                            match std::fs::write(&ino_out, &b.code) {
+                                Ok(()) => Ok(ino_out),
+                                Err(e) => Err(format!("{}: {e}", ino_out.display())),
+                            }
+                        }
+                        _ => Ok(svg_out),
+                    },
+                }
+            }
+        };
+        match result {
+            Ok(out) => {
+                crate::config::save_export_dir(&ask.dir);
+                if matches!(ask.kind, SaveKind::Png | SaveKind::Bundle) {
+                    self.saved_png = true;
+                }
+                self.status = format!(
+                    "{}: {}",
+                    self.t(match ask.kind {
+                        SaveKind::Png => "shot.saved",
+                        _ => "export.saved",
+                    }),
+                    out.display()
+                );
                 self.status_bad = false;
             }
             Err(e) => {
-                self.status = format!("{e}");
-                self.status_bad = true;
+                let mut ask = ask;
+                ask.error = Some(e);
+                self.save_ask = Some(ask);
             }
         }
     }
@@ -536,6 +712,15 @@ impl App {
             )
         });
         let typing = ctx.memory(|m| m.focused().is_some());
+
+        // While the save window is open it owns the keyboard: Escape closes
+        // it, and the shortcuts below must not stack a second one.
+        if self.save_ask.is_some() {
+            if esc {
+                self.save_ask = None;
+            }
+            return;
+        }
 
         if ctrl && enter && self.mode == Mode::Ai {
             self.plan_now();
@@ -797,6 +982,7 @@ impl eframe::App for App {
         self.overlays(ctx, accent, fg, muted, panel, radius);
         self.author_window(ctx, accent, fg, muted, panel, radius);
         self.value_window(ctx, accent, fg, muted, panel, radius);
+        self.save_window(ctx, accent, fg, muted, panel, radius);
     }
 }
 
@@ -1342,7 +1528,11 @@ impl App {
     ) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (tab, key) in [(Tab::Circuit, "tab.circuit"), (Tab::Checks, "tab.checks")] {
+            for (tab, key) in [
+                (Tab::Circuit, "tab.circuit"),
+                (Tab::Parts, "tab.parts"),
+                (Tab::Checks, "tab.checks"),
+            ] {
                 let on = self.tab == tab;
                 let label = self.t(key);
                 if tab_button(ui, &label, on, crate::style::TEXT_BODY, accent, fg, muted).clicked() {
@@ -1397,6 +1587,23 @@ impl App {
                     {
                         labels = !labels;
                     }
+                    // One small button for the sheet colour: sun for the
+                    // white Tinkercad canvas, moon for the black one.
+                    let dark = self.bench_dark;
+                    let bg = Button::new(RichText::new(if dark { "☾" } else { "☀" }).size(12.5))
+                        .fill(if dark {
+                            accent.gamma_multiply(0.8)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .min_size(vec2(26.0, 22.0));
+                    if ui
+                        .add(bg)
+                        .on_hover_text(self.t(if dark { "bg.black" } else { "bg.white" }))
+                        .clicked()
+                    {
+                        self.toggle_bench();
+                    }
                     ui.label(
                         RichText::new(format!("{}%", (self.view.zoom * 100.0).round() as i32))
                             .size(11.0)
@@ -1425,6 +1632,7 @@ impl App {
 
         match self.tab {
             Tab::Circuit => self.canvas(ui, accent, panel, radius),
+            Tab::Parts => self.parts_tab(ui, radius),
             Tab::Code => self.code_tab(ui, accent, fg, muted, panel, radius),
             Tab::Checks => self.checks_tab(ui, accent, fg, muted, panel, radius, ctx),
         }
@@ -1551,6 +1759,9 @@ impl App {
             Some(c) => c.clone(),
             None => return,
         };
+        // The sheet covers the whole canvas, not just the drawing frame, so
+        // the white or black background reads as a page rather than a patch.
+        painter.rect_filled(rect, radius, self.c32(scene.bg));
 
         let base = (rect.width() / scene.w).min(rect.height() / scene.h) * 0.96;
         if !self.view.fitted {
@@ -1851,6 +2062,174 @@ impl App {
         let _ = accent;
     }
 
+    /// The component list, drawn the way Tinkercad draws it: a white sheet,
+    /// a grey header of Name / Quantity / Component, one thin rule between
+    /// rows, and the designators of identical parts stacked in the name cell.
+    fn parts_tab(&mut self, ui: &mut egui::Ui, radius: CornerRadius) {
+        let Some(circuit) = self.active_circuit().cloned() else {
+            ui.label(
+                RichText::new(self.t("checks.none"))
+                    .size(12.0)
+                    .color(self.c32(self.theme.muted)),
+            );
+            return;
+        };
+        let rows = templates::component_rows(&circuit, self.lang);
+        let title = self.t("parts.title");
+        let csv = self.t("parts.csv");
+        let name_head = self.t("parts.name");
+        let qty_head = self.t("parts.qty");
+        let comp_head = self.t("parts.component");
+        let ink = Color32::from_rgb(0x2F, 0x2F, 0x2F);
+        let quiet = Color32::from_rgb(0x8A, 0x8A, 0x8A);
+        let line = Color32::from_rgb(0xE2, 0xE0, 0xDC);
+        let head = Color32::from_rgb(0xF1, 0xEF, 0xEB);
+        let name_font = FontId::proportional(13.0);
+        let body_font = FontId::proportional(13.5);
+        let head_font = FontId::proportional(12.0);
+
+        // The sheet takes the height of its rows, like the Tinkercad panel,
+        // and the whole card scrolls when the list gets long.
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                Frame::NONE
+                    .fill(Color32::WHITE)
+                    .corner_radius(radius)
+                    .inner_margin(Margin::same(18))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(title).size(16.0).strong().color(ink));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let button =
+                                    Button::new(RichText::new(csv).size(12.0).color(ink))
+                                        .fill(Color32::WHITE)
+                                        .stroke(Stroke::new(
+                                            1.0,
+                                            Color32::from_rgb(0xCB, 0xC8, 0xC2),
+                                        ))
+                                        .corner_radius(crate::style::RADIUS);
+                                if ui.add(button).clicked() {
+                                    self.ask_save(SaveKind::Csv);
+                                }
+                            });
+                        });
+                        ui.add_space(12.0);
+
+                        let width = ui.available_width();
+                        let name_w = (width * 0.24).clamp(64.0, 190.0);
+                        let qty_w = (width * 0.14).clamp(52.0, 110.0);
+                        let comp_x = name_w + qty_w;
+                        let wrap = (width - comp_x - 24.0).max(60.0);
+                        let head_h = 30.0;
+                        let galleys: Vec<Arc<egui::Galley>> = rows
+                            .iter()
+                            .map(|r| {
+                                ui.painter().layout(
+                                    r.component.clone(),
+                                    body_font.clone(),
+                                    ink,
+                                    wrap,
+                                )
+                            })
+                            .collect();
+                        let heights: Vec<f32> = rows
+                            .iter()
+                            .zip(&galleys)
+                            .map(|(r, g)| {
+                                (r.names.len().max(1) as f32 * 17.0 + 12.0)
+                                    .max(g.size().y + 12.0)
+                                    .max(34.0)
+                            })
+                            .collect();
+                        let total = head_h + heights.iter().sum::<f32>();
+                        let (rect, _) =
+                            ui.allocate_exact_size(vec2(width, total), Sense::hover());
+                        let p = ui.painter_at(rect);
+                        let left = rect.left();
+
+                        p.rect_filled(
+                            egui::Rect::from_min_size(rect.left_top(), vec2(width, head_h)),
+                            CornerRadius::ZERO,
+                            head,
+                        );
+                        p.text(
+                            pos2(left + 12.0, rect.top() + head_h / 2.0),
+                            Align2::LEFT_CENTER,
+                            name_head,
+                            head_font.clone(),
+                            quiet,
+                        );
+                        p.text(
+                            pos2(left + name_w + qty_w / 2.0, rect.top() + head_h / 2.0),
+                            Align2::CENTER_CENTER,
+                            qty_head,
+                            head_font.clone(),
+                            quiet,
+                        );
+                        p.text(
+                            pos2(left + comp_x + 12.0, rect.top() + head_h / 2.0),
+                            Align2::LEFT_CENTER,
+                            comp_head,
+                            head_font.clone(),
+                            quiet,
+                        );
+
+                        let mut y = rect.top() + head_h;
+                        for i in 0..rows.len() {
+                            let row = &rows[i];
+                            let height = heights[i];
+                            let galley = &galleys[i];
+                            // Names stack: M1 on the first line, M2 below it,
+                            // while the quantity stays one number for both.
+                            if row.names.is_empty() {
+                                p.text(
+                                    pos2(left + 12.0, y + height / 2.0),
+                                    Align2::LEFT_CENTER,
+                                    "—",
+                                    name_font.clone(),
+                                    quiet,
+                                );
+                            } else {
+                                for (i, name) in row.names.iter().enumerate() {
+                                    p.text(
+                                        pos2(left + 12.0, y + 12.0 + i as f32 * 17.0),
+                                        Align2::LEFT_CENTER,
+                                        name,
+                                        name_font.clone(),
+                                        ink,
+                                    );
+                                }
+                            }
+                            p.text(
+                                pos2(left + name_w + qty_w / 2.0, y + height / 2.0),
+                                Align2::CENTER_CENTER,
+                                row.quantity.to_string(),
+                                body_font.clone(),
+                                ink,
+                            );
+                            p.galley(
+                                pos2(left + comp_x + 12.0, y + (height - galley.size().y) / 2.0),
+                                galley.clone(),
+                                ink,
+                            );
+                            y += height;
+                            p.line_segment(
+                                [pos2(left, y), pos2(left + width, y)],
+                                Stroke::new(1.0, line),
+                            );
+                        }
+                        p.rect_stroke(
+                            egui::Rect::from_min_size(rect.left_top(), vec2(width, total)),
+                            CornerRadius::ZERO,
+                            Stroke::new(1.0, line),
+                            StrokeKind::Inside,
+                        );
+                    });
+            });
+    }
+
     fn checks_tab(
         &mut self,
         ui: &mut egui::Ui,
@@ -1937,6 +2316,153 @@ impl App {
     /// A small window that follows the selection: pick the value of the part
     /// being worked on. It is shown only for parts that have a choice, and it
     /// does not crowd the palette with one button per value.
+    /// "Save as", in the app's own clothes: the folder to browse, the name
+    /// to type, Save and Cancel. No portal and no extra dependency, so the
+    /// build stays offline and the window matches the rest of the app.
+    fn save_window(
+        &mut self,
+        ctx: &egui::Context,
+        accent: Color32,
+        fg: Color32,
+        muted: Color32,
+        panel: Color32,
+        radius: CornerRadius,
+    ) {
+        let Some(kind) = self.save_ask.as_ref().map(|a| a.kind) else {
+            return;
+        };
+        let title = self.t(&format!("save.{}", kind.key()));
+        let folder_lbl = self.t("save.folder");
+        let name_lbl = self.t("save.name");
+        let save_lbl = self.t("save.save");
+        let cancel_lbl = self.t("save.cancel");
+        let empty_lbl = self.t("save.empty");
+        let up_hint = self.t("save.up");
+        let Some(ask) = self.save_ask.as_mut() else {
+            return;
+        };
+        let mut close = false;
+        let mut submit = false;
+        let mut enter: Option<PathBuf> = None;
+
+        // Dim the bench under the window, the way the help sheet does: the
+        // save question is the only thing that matters while it is open.
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("save-dim"));
+        ctx.layer_painter(layer)
+            .rect_filled(ctx.content_rect(), CornerRadius::ZERO, Color32::from_black_alpha(150));
+
+        egui::Window::new(title.clone())
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .frame(
+                Frame::NONE
+                    .fill(panel)
+                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                    .corner_radius(radius)
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&title).size(16.0).strong().color(accent));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(&cancel_lbl).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                ui.label(RichText::new(&folder_lbl).size(11.0).color(muted));
+                ui.label(
+                    RichText::new(ask.dir.display().to_string())
+                        .monospace()
+                        .size(11.5)
+                        .color(fg),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .add(Button::new(RichText::new("↑").size(13.0)).min_size(vec2(28.0, 22.0)))
+                    .on_hover_text(&up_hint)
+                    .clicked()
+                {
+                    if let Some(parent) = ask.dir.parent() {
+                        enter = Some(parent.to_path_buf());
+                    }
+                }
+                ScrollArea::vertical()
+                    .max_height(190.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if ask.folders.is_empty() {
+                            ui.label(RichText::new(&empty_lbl).size(11.5).color(muted));
+                        }
+                        for name in &ask.folders {
+                            let row = Button::new(RichText::new(format!("▸ {name}")).size(12.5))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .min_size(vec2(ui.available_width(), 24.0));
+                            if ui.add(row).clicked() {
+                                enter = Some(ask.dir.join(name));
+                            }
+                        }
+                    });
+                ui.add_space(10.0);
+                ui.label(RichText::new(&name_lbl).size(11.0).color(muted));
+                let resp = ui.add(
+                    TextEdit::singleline(&mut ask.name).desired_width(f32::INFINITY),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if let Some(e) = &ask.error {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(e)
+                            .size(11.5)
+                            .color(Color32::from_rgb(0xD2, 0x4B, 0x45)),
+                    );
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let save = Button::new(
+                        RichText::new(&save_lbl).strong().size(12.5),
+                    )
+                    .fill(accent)
+                    .corner_radius(crate::style::RADIUS)
+                    .min_size(vec2(110.0, 30.0));
+                    if ui.add(save).clicked() {
+                        submit = true;
+                    }
+                    if ui
+                        .add(
+                            Button::new(RichText::new(&cancel_lbl).size(12.0))
+                                .corner_radius(crate::style::RADIUS)
+                                .min_size(vec2(90.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+
+        if let Some(dir) = enter {
+            if dir.is_dir() {
+                ask.dir = dir;
+                ask.folders = folders_in(&ask.dir);
+                ask.error = None;
+            }
+        }
+        if close {
+            self.save_ask = None;
+        } else if submit {
+            self.finish_save();
+        }
+    }
+
     fn value_window(
         &mut self,
         ctx: &egui::Context,
@@ -2175,6 +2701,37 @@ fn bench_to_screen(p: Pt, origin: Pos2, scale: f32, scene_origin: Pt) -> Pos2 {
 /// A tab is a word with an accent rule under it: no box, no fill, no
 /// rounding. It is the quietest way to switch a pane and it keeps the window
 /// looking like one slab rather than a pile of buttons.
+/// Sub-folders of `dir`, hidden ones skipped, sorted the way a file manager
+/// lists them.
+fn folders_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    out.sort_by_key(|n| n.to_lowercase());
+    out
+}
+
+/// Add an extension unless the name already ends with it, so typing
+/// `circuit.png` does not produce `circuit.png.png`.
+fn with_ext(path: &Path, ext: &str) -> PathBuf {
+    let has = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case(ext))
+        .unwrap_or(false);
+    if has {
+        path.to_path_buf()
+    } else {
+        path.with_extension(ext)
+    }
+}
+
 fn tab_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -2452,5 +3009,38 @@ mod tests {
         let back = screen_to_bench(px, origin, scale, scene.origin);
         assert!(back.dist(scene.to_bench(local)) < 0.01);
         assert!(back.dist(local) > 0.5, "the shift was ignored");
+    }
+
+    #[test]
+    fn extensions_are_added_once() {
+        assert_eq!(
+            with_ext(Path::new("/tmp/circuit"), "png"),
+            PathBuf::from("/tmp/circuit.png")
+        );
+        assert_eq!(
+            with_ext(Path::new("/tmp/circuit.png"), "png"),
+            PathBuf::from("/tmp/circuit.png")
+        );
+        assert_eq!(
+            with_ext(Path::new("/tmp/circuit.PNG"), "png"),
+            PathBuf::from("/tmp/circuit.PNG")
+        );
+        assert_eq!(
+            with_ext(Path::new("/tmp/my.circuit"), "svg"),
+            PathBuf::from("/tmp/my.svg")
+        );
+    }
+
+    #[test]
+    fn the_folder_list_skips_hidden_entries() {
+        let dir = std::env::temp_dir().join("volta-folders");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Desktop")).unwrap();
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        std::fs::create_dir_all(dir.join(".cache")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        let names = folders_in(&dir);
+        assert_eq!(names, vec!["alpha", "Desktop"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

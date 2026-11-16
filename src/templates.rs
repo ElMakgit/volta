@@ -2492,6 +2492,75 @@ pub fn bom(c: &Circuit, lang: Lang) -> Vec<(String, String, usize)> {
     out
 }
 
+/// One line of the component list, drawn the way Tinkercad draws it: a name
+/// or a stack of names, how many of them, and one component description.
+pub struct ComponentRow {
+    pub names: Vec<String>,
+    pub quantity: usize,
+    pub component: String,
+}
+
+/// The component list for any circuit: parts grouped by value and kind, with
+/// their designators stacked, plus the breadboard itself.
+pub fn component_rows(c: &Circuit, lang: Lang) -> Vec<ComponentRow> {
+    let mut out: Vec<ComponentRow> = Vec::new();
+    for p in &c.parts {
+        let kind = kind_name(p.kind, lang);
+        let component = if p.value.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind} {}", p.value)
+        };
+        if let Some(slot) = out.iter_mut().find(|r| r.component == component) {
+            slot.names.push(p.label.clone());
+            slot.quantity += 1;
+        } else {
+            out.push(ComponentRow {
+                names: vec![p.label.clone()],
+                quantity: 1,
+                component,
+            });
+        }
+    }
+    let columns = if c.board.cols >= 30 { 30 } else { 15 };
+    let board = match lang {
+        Lang::Ru => format!("Макетка {columns} отверстий"),
+        Lang::En => format!("Breadboard ({columns} columns)"),
+    };
+    if !c.bare {
+        out.push(ComponentRow {
+            // The breadboard has no designator of its own, and Tinkercad
+            // leaves the name cell empty for it.
+            names: Vec::new(),
+            quantity: 1,
+            component: board,
+        });
+    }
+    out
+}
+
+/// The same list as Tinkercad's "Download CSV": one header and one row per
+/// component, names separated by a space.
+pub fn component_csv(rows: &[ComponentRow]) -> String {
+    let quote = |s: &str| {
+        if s.contains(',') || s.contains('"') || s.contains('\n') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    };
+    let mut out = String::from("Name,Quantity,Component\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{}\n",
+            quote(&r.names.join(" ")),
+            r.quantity,
+            quote(&r.component)
+        ));
+    }
+    out
+}
+
 pub fn kind_name(kind: Kind, lang: Lang) -> &'static str {
     match kind {
         Kind::Arduino => tr(lang, "плата", "board"),
@@ -4062,5 +4131,49 @@ mod tests {
         assert!(bom.iter().any(|(v, _, _)| v.contains("Arduino")));
     }
 
+    /// The Tinkercad-style list groups identical parts and stacks their
+    /// designators in one name cell; the breadboard is a row of its own.
+    #[test]
+    fn the_component_list_stacks_names() {
+        let p = parse("газ выше 400 rgb");
+        let built = build(&p.intent, 0, Lang::Ru).unwrap();
+        let rows = component_rows(&built.circuit, Lang::Ru);
+        let resistors = rows
+            .iter()
+            .find(|r| r.component.starts_with("резистор") && r.component.contains("220"))
+            .expect("three 220 ohm resistors");
+        assert_eq!(resistors.quantity, 3);
+        assert_eq!(resistors.names, vec!["R3", "R4", "R5"]);
+        let board = rows.last().expect("a breadboard row");
+        assert_eq!(board.quantity, 1);
+        assert!(board.names.is_empty());
+        assert!(board.component.starts_with("Макетка 30"));
+
+        // Every part is accounted for exactly once.
+        let counted: usize = rows.iter().map(|r| r.quantity).sum();
+        assert_eq!(counted, built.circuit.parts.len() + 1);
+    }
+
+    #[test]
+    fn the_component_list_downloads_like_tinkercad() {
+        let p = parse("газ выше 400 rgb");
+        let built = build(&p.intent, 0, Lang::Ru).unwrap();
+        let rows = component_rows(&built.circuit, Lang::Ru);
+        let csv = component_csv(&rows);
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some("Name,Quantity,Component"));
+        assert_eq!(lines.count(), rows.len());
+        assert!(csv.contains("R3 R4 R5,3,"));
+        assert!(csv.ends_with('\n'));
+
+        // A comma inside a component is quoted instead of splitting a cell.
+        let odd = ComponentRow {
+            names: vec!["D1".into()],
+            quantity: 1,
+            component: "светодиод, красный".into(),
+        };
+        let csv = component_csv(&[odd]);
+        assert!(csv.contains("D1,1,\"светодиод, красный\""));
+    }
 }
 
