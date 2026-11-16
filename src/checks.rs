@@ -121,13 +121,13 @@ fn pins_with_kind(c: &Circuit, nets_roots: &[usize], root: usize, kind: PinKind)
 /// input pin (a relay module's IN is meant to sit on a pin).
 fn uno_signal_on(c: &Circuit, roots: &[usize], root: usize) -> bool {
     let Some(uno) = c.arduino else { return false };
-    c.pins.iter().enumerate().any(|(i, p)| {
+    c.pins_id().any(|(i, p)| {
         roots[i] == root && p.part == uno && p.kind == PinKind::Signal
     })
 }
 
 fn parts_with<'a>(c: &'a Circuit, kind: Kind) -> impl Iterator<Item = &'a Part> {
-    c.parts.iter().filter(move |p| p.kind == kind)
+    c.parts().filter(move |p| p.kind == kind)
 }
 
 fn ohms(value: &str) -> Option<f32> {
@@ -318,7 +318,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         .filter(|(i, _)| nets.pins_in(roots[*i]).len() < 2)
         .map(|(i, _)| (i, pin_label(c, i)))
         .collect();
-    let parts_total = c.parts.iter().filter(|p| p.kind != Kind::Arduino).count();
+    let parts_total = c.parts().filter(|p| p.kind != Kind::Arduino).count();
     checks.push(if parts_total == 0 {
         Check::warn(
             L::new("Монтаж", "Assembly"),
@@ -480,7 +480,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         }
         let a = roots[load.pins[0]];
         let b = roots[load.pins[1]];
-        let diode = c.parts.iter().find(|d| {
+        let diode = c.parts().find(|d| {
             d.kind == Kind::Diode
                 && ((roots[d.pins[0]] == a && roots[d.pins[1]] == b)
                     || (roots[d.pins[0]] == b && roots[d.pins[1]] == a))
@@ -488,7 +488,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         match diode {
             Some(d) => {
                 // Cathode must sit on the positive side.
-                let k = roots[c.pin(c.parts.iter().position(|p| std::ptr::eq(p, d)).unwrap(), "K")];
+                let k = roots[c.pin(c.parts().position(|p| std::ptr::eq(p, d)).unwrap(), "K")];
                 let positive_side = if pins_with_kind(c, &roots, a, PinKind::Power).is_empty()
                     && pins_with_kind(c, &roots, b, PinKind::Power).is_empty()
                 {
@@ -836,15 +836,15 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Схема собрана без макетки — шины не нужны.", "Built without a breadboard, so there are no rails to bridge.").to_string(),
         ));
     } else {
-    let bridged = c.wires.iter().any(|w| {
+    let bridged = c.wires().any(|w| {
         matches!(
             (w.a, w.b),
             (End::Hole(Hole::Rail(_, RailHalf::Left, _)), End::Hole(Hole::Rail(_, RailHalf::Right, _)))
                 | (End::Hole(Hole::Rail(_, RailHalf::Right, _)), End::Hole(Hole::Rail(_, RailHalf::Left, _)))
         )
     });
-    let uses_right = c.pins.iter().any(|p| matches!(p.hole, Hole::Rail(_, RailHalf::Right, _)));
-    let uses_left = c.pins.iter().any(|p| matches!(p.hole, Hole::Rail(_, RailHalf::Left, _)));
+    let uses_right = c.pins().any(|p| matches!(p.hole, Hole::Rail(_, RailHalf::Right, _)));
+    let uses_left = c.pins().any(|p| matches!(p.hole, Hole::Rail(_, RailHalf::Left, _)));
     checks.push(if uses_left && uses_right && !bridged {
         let pins: Vec<usize> = c
             .pins

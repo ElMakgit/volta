@@ -860,8 +860,8 @@ mod tests {
             for lang in [Lang::Ru, Lang::En] {
                 let built = build(recipe, choice, lang).expect("builds");
                 assert!(!unfilled(&built.code), "choice {choice}: unfilled token");
-                assert!(built.circuit.parts.iter().any(|q| q.value == "MQ-2"));
-                assert!(built.circuit.parts.iter().any(|q| q.kind == Kind::Led));
+                assert!(built.circuit.parts().any(|q| q.value == "MQ-2"));
+                assert!(built.circuit.parts().any(|q| q.kind == Kind::Led));
                 let report = crate::checks::run(&built, lang);
                 assert_eq!(
                     report.failed(),
@@ -1037,7 +1037,7 @@ mod tests {
         assert!(built.code.contains("lcd.print(value, 1)"));
         assert!(!built.code.contains("SINK_PIN"));
         assert!(!built.code.contains("bool active"));
-        assert!(built.circuit.parts.iter().any(|q| q.value == "LCD1602"));
+        assert!(built.circuit.parts().any(|q| q.value == "LCD1602"));
         assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
         assert!(built.code.contains("arm.attach(SINK_PIN)"));
         assert!(built.code.contains("arm.write(active ? 90 : 0)"));
         assert!(!built.code.contains("pinMode(SINK_PIN"));
-        assert!(built.circuit.parts.iter().any(|q| q.kind == Kind::Servo));
+        assert!(built.circuit.parts().any(|q| q.kind == Kind::Servo));
         assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
     }
 
@@ -1113,7 +1113,7 @@ mod tests {
         assert!(built.code.contains("analogWrite(SINK_PIN, active ? 255 : 0)"));
         for kind in [Kind::Motor, Kind::Nmos, Kind::Diode, Kind::Resistor] {
             assert!(
-                built.circuit.parts.iter().any(|q| q.kind == kind),
+                built.circuit.parts().any(|q| q.kind == kind),
                 "{kind:?} missing"
             );
         }

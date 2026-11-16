@@ -6,6 +6,7 @@
 //! the screenshot keep working without a sketch.
 
 use crate::model::*;
+use std::collections::BTreeSet;
 use crate::templates::{bench_pin_kind, bench_pins};
 use crate::text::{tr, Lang};
 
@@ -193,25 +194,60 @@ pub const PALETTE: [Place; 21] = [
     Place::Module,
 ];
 
-/// How many undo steps to keep, and roughly how much heap they may hold.
-/// Sixty copies of a small circuit cost a few hundred kilobytes; the byte
-/// cap is what stops a dense one from eating the window's memory budget.
+/// How many undo steps to keep. A command step is tiny compared with a whole
+/// circuit clone, so the count is the only limit we need.
 const HISTORY_STEPS: usize = 60;
-const HISTORY_BYTES: usize = 4 << 20;
 
-/// A rough size of a saved circuit, including the heap its strings and
-/// vectors own. It does not have to be exact, only proportional, so the cap
-/// bites at the right time.
-fn history_bytes(c: &Circuit) -> usize {
-    let text: usize = c.parts.iter().map(|p| p.label.len() + p.value.len()).sum();
-    let heap = std::mem::size_of::<Circuit>()
-        + c.parts.len() * (std::mem::size_of::<Part>() + 8)
-        + c.pins.len() * (std::mem::size_of::<Pin>() + 4)
-        + c.wires.len() * (std::mem::size_of::<Wire>() + 4)
-        + c.wires.iter().map(|w| w.via.len() * std::mem::size_of::<Pt>()).sum::<usize>()
-        + text;
-    // Vector slack and the allocator's own headers.
-    heap + heap / 4
+/// One reversible change. Fine-grained commands keep a long editing session
+/// small and, unlike a whole-circuit clone, let undo keep the selection.
+#[derive(Clone)]
+enum Command {
+    /// Rare whole-circuit operations: adopting a build, clearing the bench.
+    Full(Circuit),
+    PartAdded(PartId, Part, Vec<Pin>),
+    PartRemoved(PartId, Part, Vec<Pin>, Vec<(WireId, Wire)>),
+    WireAdded(WireId, Wire),
+    WireRemoved(WireId, Wire),
+    MovePart(PartId, Pt, Pt),
+    Seat(PartId, Vec<Pin>, Vec<Pin>),
+    Rot(PartId, u8, u8),
+    Via(WireId, Vec<Pt>, Vec<Pt>),
+    Label(PartId, String, String),
+    Value(PartId, String, String),
+    SetKind(PartId, Kind, Kind),
+    WireClass(WireId, NetClass, NetClass),
+    NetName(String, Option<String>, Option<String>),
+}
+
+#[derive(Clone, Default)]
+struct SelectionState {
+    primary: Option<PartId>,
+    parts: BTreeSet<PartId>,
+    wires: BTreeSet<WireId>,
+}
+
+struct Transaction {
+    before: SelectionState,
+    after: SelectionState,
+    ops: Vec<Command>,
+}
+
+/// Which edge of the group a manual align uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// A copied group of parts, with pin indices local to the group so a paste
+/// can give every object a fresh id.
+#[derive(Clone)]
+struct Clipboard {
+    parts: Vec<Part>,
+    pins: Vec<Pin>,
+    wires: Vec<(usize, usize, usize, usize, NetClass)>,
 }
 
 pub struct Draft {
@@ -220,9 +256,14 @@ pub struct Draft {
     pub module: &'static str,
     /// The first end of a wire that is being pulled.
     pub pending: Option<End>,
-    pub selected: Option<usize>,
-    undo: Vec<Circuit>,
-    redo: Vec<Circuit>,
+    pub selected: Option<PartId>,
+    /// Everything the user marked with a click or a marquee. `selected` stays
+    /// the primary part for the inspector and the rotation key.
+    pub selected_parts: BTreeSet<PartId>,
+    pub selected_wires: BTreeSet<WireId>,
+    clipboard: Option<Clipboard>,
+    undo: Vec<Transaction>,
+    redo: Vec<Transaction>,
 }
 
 impl Default for Draft {
@@ -240,47 +281,315 @@ impl Draft {
             module: crate::modules::DEFAULT,
             pending: None,
             selected: None,
+            selected_parts: BTreeSet::new(),
+            selected_wires: BTreeSet::new(),
+            clipboard: None,
             undo: Vec::new(),
             redo: Vec::new(),
         }
     }
 
-    /// Save a snapshot before a change; the stacks are what Ctrl+Z walks.
-    ///
-    /// Two limits keep the history honest: a count, so a long session cannot
-    /// grow an endless menu of steps, and a byte estimate, because a circuit
-    /// with a hundred wires is not the same size as an empty one.
+    fn selection_state(&self) -> SelectionState {
+        SelectionState {
+            primary: self.selected,
+            parts: self.selected_parts.clone(),
+            wires: self.selected_wires.clone(),
+        }
+    }
+
+    fn restore_selection(&mut self, state: &SelectionState) {
+        self.selected = state.primary.filter(|&i| self.circuit.parts.get(i).is_some_and(|p| p.active));
+        self.selected_parts = state.parts.iter().copied()
+            .filter(|&i| self.circuit.parts.get(i).is_some_and(|p| p.active)).collect();
+        self.selected_wires = state.wires.iter().copied()
+            .filter(|&i| self.circuit.wires.get(i).is_some_and(|w| w.active)).collect();
+    }
+
+    /// Start a command group. Existing callers still use this exactly as the
+    /// old snapshot did; the difference is that it records no circuit data.
     pub fn snapshot(&mut self) {
-        self.undo.push(self.circuit.clone());
-        let mut total: usize = self.undo.iter().map(history_bytes).sum();
-        while self.undo.len() > HISTORY_STEPS
-            || (total > HISTORY_BYTES && self.undo.len() > 1)
-        {
-            total -= history_bytes(&self.undo[0]);
+        self.undo.push(Transaction {
+            before: self.selection_state(),
+            after: SelectionState::default(),
+            ops: Vec::new(),
+        });
+        while self.undo.len() > HISTORY_STEPS {
             self.undo.remove(0);
         }
         self.redo.clear();
     }
 
-    /// Drop the snapshot a drag pushed when it never moved the part.
+    /// Record one change in the group opened by `snapshot()`.
+    fn record(&mut self, command: Command) {
+        if let Some(tx) = self.undo.last_mut() {
+            tx.ops.push(command);
+        }
+    }
+
+    /// For operations too rare to model as fine commands.
+    fn snapshot_full(&mut self) {
+        self.snapshot();
+        let circuit = self.circuit.clone();
+        self.record(Command::Full(circuit));
+    }
+
+    fn add_part_recorded(
+        &mut self,
+        kind: Kind,
+        label: &str,
+        value: &str,
+        at: Pt,
+        pins: Vec<PinSpec>,
+        internal: Vec<(&'static str, &'static str)>,
+    ) -> PartId {
+        let id = self.circuit.add_part(kind, label, value, at, pins, internal);
+        let part = self.circuit.parts[id].clone();
+        let pins = part.pins.iter().map(|&p| self.circuit.pins[p].clone()).collect();
+        self.record(Command::PartAdded(id, part, pins));
+        id
+    }
+
+    fn add_arduino_recorded(&mut self, at: Pt) -> PartId {
+        let id = self.circuit.add_arduino(at);
+        let part = self.circuit.parts[id].clone();
+        let pins = part.pins.iter().map(|&p| self.circuit.pins[p].clone()).collect();
+        self.record(Command::PartAdded(id, part, pins));
+        id
+    }
+
+    fn add_wire_recorded(&mut self, a: End, b: End, class: NetClass) -> WireId {
+        let id = self.circuit.next_wire_id();
+        self.circuit.wire(a, b, class);
+        if self.circuit.wires.get(id).is_some_and(|w| w.active) {
+            let wire = self.circuit.wires[id].clone();
+            self.record(Command::WireAdded(id, wire));
+        }
+        id
+    }
+
+    fn remove_part_recorded(&mut self, id: PartId) {
+        let Some(part) = self.circuit.parts.get(id).filter(|p| p.active).cloned() else {
+            return;
+        };
+        let pins: Vec<Pin> = part.pins.iter().filter_map(|&p| self.circuit.pins.get(p).cloned()).collect();
+        let wires: Vec<(WireId, Wire)> = self
+            .circuit
+            .wires_id()
+            .filter(|(_, w)| {
+                let touches = |e: End| matches!(e, End::Pin(p) if part.pins.contains(&p));
+                touches(w.a) || touches(w.b)
+            })
+            .map(|(i, w)| (i, w.clone()))
+            .collect();
+        self.circuit.remove_part(id);
+        self.record(Command::PartRemoved(id, part, pins, wires));
+    }
+
+    pub fn remove_wire_recorded(&mut self, id: WireId) {
+        if let Some(wire) = self.circuit.wires.get(id).filter(|w| w.active).cloned() {
+            self.circuit.remove_wire(id);
+            self.record(Command::WireRemoved(id, wire));
+        }
+    }
+
+    pub fn move_part_recorded(&mut self, id: PartId, to: Pt) -> bool {
+        let Some(part) = self.circuit.parts.get(id).filter(|p| p.active) else {
+            return false;
+        };
+        let from = part.at;
+        if self.circuit.move_part(id, to) {
+            self.record(Command::MovePart(id, from, to));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Seat a part a few holes away, recording both the move and the new
+    /// pin positions so undo restores the exact original state.
+    pub fn reseat_recorded(&mut self, id: PartId, dcol: i32, drow: i32) -> bool {
+        let old_at = self.circuit.parts.get(id).map(|p| p.at);
+        let old: Vec<Pin> = self.circuit.parts.get(id).map(|p| {
+            p.pins.iter().filter_map(|&q| self.circuit.pins.get(q).cloned()).collect()
+        }).unwrap_or_default();
+        self.snapshot();
+        if !self.circuit.reseat_part(id, dcol, drow) {
+            self.cancel_snapshot();
+            return false;
+        }
+        if let Some(from) = old_at {
+            let to = self.circuit.parts[id].at;
+            if from != to {
+                self.record(Command::MovePart(id, from, to));
+            }
+        }
+        let new: Vec<Pin> = self.circuit.parts[id]
+            .pins
+            .iter()
+            .filter_map(|&q| self.circuit.pins.get(q).cloned())
+            .collect();
+        self.record(Command::Seat(id, old, new));
+        true
+    }
+
+    fn set_via_recorded(&mut self, id: WireId, via: Vec<Pt>) {
+        if let Some(w) = self.circuit.wires.get_mut(id) {
+            let old = w.via.clone();
+            if old == via {
+                return;
+            }
+            w.via = via.clone();
+            self.record(Command::Via(id, old, via));
+        }
+    }
+
+    /// Drop the group a drag pushed when the drag never moved anything.
     pub fn cancel_snapshot(&mut self) {
         self.undo.pop();
         self.redo.clear();
     }
 
+    fn apply_command(&mut self, command: &Command) {
+        match command {
+            Command::Full(c) => self.circuit = c.clone(),
+            Command::PartAdded(id, p, pins) => {
+                self.circuit.restore_part(*id, p.clone(), pins.clone());
+            }
+            Command::PartRemoved(id, _, _, _) => self.circuit.remove_part(*id),
+            Command::WireAdded(id, w) => self.circuit.restore_wire(*id, w.clone()),
+            Command::WireRemoved(id, _) => self.circuit.remove_wire(*id),
+            Command::MovePart(id, _, to) => {
+                self.circuit.move_part(*id, *to);
+            }
+            Command::Rot(id, _, new) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.rot = *new;
+                }
+            }
+            Command::Seat(id, _, new) => {
+                for (k, pin) in new.iter().enumerate() {
+                    if let Some(slot) = self.circuit.parts.get(*id).and_then(|p| p.pins.get(k)) {
+                        self.circuit.pins[*slot] = pin.clone();
+                    }
+                }
+            }
+            Command::Via(id, _, new) => {
+                if let Some(w) = self.circuit.wires.get_mut(*id) {
+                    w.via = new.clone();
+                }
+            }
+            Command::Label(id, _, new) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.label = new.clone();
+                }
+            }
+            Command::Value(id, _, new) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.value = new.clone();
+                }
+            }
+            Command::SetKind(id, _, new) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.kind = *new;
+                }
+            }
+            Command::WireClass(id, _, new) => {
+                if let Some(w) = self.circuit.wires.get_mut(*id) {
+                    w.class = *new;
+                }
+            }
+            Command::NetName(key, _, new) => {
+                if let Some(name) = new {
+                    self.circuit.net_names.insert(key.clone(), name.clone());
+                } else {
+                    self.circuit.net_names.remove(key);
+                }
+            }
+        }
+    }
+
+    fn revert_command(&mut self, command: &Command) {
+        match command {
+            Command::Full(c) => self.circuit = c.clone(),
+            Command::PartAdded(id, _, _) => self.circuit.remove_part(*id),
+            Command::PartRemoved(id, p, pins, wires) => {
+                self.circuit.restore_part(*id, p.clone(), pins.clone());
+                for (wid, w) in wires {
+                    self.circuit.restore_wire(*wid, w.clone());
+                }
+            }
+            Command::WireAdded(id, _) => self.circuit.remove_wire(*id),
+            Command::WireRemoved(id, w) => self.circuit.restore_wire(*id, w.clone()),
+            Command::MovePart(id, from, _) => {
+                self.circuit.move_part(*id, *from);
+            }
+            Command::Rot(id, old, _) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.rot = *old;
+                }
+            }
+            Command::Seat(id, old, _) => {
+                for (k, pin) in old.iter().enumerate() {
+                    if let Some(slot) = self.circuit.parts.get(*id).and_then(|p| p.pins.get(k)) {
+                        self.circuit.pins[*slot] = pin.clone();
+                    }
+                }
+            }
+            Command::Via(id, old, _) => {
+                if let Some(w) = self.circuit.wires.get_mut(*id) {
+                    w.via = old.clone();
+                }
+            }
+            Command::Label(id, old, _) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.label = old.clone();
+                }
+            }
+            Command::Value(id, old, _) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.value = old.clone();
+                }
+            }
+            Command::SetKind(id, old, _) => {
+                if let Some(p) = self.circuit.parts.get_mut(*id) {
+                    p.kind = *old;
+                }
+            }
+            Command::WireClass(id, old, _) => {
+                if let Some(w) = self.circuit.wires.get_mut(*id) {
+                    w.class = *old;
+                }
+            }
+            Command::NetName(key, old, _) => {
+                if let Some(name) = old {
+                    self.circuit.net_names.insert(key.clone(), name.clone());
+                } else {
+                    self.circuit.net_names.remove(key);
+                }
+            }
+        }
+    }
+
     pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo.pop() else { return false };
-        self.redo.push(std::mem::replace(&mut self.circuit, prev));
+        let Some(mut tx) = self.undo.pop() else { return false };
+        tx.after = self.selection_state();
+        for command in tx.ops.iter().rev() {
+            self.revert_command(command);
+        }
+        self.restore_selection(&tx.before);
         self.pending = None;
-        self.selected = None;
+        self.redo.push(tx);
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(next) = self.redo.pop() else { return false };
-        self.undo.push(std::mem::replace(&mut self.circuit, next));
+        let Some(tx) = self.redo.pop() else { return false };
+        for command in &tx.ops {
+            self.apply_command(command);
+        }
+        self.restore_selection(&tx.after);
         self.pending = None;
-        self.selected = None;
+        self.undo.push(tx);
         true
     }
 
@@ -292,22 +601,23 @@ impl Draft {
         !self.redo.is_empty()
     }
 
-    /// Take over a generated circuit and forget the AI history.
+    /// Take over a generated circuit. The switch itself is an edit, so the
+    /// bench the user came from can still be reached with Ctrl+Z.
     pub fn adopt(&mut self, circuit: Circuit) {
+        self.snapshot_full();
         self.circuit = circuit;
-        self.undo.clear();
         self.redo.clear();
         self.pending = None;
-        self.selected = None;
+        self.clear_selection();
     }
 
     pub fn clear(&mut self) {
-        self.snapshot();
+        self.snapshot_full();
         let mut fresh = Circuit::new();
         fresh.add_arduino(uno_spot());
         self.circuit = fresh;
         self.pending = None;
-        self.selected = None;
+        self.clear_selection();
     }
 
     pub fn place(&mut self, what: Place, at: Pt) -> bool {
@@ -317,7 +627,7 @@ impl Draft {
                 return false;
             }
             self.snapshot();
-            let idx = self.circuit.add_arduino(uno_spot());
+            let idx = self.add_arduino_recorded(uno_spot());
             self.selected = Some(idx);
             return true;
         }
@@ -430,7 +740,7 @@ impl Draft {
                 kind: bench_pin_kind(kind, value, name),
             });
         }
-        self.circuit.add_part(kind, label, value, at, pins, links)
+        self.add_part_recorded(kind, label, value, at, pins, links)
     }
 
     /// Give a part another value, and for a capacitor another type. The pins
@@ -444,10 +754,100 @@ impl Draft {
         if !variants_for(p.kind).iter().any(|v| v.value == value && v.kind == kind) {
             return false;
         }
+        let (old_kind, old_value) = {
+            let p = &self.circuit.parts[part];
+            (p.kind, p.value.clone())
+        };
         self.snapshot();
-        let p = &mut self.circuit.parts[part];
-        p.kind = kind;
-        p.value = value.to_string();
+        self.circuit.parts[part].kind = kind;
+        self.circuit.parts[part].value = value.to_string();
+        self.record(Command::SetKind(part, old_kind, kind));
+        self.record(Command::Value(part, old_value, value.to_string()));
+        true
+    }
+
+    /// Give a part its own reference designator. Names must stay unique, so
+    /// two R1s never make a bill of materials ambiguous.
+    pub fn set_label(&mut self, part: PartId, label: &str) -> bool {
+        let label = label.trim();
+        let Some(p) = self.circuit.parts.get(part) else { return false };
+        if !p.active || label.is_empty() || label.chars().count() > 16 {
+            return false;
+        }
+        if label.chars().any(|c| c.is_control()) {
+            return false;
+        }
+        if p.label == label || self.circuit.parts().any(|q| q.label == label) {
+            return false;
+        }
+        let old = self.circuit.parts[part].label.clone();
+        self.snapshot();
+        self.circuit.parts[part].label = label.to_string();
+        self.record(Command::Label(part, old, label.to_string()));
+        true
+    }
+
+    /// A free-form value, for parts the preset list does not cover.
+    pub fn set_value(&mut self, part: PartId, value: &str) -> bool {
+        let value = value.trim();
+        let Some(p) = self.circuit.parts.get(part) else { return false };
+        if !p.active || value.is_empty() || value.chars().count() > 64 || p.value == value {
+            return false;
+        }
+        let old = self.circuit.parts[part].value.clone();
+        self.snapshot();
+        self.circuit.parts[part].value = value.to_string();
+        self.record(Command::Value(part, old, value.to_string()));
+        true
+    }
+
+    /// Change the class of a cable, and with it the colour of its insulation.
+    pub fn set_wire_class(&mut self, wire: WireId, class: NetClass) -> bool {
+        let Some(w) = self.circuit.wires.get(wire) else { return false };
+        if !w.active || w.class == class {
+            return false;
+        }
+        let old = self.circuit.wires[wire].class;
+        self.snapshot();
+        self.circuit.wires[wire].class = class;
+        self.record(Command::WireClass(wire, old, class));
+        true
+    }
+
+    /// Rename the net a cable belongs to. A net made only of breadboard
+    /// holes has no pin to key it by, so those stay with their auto name.
+    pub fn set_net_name(&mut self, wire: WireId, name: &str) -> bool {
+        let Some(w) = self.circuit.wires.get(wire).filter(|w| w.active) else {
+            return false;
+        };
+        let pin = match [w.a, w.b].into_iter().find_map(|e| match e {
+            End::Pin(p) => Some(p),
+            _ => None,
+        }) {
+            Some(p) => p,
+            None => return false,
+        };
+        let nets = self.circuit.nets();
+        let root = nets.root(pin);
+        let key = self.circuit.net_key(&nets, root);
+        let old = self.circuit.net_names.get(&key).cloned();
+        self.snapshot();
+        let ok = self.circuit.set_net_name(&nets, root, name);
+        if ok {
+            self.record(Command::NetName(key, old, Some(name.to_string())));
+        } else {
+            self.cancel_snapshot();
+        }
+        ok
+    }
+
+    pub fn clear_vias(&mut self, wire: WireId) -> bool {
+        let Some(w) = self.circuit.wires.get(wire) else { return false };
+        if !w.active || w.via.is_empty() {
+            return false;
+        }
+        self.snapshot();
+        self.set_via_recorded(wire, Vec::new());
         true
     }
 
@@ -458,22 +858,34 @@ impl Draft {
         if self.circuit.part_is_seated(&self.circuit.parts[i]) {
             return false;
         }
+        let old_rot = self.circuit.parts[i].rot;
+        let old: Vec<Pin> = self.circuit.parts[i]
+            .pins
+            .iter()
+            .filter_map(|&p| self.circuit.pins.get(p).cloned())
+            .collect();
         self.snapshot();
         let ok = self.circuit.rotate_part(i, quarter);
-        if !ok {
-            self.undo.pop();
-            self.redo.clear();
+        if ok {
+            let new: Vec<Pin> = self.circuit.parts[i]
+                .pins
+                .iter()
+                .filter_map(|&p| self.circuit.pins.get(p).cloned())
+                .collect();
+            self.record(Command::Seat(i, old, new));
+            self.record(Command::Rot(i, old_rot, self.circuit.parts[i].rot));
+        } else {
+            self.cancel_snapshot();
         }
         ok
     }
 
     /// Turn the breadboard together with everything plugged into it.
     pub fn rotate_board(&mut self, quarter: i32) -> bool {
-        self.snapshot();
+        self.snapshot_full();
         let ok = self.circuit.rotate_board(quarter);
         if !ok {
-            self.undo.pop();
-            self.redo.clear();
+            self.cancel_snapshot();
         }
         ok
     }
@@ -484,11 +896,10 @@ impl Draft {
         if self.circuit.bare == bare {
             return true;
         }
-        self.snapshot();
+        self.snapshot_full();
         let ok = self.circuit.set_bare(bare);
         if !ok {
-            self.undo.pop();
-            self.redo.clear();
+            self.cancel_snapshot();
         }
         ok
     }
@@ -519,13 +930,16 @@ impl Draft {
         }
         let a = board.hole(col, row);
         let z = board.hole(col + span, row);
+        if !self.circuit.holes_free(&[Hole::Col(col, row), Hole::Col(col + span, row)]) {
+            return false;
+        }
         let label = self.next_label(match kind {
             Kind::Led => "D",
             Kind::Ldr => "LDR",
             Kind::Capacitor | Kind::Electrolytic => "C",
             _ => "R",
         });
-        let p = self.circuit.add_part(
+        let p = self.add_part_recorded(
             kind,
             &label,
             value,
@@ -546,6 +960,10 @@ impl Draft {
         if col + 3 > board.cols {
             return false;
         }
+        let holes: Vec<Hole> = (0..4).map(|i| Hole::Col(col + i, row)).collect();
+        if !self.circuit.holes_free(&holes) {
+            return false;
+        }
         let names = ["R", "G", "B", "-"];
         let mut pins = Vec::new();
         for (i, name) in names.iter().enumerate() {
@@ -558,7 +976,7 @@ impl Draft {
         }
         let at = board.hole(col, row).mid(board.hole(col + 3, row));
         let label = self.next_label("D");
-        let p = self.circuit.add_part(Kind::Led, &label, "RGB 5 мм", at, pins, vec![]);
+        let p = self.add_part_recorded(Kind::Led, &label, "RGB 5 мм", at, pins, vec![]);
         self.selected = Some(p);
         true
     }
@@ -566,6 +984,10 @@ impl Draft {
     fn three_pin(&mut self, kind: Kind, value: &str, col: u8, row: Row, names: [&'static str; 3]) -> bool {
         let board = self.circuit.board;
         if col + 2 > board.cols {
+            return false;
+        }
+        let holes: Vec<Hole> = (0..3).map(|i| Hole::Col(col + i as u8, row)).collect();
+        if !self.circuit.holes_free(&holes) {
             return false;
         }
         let mut pins = Vec::new();
@@ -583,7 +1005,7 @@ impl Draft {
         }
         let at = board.hole(col, row).mid(board.hole(col + 2, row));
         let label = self.next_label("Q");
-        let p = self.circuit.add_part(kind, &label, value, at, pins, vec![]);
+        let p = self.add_part_recorded(kind, &label, value, at, pins, vec![]);
         self.selected = Some(p);
         true
     }
@@ -594,6 +1016,14 @@ impl Draft {
             return false;
         }
         let row = if row.idx() < 5 { row } else { row.mirror() };
+        if !self.circuit.holes_free(&[
+            Hole::Col(col, row),
+            Hole::Col(col + 3, row),
+            Hole::Col(col, row.mirror()),
+            Hole::Col(col + 3, row.mirror()),
+        ]) {
+            return false;
+        }
         let tops = [board.hole(col, row), board.hole(col + 3, row)];
         let bots = [board.hole(col, row.mirror()), board.hole(col + 3, row.mirror())];
         let pins = vec![
@@ -603,7 +1033,7 @@ impl Draft {
             PinSpec { name: "4", pos: bots[1], hole: Hole::Col(col + 3, row.mirror()), kind: PinKind::Passive },
         ];
         let label = self.next_label("B");
-        let p = self.circuit.add_part(
+        let p = self.add_part_recorded(
             Kind::Button,
             &label,
             "такт 6×6",
@@ -655,12 +1085,21 @@ impl Draft {
     }
 
     pub fn connect(&mut self, a: End, b: End) -> bool {
-        if a == b || self.circuit.wires.iter().any(|w| (w.a == a && w.b == b) || (w.a == b && w.b == a)) {
+        let live = |e: End| match e {
+            End::Hole(Hole::OffBoard) => false,
+            End::Pin(p) => self.circuit.pins.get(p).is_some_and(|pin| pin.active),
+            End::Hole(_) => true,
+        };
+        if a == b
+            || !live(a)
+            || !live(b)
+            || self.circuit.wires().any(|w| (w.a == a && w.b == b) || (w.a == b && w.b == a))
+        {
             return false;
         }
         self.snapshot();
         let class = self.class_between(a, b);
-        self.circuit.wire(a, b, class);
+        self.add_wire_recorded(a, b, class);
         true
     }
 
@@ -714,7 +1153,7 @@ impl Draft {
         // cursor wins, so the part whose case is drawn there is picked rather
         // than a neighbour that merely shares a bounding box.
         let mut best: Option<(usize, f32)> = None;
-        for (i, p) in self.circuit.parts.iter().enumerate() {
+        for (i, p) in self.circuit.parts_id() {
             let r = self.circuit.part_rect(p);
             if r.inflate(0.8).contains(at) {
                 let area = r.w * r.h;
@@ -728,7 +1167,7 @@ impl Draft {
 
     pub fn wire_at(&self, at: Pt, style: WireStyle) -> Option<usize> {
         let mut best: Option<(f32, usize)> = None;
-        for (i, w) in self.circuit.wires.iter().enumerate() {
+        for (i, w) in self.circuit.wires_id() {
             let pts = self.circuit.wire_points(w, style);
             let d = pts
                 .windows(2)
@@ -744,7 +1183,7 @@ impl Draft {
     /// A hand-made bend under the pointer, as (wire, bend).
     pub fn via_at(&self, at: Pt) -> Option<(usize, usize)> {
         let mut best: Option<(f32, (usize, usize))> = None;
-        for (i, w) in self.circuit.wires.iter().enumerate() {
+        for (i, w) in self.circuit.wires_id() {
             for (j, v) in w.via.iter().enumerate() {
                 let d = v.dist(at);
                 if d < 1.7 && best.map(|(b, _)| d < b).unwrap_or(true) {
@@ -770,38 +1209,45 @@ impl Draft {
             }
         }
         let (_, leg, point) = best?;
-        let w = &mut self.circuit.wires[wire];
-        w.via.insert(leg, snap_via(point));
+        let mut via = self.circuit.wires[wire].via.clone();
+        via.insert(leg, snap_via(point));
+        self.set_via_recorded(wire, via);
         Some(leg)
     }
 
     /// Move a bend. Returns false when it would not actually move, so the
     /// caller can keep the drag in the "nothing happened yet" state.
     pub fn move_via(&mut self, wire: usize, via: usize, to: Pt) -> bool {
-        let Some(w) = self.circuit.wires.get_mut(wire) else { return false };
-        let Some(v) = w.via.get_mut(via) else { return false };
+        let Some(w) = self.circuit.wires.get(wire) else { return false };
+        let Some(v) = w.via.get(via) else { return false };
         let to = snap_via(to);
         if v.dist(to) < 1e-3 {
             return false;
         }
-        *v = to;
+        let mut via_list = w.via.clone();
+        via_list[via] = to;
+        self.set_via_recorded(wire, via_list);
         true
     }
 
     /// Drop one bend, leaving the cable free to route itself again.
     pub fn remove_via(&mut self, wire: usize, via: usize) -> bool {
-        let Some(w) = self.circuit.wires.get_mut(wire) else { return false };
+        let Some(w) = self.circuit.wires.get(wire) else { return false };
         if via >= w.via.len() {
             return false;
         }
-        w.via.remove(via);
+        let mut via_list = w.via.clone();
+        via_list.remove(via);
+        self.set_via_recorded(wire, via_list);
         true
     }
 
     pub fn delete_at(&mut self, at: Pt, style: WireStyle) -> bool {
         if let Some((wire, via)) = self.via_at(at) {
             self.snapshot();
-            self.circuit.wires[wire].via.remove(via);
+            let mut via_list = self.circuit.wires[wire].via.clone();
+            via_list.remove(via);
+            self.set_via_recorded(wire, via_list);
             return true;
         }
         if let Some(part) = self.part_at(at) {
@@ -809,9 +1255,9 @@ impl Draft {
                 return false;
             }
             self.snapshot();
-            self.circuit.remove_part(part);
+            self.remove_part_recorded(part);
             self.pending = None;
-            self.selected = None;
+            self.clear_selection();
             return true;
         }
         if let Some(w) = self.wire_at(at, style) {
@@ -824,6 +1270,268 @@ impl Draft {
 
     pub fn selected_part(&self) -> Option<usize> {
         self.selected.filter(|&i| i < self.circuit.parts.len())
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+        self.selected_parts.clear();
+        self.selected_wires.clear();
+    }
+
+    /// Click: replace the selection. Shift+click: add or remove one object.
+    pub fn select_part(&mut self, id: PartId, add: bool) {
+        if !self.circuit.parts.get(id).is_some_and(|p| p.active) {
+            return;
+        }
+        if !add {
+            self.clear_selection();
+        }
+        if add && self.selected_parts.contains(&id) {
+            self.selected_parts.remove(&id);
+            self.selected = self.selected_parts.iter().next_back().copied();
+            return;
+        }
+        self.selected_parts.insert(id);
+        self.selected = Some(id);
+    }
+
+    pub fn select_wire(&mut self, id: WireId, add: bool) {
+        if !self.circuit.wires.get(id).is_some_and(|w| w.active) {
+            return;
+        }
+        if !add {
+            self.clear_selection();
+        }
+        if add && self.selected_wires.contains(&id) {
+            self.selected_wires.remove(&id);
+            return;
+        }
+        self.selected_wires.insert(id);
+    }
+
+    pub fn select_all(&mut self) {
+        self.clear_selection();
+        self.selected_parts.extend(
+            self.circuit
+                .parts_id()
+                .filter(|(_, p)| p.kind != Kind::Arduino)
+                .map(|(i, _)| i),
+        );
+        self.selected_wires.extend(self.circuit.wires_id().map(|(i, _)| i));
+        self.selected = self.selected_parts.iter().next_back().copied();
+    }
+
+    /// The frame of the whole selection, used by the marquee and by align.
+    pub fn selection_bbox(&self) -> Option<Rect> {
+        let mut out: Option<Rect> = None;
+        for id in &self.selected_parts {
+            let part = self.circuit.parts.get(*id)?;
+            let r = self.circuit.part_rect(part);
+            out = Some(out.map(|b| b.union(r)).unwrap_or(r));
+        }
+        out
+    }
+
+    /// Copy selected parts and the cables between them into an internal
+    /// clipboard. Pin ids are stored relative to the copied group.
+    pub fn copy_selected(&mut self) -> bool {
+        if self.selected_parts.is_empty() && self.selected_wires.is_empty() {
+            return false;
+        }
+        let parts: Vec<Part> = self
+            .selected_parts
+            .iter()
+            .filter_map(|&i| {
+                self.circuit
+                    .parts
+                    .get(i)
+                    .filter(|p| p.active && p.kind != Kind::Arduino)
+                    .cloned()
+            })
+            .collect();
+        let pins: Vec<Pin> = parts
+            .iter()
+            .flat_map(|p| p.pins.iter().filter_map(|&i| self.circuit.pins.get(i).cloned()))
+            .collect();
+        let local_pin = |global: PinId| -> Option<(usize, usize)> {
+            for (pi, part) in parts.iter().enumerate() {
+                if let Some(li) = part.pins.iter().position(|&p| p == global) {
+                    let mut offset = 0;
+                    for prev in parts.iter().take(pi) {
+                        offset += prev.pins.len();
+                    }
+                    return Some((pi, offset + li));
+                }
+            }
+            None
+        };
+        let mut wires = Vec::new();
+        for &id in &self.selected_wires {
+            let Some(w) = self.circuit.wires.get(id).filter(|w| w.active) else { continue };
+            let (a, b) = match (w.a, w.b) {
+                (End::Pin(a), End::Pin(b)) => (a, b),
+                _ => continue,
+            };
+            if let (Some((pa, ia)), Some((pb, ib))) = (local_pin(a), local_pin(b)) {
+                wires.push((pa, ia, pb, ib, w.class));
+            }
+        }
+        self.clipboard = Some(Clipboard { parts, pins, wires });
+        true
+    }
+
+    pub fn cut_selected(&mut self) -> bool {
+        if !self.copy_selected() {
+            return false;
+        }
+        self.delete_selected();
+        true
+    }
+
+    /// Paste the clipboard with its first part under `at`, giving every
+    /// object a new id. Cables inside the group come along.
+    pub fn paste(&mut self, at: Pt) -> bool {
+        let Some(clip) = self.clipboard.clone() else { return false };
+        if clip.parts.is_empty() {
+            return false;
+        }
+        self.snapshot();
+        let base = clip.parts[0].at;
+        let delta = Pt::new(at.x - base.x, at.y - base.y);
+        let mut local_of = std::collections::BTreeMap::new();
+        let mut new_ids = Vec::new();
+        let mut created = Vec::new();
+        for (li, part) in clip.parts.iter().enumerate() {
+            let offset: usize = clip.parts.iter().take(li).map(|p| p.pins.len()).sum();
+            let count = part.pins.len();
+            let group: Vec<&Pin> = clip.pins[offset..offset + count].iter().collect();
+            for (k, global) in part.pins.iter().enumerate() {
+                local_of.insert(*global, offset + k);
+            }
+            let holes: Vec<Hole> = group.iter().map(|p| p.hole).collect();
+            let seated = !holes.contains(&Hole::OffBoard) && self.circuit.holes_free(&holes);
+            let specs: Vec<PinSpec> = group
+                .iter()
+                .enumerate()
+                .map(|(k, p)| PinSpec {
+                    name: p.name,
+                    pos: Pt::new(p.pos.x + delta.x, p.pos.y + delta.y),
+                    hole: if seated { holes[k] } else { Hole::OffBoard },
+                    kind: p.kind,
+                })
+                .collect();
+            let internal: Vec<(&'static str, &'static str)> = part
+                .internal
+                .iter()
+                .filter_map(|&(a, b)| {
+                    let an = local_of.get(&a).and_then(|i| clip.pins.get(*i))?;
+                    let bn = local_of.get(&b).and_then(|i| clip.pins.get(*i))?;
+                    Some((an.name, bn.name))
+                })
+                .collect();
+            let prefix: String = part.label.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            let label = if prefix.is_empty() { self.next_label("U") } else { self.next_label(&prefix) };
+            let id = self.add_part_recorded(
+                part.kind,
+                &label,
+                &part.value,
+                Pt::new(part.at.x + delta.x, part.at.y + delta.y),
+                specs,
+                internal,
+            );
+            let pins = self.circuit.parts[id].pins.clone();
+            new_ids.push((id, pins));
+            created.push(id);
+        }
+        for &(pa, ia, pb, ib, class) in &clip.wires {
+            if let (Some(a), Some(b)) = (
+                new_ids.get(pa).and_then(|(_, v)| v.get(ia)),
+                new_ids.get(pb).and_then(|(_, v)| v.get(ib)),
+            ) {
+                self.add_wire_recorded(End::Pin(*a), End::Pin(*b), class);
+            }
+        }
+        self.clear_selection();
+        for id in created {
+            self.selected_parts.insert(id);
+        }
+        self.selected = self.selected_parts.iter().next_back().copied();
+        true
+    }
+
+    pub fn duplicate_selected(&mut self) -> bool {
+        if !self.copy_selected() {
+            return false;
+        }
+        let at = self
+            .selected_parts
+            .iter()
+            .filter_map(|&i| self.circuit.parts.get(i))
+            .next()
+            .map(|p| Pt::new(p.at.x + 10.16, p.at.y))
+            .unwrap_or_default();
+        self.paste(at)
+    }
+
+    /// Move the whole selection by one grid step. Shift uses a half step.
+    pub fn nudge_selected(&mut self, dx: f32, dy: f32) -> bool {
+        if self.selected_parts.is_empty() {
+            return false;
+        }
+        self.snapshot();
+        let ids: Vec<PartId> = self.selected_parts.iter().copied().collect();
+        let mut moved = false;
+        for id in ids {
+            let Some(part) = self.circuit.parts.get(id).filter(|p| p.active) else { continue };
+            let to = Pt::new(part.at.x + dx, part.at.y + dy);
+            moved |= self.move_part_recorded(id, to);
+        }
+        if !moved {
+            self.cancel_snapshot();
+        }
+        moved
+    }
+
+    /// Line every marked part up with one edge of the group's frame.
+    pub fn align_selected(&mut self, edge: Align) -> bool {
+        let Some(box_) = self.selection_bbox() else { return false };
+        let ids: Vec<PartId> = self.selected_parts.iter().copied().collect();
+        self.snapshot();
+        let mut moved = false;
+        for id in ids {
+            let Some(part) = self.circuit.parts.get(id).filter(|p| p.active) else { continue };
+            let r = self.circuit.part_rect(part);
+            let (x, y) = match edge {
+                Align::Left => (box_.x, part.at.y),
+                Align::Right => (box_.right() - r.w, part.at.y),
+                Align::Top => (part.at.x, box_.y),
+                Align::Bottom => (part.at.x, box_.bottom() - r.h),
+            };
+            moved |= self.move_part_recorded(id, Pt::new(x, y));
+        }
+        if !moved {
+            self.cancel_snapshot();
+        }
+        moved
+    }
+
+    pub fn delete_selected(&mut self) -> bool {
+        if self.selected_parts.is_empty() && self.selected_wires.is_empty() {
+            return false;
+        }
+        self.snapshot();
+        let wires: Vec<WireId> = self.selected_wires.iter().copied().collect();
+        let parts: Vec<PartId> = self.selected_parts.iter().copied().collect();
+        for id in wires {
+            self.remove_wire_recorded(id);
+        }
+        for id in parts {
+            if self.circuit.arduino != Some(id) {
+                self.remove_part_recorded(id);
+            }
+        }
+        self.clear_selection();
+        true
     }
 }
 
@@ -871,7 +1579,7 @@ mod tests {
 
     /// Every pin must point at its own part, and every part at its own pins.
     fn consistent(c: &Circuit) -> bool {
-        for (i, pin) in c.pins.iter().enumerate() {
+        for (i, pin) in c.pins_id() {
             if pin.part >= c.parts.len() {
                 return false;
             }
@@ -879,14 +1587,14 @@ mod tests {
                 return false;
             }
         }
-        for (i, part) in c.parts.iter().enumerate() {
+        for (i, part) in c.parts_id() {
             for &p in &part.pins {
                 if p >= c.pins.len() || c.pins[p].part != i {
                     return false;
                 }
             }
         }
-        for w in &c.wires {
+        for w in c.wires() {
             for e in [w.a, w.b] {
                 if let End::Pin(p) = e {
                     if p >= c.pins.len() {
@@ -906,7 +1614,7 @@ mod tests {
             // cursor on that board instead of adding a second one.
             if place == Place::Uno {
                 assert!(!d.place(Place::Uno, Pt::default()));
-                assert_eq!(d.circuit.parts.len(), 1);
+                assert_eq!(d.circuit.parts().count(), 1);
                 assert_eq!(d.selected, d.circuit.arduino);
                 continue;
             }
@@ -916,7 +1624,7 @@ mod tests {
                 Pt::new(100.0, 100.0)
             };
             assert!(d.place(place, spot), "{place:?} could not be placed");
-            assert_eq!(d.circuit.parts.len(), 2, "{place:?}");
+            assert_eq!(d.circuit.parts().count(), 2, "{place:?}");
             assert!(consistent(&d.circuit), "{place:?} broke the pin indices");
             let part = &d.circuit.parts[1];
             assert!(!part.pins.is_empty(), "{place:?} has no pins");
@@ -957,19 +1665,125 @@ mod tests {
     }
 
     #[test]
+    fn the_inspector_edits_a_part_and_a_wire() {
+        let mut d = Draft::new();
+        d.place(Place::Resistor, at(&d, 5, Row::A));
+        assert!(d.set_label(1, "R7"));
+        assert_eq!(d.circuit.parts[1].label, "R7");
+        assert!(!d.set_label(1, "U1"), "the Uno already owns that name");
+        assert!(d.set_value(1, "10 кОм"));
+        assert_eq!(d.circuit.parts[1].value, "10 кОм");
+        let d9 = End::Pin(d.circuit.pin(0, "D9"));
+        let hole = End::Hole(Hole::Col(20, Row::J));
+        assert!(d.connect(d9, hole));
+        assert!(d.set_wire_class(0, NetClass::Gnd));
+        assert_eq!(d.circuit.wires[0].class, NetClass::Gnd);
+        assert!(!d.clear_vias(0));
+    }
+
+    /// A half-finished cable must never end in the corner of the sheet: the
+    /// old code turned `OffBoard` into point (0, 0).
+    #[test]
+    fn undo_keeps_the_selection_context() {
+        let mut d = Draft::new();
+        d.place(Place::Resistor, at(&d, 5, Row::A));
+        let marked = d.selected_parts.clone();
+        let r = d.circuit.parts[1].pins[0];
+        let gnd = d.circuit.pin(0, "GND1");
+        assert!(d.connect(End::Pin(r), End::Pin(gnd)));
+        assert!(d.undo());
+        assert_eq!(d.circuit.wires().count(), 0);
+        assert_eq!(d.selected_parts, marked, "the part under the cursor is still selected");
+        assert!(d.redo());
+        assert_eq!(d.circuit.wires().count(), 1);
+    }
+
+    #[test]
+    fn a_marquee_group_can_be_copied_moved_and_deleted() {
+        let mut d = Draft::new();
+        assert!(d.place(Place::Resistor, at(&d, 5, Row::A)));
+        assert!(d.place(Place::Resistor, at(&d, 12, Row::A)));
+        d.select_all();
+        assert_eq!(d.selected_parts.len(), 2, "the Uno is not part of the group");
+        let before = d.circuit.parts().count();
+        assert!(d.copy_selected());
+        assert!(d.duplicate_selected());
+        assert_eq!(d.circuit.parts().count(), before + 2);
+        assert_eq!(d.selected_parts.len(), 2, "the copies are the new selection");
+        assert!(d.nudge_selected(PITCH, 0.0));
+        assert!(d.align_selected(Align::Left));
+        assert!(d.delete_selected());
+        assert_eq!(d.circuit.parts().count(), before);
+        assert!(d.selected_parts.is_empty());
+        assert!(d.undo());
+        assert_eq!(d.circuit.parts().count(), before + 2);
+    }
+
+    #[test]
+    fn shift_click_adds_to_the_selection() {
+        let mut d = Draft::new();
+        d.place(Place::Resistor, at(&d, 5, Row::A));
+        d.place(Place::Resistor, at(&d, 12, Row::A));
+        d.select_part(1, false);
+        d.select_part(2, true);
+        assert_eq!(d.selected_parts.len(), 2);
+        assert_eq!(d.selected_part(), Some(2));
+        d.select_part(1, true);
+        assert_eq!(d.selected_parts.len(), 1);
+        d.clear_selection();
+        assert!(d.selected_parts.is_empty());
+    }
+
+    #[test]
+    fn a_cable_can_rename_its_net() {
+        let mut d = Draft::new();
+        let d9 = End::Pin(d.circuit.pin(0, "D9"));
+        let hole = End::Hole(Hole::Col(20, Row::J));
+        assert!(d.connect(d9, hole));
+        assert!(d.set_net_name(0, "MOTOR_PWM"));
+        let nets = d.circuit.nets();
+        let pin = d.circuit.pin(0, "D9");
+        assert_eq!(d.circuit.net_name(&nets, nets.root(pin)), "MOTOR_PWM");
+        assert!(crate::netlist::netlist(&d.circuit).contains("MOTOR_PWM"));
+    }
+
+    #[test]
+    fn a_wire_cannot_end_outside_the_bench() {
+        let mut d = Draft::new();
+        let d9 = End::Pin(d.circuit.pin(0, "D9"));
+        let empty = End::Hole(Hole::OffBoard);
+        assert!(!d.connect(d9, empty));
+        assert!(!d.connect(empty, d9));
+        assert_eq!(d.circuit.wires().count(), 0);
+        let hole = End::Hole(Hole::Col(20, Row::J));
+        assert!(d.connect(d9, hole));
+    }
+
+    /// A part dropped on a hole that already holds a leg would silently
+    /// short two components: the board joins all pins in one hole.
+    #[test]
+    fn a_part_cannot_take_an_occupied_hole() {
+        let mut d = Draft::new();
+        assert!(d.place(Place::Resistor, at(&d, 5, Row::A)));
+        assert!(d.place(Place::Resistor, at(&d, 12, Row::A)));
+        assert!(!d.place(Place::Resistor, at(&d, 5, Row::A)), "hole 5 is taken");
+        assert_eq!(d.circuit.parts().count(), 3);
+    }
+
+    #[test]
     fn wiring_and_undo_keep_the_netlist() {
         let mut d = Draft::new();
         d.place(Place::Resistor, at(&d, 5, Row::A));
         let r = d.circuit.parts[1].pins[0];
         let gnd = d.circuit.pin(0, "GND1");
         assert!(d.connect(End::Pin(r), End::Pin(gnd)));
-        assert_eq!(d.circuit.wires.len(), 1);
+        assert_eq!(d.circuit.wires().count(), 1);
         let roots = d.circuit.nets();
         assert_eq!(roots.root(r), roots.root(gnd));
         assert!(d.undo());
-        assert!(d.circuit.wires.is_empty());
+        assert!(d.circuit.wires().count() == 0);
         assert!(d.redo());
-        assert_eq!(d.circuit.wires.len(), 1);
+        assert_eq!(d.circuit.wires().count(), 1);
         assert!(consistent(&d.circuit));
     }
 
@@ -981,7 +1795,7 @@ mod tests {
         assert!(d.connect(a, b));
         assert!(!d.connect(a, b), "duplicate wire accepted");
         assert!(!d.connect(b, a), "reversed duplicate accepted");
-        assert_eq!(d.circuit.wires.len(), 1);
+        assert_eq!(d.circuit.wires().count(), 1);
     }
 
     #[test]
@@ -990,11 +1804,11 @@ mod tests {
         d.place(Place::Led, at(&d, 5, Row::A));
         let led = d.circuit.parts[1].pins[0];
         d.connect(End::Pin(led), End::Hole(Hole::Col(5, Row::A)));
-        assert_eq!(d.circuit.wires.len(), 1);
+        assert_eq!(d.circuit.wires().count(), 1);
         d.circuit.remove_part(1);
-        assert_eq!(d.circuit.parts.len(), 1);
-        assert!(d.circuit.wires.is_empty());
-        assert_eq!(d.circuit.pins.len(), 32);
+        assert_eq!(d.circuit.parts().count(), 1);
+        assert_eq!(d.circuit.wires().count(), 0);
+        assert_eq!(d.circuit.pins().count(), 32);
         assert!(consistent(&d.circuit));
     }
 
@@ -1039,7 +1853,7 @@ mod tests {
         let mid = d.circuit.parts[1].at;
         assert_eq!(d.part_at(mid), Some(1));
         assert!(d.delete_at(mid, WireStyle::Arc));
-        assert_eq!(d.circuit.parts.len(), 1);
+        assert_eq!(d.circuit.parts().count(), 1);
         assert!(!d.delete_at(mid, WireStyle::Arc), "nothing left to delete");
 
         let a = End::Pin(d.circuit.pin(0, "D9"));
@@ -1109,8 +1923,10 @@ mod tests {
         let mut d = Draft::new();
         d.adopt(built.circuit.clone());
         assert!(consistent(&d.circuit));
-        assert_eq!(d.circuit.wires.len(), built.circuit.wires.len());
-        assert!(!d.can_undo(), "handover must start with a clean history");
+        assert_eq!(d.circuit.wires().count(), built.circuit.wires().count());
+        assert!(d.can_undo(), "the handover itself can be undone");
+        assert!(d.undo());
+        assert_eq!(d.circuit.wires().count(), 0, "back to the empty bench");
 
         let report = checks::run_circuit(&d.circuit, crate::text::Lang::Ru, None);
         let failed: Vec<&str> = report
@@ -1125,10 +1941,10 @@ mod tests {
     #[test]
     fn an_empty_draft_has_only_the_board_and_the_uno() {
         let d = Draft::new();
-        assert_eq!(d.circuit.parts.len(), 1);
+        assert_eq!(d.circuit.parts().count(), 1);
         assert_eq!(d.circuit.parts[0].kind, Kind::Arduino);
-        assert!(d.circuit.wires.is_empty());
-        assert_eq!(d.circuit.pins.len(), 32);
+        assert!(d.circuit.wires().count() == 0);
+        assert_eq!(d.circuit.pins().count(), 32);
         let report = checks::run_circuit(&d.circuit, crate::text::Lang::Ru, None);
         assert_ne!(
             report.worst(),
@@ -1191,7 +2007,7 @@ mod tests {
         assert!(scene.bounds().h > 0.0);
         // Going back is always allowed and keeps the bench parts.
         assert!(d.set_bare(false));
-        assert_eq!(d.circuit.parts.len(), 2);
+        assert_eq!(d.circuit.parts().count(), 2);
     }
 
     /// Turning the board off is refused while a part is plugged in, so the
@@ -1280,7 +2096,7 @@ mod tests {
         assert_eq!(d.via_at(target), Some((0, 0)), "the bend cannot be grabbed");
         assert!(d.delete_at(target, style));
         assert!(d.circuit.wires[0].via.is_empty());
-        assert!(d.circuit.wires.len() == 1, "deleting a bend took the cable");
+        assert!(d.circuit.wires().count() == 1, "deleting a bend took the cable");
     }
 
     /// A second bend lands on the leg that was grabbed, not at the ends.
@@ -1387,7 +2203,7 @@ mod tests {
                 "{} could not be placed",
                 m.name
             );
-            assert_eq!(d.circuit.parts.len(), 2, "{}", m.name);
+            assert_eq!(d.circuit.parts().count(), 2, "{}", m.name);
             assert_eq!(d.circuit.parts[1].value, m.name);
             assert_eq!(d.circuit.parts[1].kind, Kind::Module);
             assert!(!d.circuit.parts[1].pins.is_empty(), "{} has no pins", m.name);
@@ -1428,8 +2244,8 @@ mod tests {
         }
         assert_eq!(d.undo.len(), HISTORY_STEPS);
 
-        // A dense bench hits the byte cap: older steps are dropped, the
-        // newest one always survives.
+        // A command step holds only the change, not a copy of the bench:
+        // a dense circuit is just as cheap to step through as an empty one.
         let mut d = Draft::new();
         d.circuit.wire(
             End::Hole(Hole::Col(1, Row::A)),
@@ -1440,18 +2256,10 @@ mod tests {
         for _ in 0..1200 {
             d.circuit.wires.push(seed.clone());
         }
-        let one = history_bytes(&d.circuit);
-        assert!(one * 4 < HISTORY_BYTES, "fixture is too small to test the cap");
-        for _ in 0..HISTORY_STEPS {
+        for _ in 0..200 {
             d.snapshot();
         }
-        let total: usize = d.undo.iter().map(history_bytes).sum();
-        assert!(
-            total <= HISTORY_BYTES || d.undo.len() == 1,
-            "{total} bytes in {} steps",
-            d.undo.len()
-        );
-        assert!(d.undo.len() < HISTORY_STEPS, "the cap never bit");
+        assert_eq!(d.undo.len(), HISTORY_STEPS);
         assert!(d.can_undo());
     }
 }

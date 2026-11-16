@@ -1449,7 +1449,7 @@ impl B {
         for rail in [Rail::TopPlus, Rail::TopMinus, Rail::BotPlus, Rail::BotMinus] {
             let mut left = false;
             let mut right = false;
-            for w in &self.c.wires {
+            for w in self.c.wires() {
                 for e in [w.a, w.b] {
                     if let End::Hole(Hole::Rail(r, h, _)) = e {
                         if r == rail {
@@ -1461,7 +1461,7 @@ impl B {
                     }
                 }
             }
-            for p in &self.c.pins {
+            for p in self.c.pins() {
                 if let Hole::Rail(r, h, _) = p.hole {
                     if r == rail {
                         match h {
@@ -3995,7 +3995,7 @@ mod tests {
                 signatures.push((
                     built.circuit.parts.len(),
                     built.circuit.wires.len(),
-                    built.circuit.parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>(),
+                    built.circuit.parts().map(|p| p.value.clone()).collect::<Vec<_>>(),
                 ));
             }
             assert!(
@@ -4021,7 +4021,7 @@ mod tests {
         assert!(built.code.contains("MAX_CARDS = 49"), "wrong table size");
         assert!(built.code.contains("Adafruit_SSD1306"), "no OLED");
         assert!(built.code.contains("MFRC522"), "no reader");
-        let values: Vec<&str> = built.circuit.parts.iter().map(|p| p.value.as_str()).collect();
+        let values: Vec<&str> = built.circuit.parts().map(|p| p.value.as_str()).collect();
         assert!(values.iter().any(|v| v.contains("OLED")), "{values:?}");
         assert!(values.iter().any(|v| *v == "RC522"), "{values:?}");
         assert!(!built.code.contains("delay("), "loop must not block");
@@ -4062,7 +4062,7 @@ mod tests {
                 signatures.push((
                     built.circuit.parts.len(),
                     built.circuit.wires.len(),
-                    built.circuit.parts.iter().map(|q| q.value.clone()).collect::<Vec<_>>(),
+                    built.circuit.parts().map(|q| q.value.clone()).collect::<Vec<_>>(),
                 ));
             }
             if signatures.len() > 1 {
@@ -4249,7 +4249,7 @@ mod tests {
                 );
             }
             assert!(
-                built.circuit.parts.iter().any(|p| p.kind == Kind::Motor),
+                built.circuit.parts().any(|p| p.kind == Kind::Motor),
                 "choice {choice} lost the motor"
             );
         }

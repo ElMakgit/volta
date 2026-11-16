@@ -379,13 +379,23 @@ pub enum PinKind {
     Passive,
 }
 
+/// Stable identifiers of the objects on the bench. They are indices into
+/// append-only slot lists: deleting an object marks its slot dead, so an id
+/// never changes or points at another object afterwards.
+pub type PartId = usize;
+pub type PinId = usize;
+pub type WireId = usize;
+
 #[derive(Clone, Debug)]
 pub struct Pin {
-    pub part: usize,
+    pub part: PartId,
     pub name: &'static str,
     pub pos: Pt,
     pub hole: Hole,
     pub kind: PinKind,
+    /// False for a removed slot, kept so that the ids of all other objects
+    /// stay valid.
+    pub active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -394,13 +404,15 @@ pub struct Part {
     pub label: String,
     pub value: String,
     pub at: Pt,
-    pub pins: Vec<usize>,
+    pub pins: Vec<PinId>,
     /// Pins that are joined inside the part (switch contacts, coil terminals).
-    pub internal: Vec<(usize, usize)>,
+    pub internal: Vec<(PinId, PinId)>,
     /// Quarter turns clockwise around the part's own pivot. Pins are stored in
     /// their turned positions; the painter draws the body upright and turns the
     /// primitives, which keeps every part on the same simple geometry.
     pub rot: u8,
+    /// False for a removed slot, kept so that ids never get reused.
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -415,7 +427,7 @@ pub enum NetClass {
 /// a first-class endpoint and takes part in the netlist just like a pin.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum End {
-    Pin(usize),
+    Pin(PinId),
     Hole(Hole),
 }
 
@@ -469,6 +481,8 @@ pub struct Wire {
     /// Corners the user pulled out by hand, in bench millimetres, in the order
     /// the cable passes through them. Empty means the style decides the route.
     pub via: Vec<Pt>,
+    /// False for a removed slot, kept so that wire ids stay valid.
+    pub active: bool,
 }
 
 pub struct PinSpec {
@@ -484,10 +498,14 @@ pub struct Circuit {
     pub parts: Vec<Part>,
     pub pins: Vec<Pin>,
     pub wires: Vec<Wire>,
-    pub arduino: Option<usize>,
+    pub arduino: Option<PartId>,
     pub notes: Vec<&'static str>,
     /// No breadboard: parts sit on the bench and are wired pin to pin.
     pub bare: bool,
+    /// User-given names of nets, keyed by the sorted ids of their pins.
+    /// A key changes only when the net itself changes, so a name survives
+    /// adding another wire to the same net.
+    pub net_names: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Board {
@@ -503,6 +521,48 @@ impl Circuit {
             board: Board::default(),
             ..Default::default()
         }
+    }
+
+    /// Live objects only. The vectors also hold the slots of deleted objects
+    /// so that ids never change; every drawing, check and netlist walks these
+    /// iterators instead of the raw vectors.
+    pub fn parts(&self) -> impl Iterator<Item = &Part> {
+        self.parts.iter().filter(|p| p.active)
+    }
+    pub fn parts_mut(&mut self) -> impl Iterator<Item = &mut Part> {
+        self.parts.iter_mut().filter(|p| p.active)
+    }
+    pub fn pins(&self) -> impl Iterator<Item = &Pin> {
+        self.pins.iter().filter(|p| p.active)
+    }
+    pub fn pins_mut(&mut self) -> impl Iterator<Item = &mut Pin> {
+        self.pins.iter_mut().filter(|p| p.active)
+    }
+    pub fn wires(&self) -> impl Iterator<Item = &Wire> {
+        self.wires.iter().filter(|w| w.active)
+    }
+    pub fn wires_mut(&mut self) -> impl Iterator<Item = &mut Wire> {
+        self.wires.iter_mut().filter(|w| w.active)
+    }
+    /// Live objects with their stable ids, for hit-testing and selection.
+    pub fn parts_id(&self) -> impl Iterator<Item = (PartId, &Part)> {
+        self.parts.iter().enumerate().filter(|(_, p)| p.active)
+    }
+    pub fn pins_id(&self) -> impl Iterator<Item = (PinId, &Pin)> {
+        self.pins.iter().enumerate().filter(|(_, p)| p.active)
+    }
+    pub fn wires_id(&self) -> impl Iterator<Item = (WireId, &Wire)> {
+        self.wires.iter().enumerate().filter(|(_, w)| w.active)
+    }
+    /// The first free slot id, used when a new object is added.
+    pub fn next_part_id(&self) -> PartId {
+        self.parts.len()
+    }
+    pub fn next_pin_id(&self) -> PinId {
+        self.pins.len()
+    }
+    pub fn next_wire_id(&self) -> WireId {
+        self.wires.len()
     }
 
     pub fn add_part(
@@ -524,6 +584,7 @@ impl Circuit {
                 pos: p.pos,
                 hole: p.hole,
                 kind: p.kind,
+                active: true,
             });
         }
         // Push the part first: the internal links are resolved by name, and
@@ -536,6 +597,7 @@ impl Circuit {
             pins: ids,
             internal: Vec::new(),
             rot: 0,
+            active: true,
         });
         let mut links = Vec::new();
         for (a, b) in internal {
@@ -563,60 +625,64 @@ impl Circuit {
         if a == b {
             return;
         }
-        self.wires.push(Wire { a, b, class, lift, via: Vec::new() });
+        self.wires.push(Wire { a, b, class, lift, via: Vec::new(), active: true });
     }
 
-    /// Drop a part and every wire that hung off it. Indices are rebuilt, so
-    /// the caller's old part numbers stop being valid.
-    pub fn remove_part(&mut self, victim: usize) {
-        if victim >= self.parts.len() {
+    /// Remove a part without renumbering anything. Its slot and the slots of
+    /// its pins stay in the vectors, marked dead, so every id held by the UI,
+    /// the checks or a saved project still names the same thing.
+    pub fn remove_part(&mut self, victim: PartId) {
+        if victim >= self.parts.len() || !self.parts[victim].active {
             return;
         }
-        let mut pin_map: Vec<Option<usize>> = vec![None; self.pins.len()];
-        let mut parts = Vec::with_capacity(self.parts.len() - 1);
-        let mut pins = Vec::with_capacity(self.pins.len() - self.parts[victim].pins.len());
-        for (old, part) in self.parts.iter().enumerate() {
-            if old == victim {
-                continue;
-            }
-            let new_idx = parts.len();
-            let mut moved = Vec::with_capacity(part.pins.len());
-            for &old_pin in &part.pins {
-                let new_pin = pins.len();
-                pin_map[old_pin] = Some(new_pin);
-                let p = &self.pins[old_pin];
-                pins.push(Pin { part: new_idx, ..p.clone() });
-                moved.push(new_pin);
-            }
-            parts.push(Part { pins: moved, ..part.clone() });
+        self.parts[victim].active = false;
+        let victim_pins = self.parts[victim].pins.clone();
+        for &pin in &victim_pins {
+            self.pins[pin].active = false;
         }
-        for part in &mut parts {
-            part.internal = part
-                .internal
-                .iter()
-                .filter_map(|(a, b)| Some((pin_map[*a]?, pin_map[*b]?)))
-                .collect();
-        }
-        let remap = |e: End| -> Option<End> {
-            match e {
-                End::Pin(p) => pin_map[p].map(End::Pin),
-                End::Hole(h) => Some(End::Hole(h)),
+        for w in &mut self.wires {
+            let touches = |e: End| matches!(e, End::Pin(p) if victim_pins.contains(&p));
+            if touches(w.a) || touches(w.b) {
+                w.active = false;
             }
-        };
-        let wires = self
-            .wires
-            .iter()
-            .filter_map(|w| Some(Wire { a: remap(w.a)?, b: remap(w.b)?, ..w.clone() }))
-            .collect();
-        self.parts = parts;
-        self.pins = pins;
-        self.wires = wires;
-        self.arduino = self.arduino.and_then(|a| if a == victim { None } else if a > victim { Some(a - 1) } else { Some(a) });
+        }
+        if self.arduino == Some(victim) {
+            self.arduino = None;
+        }
     }
 
-    pub fn remove_wire(&mut self, idx: usize) {
-        if idx < self.wires.len() {
-            self.wires.remove(idx);
+    /// Put a previously removed part back into its original slot, keeping
+    /// the ids that other cables and the UI still point at.
+    pub fn restore_part(&mut self, id: PartId, part: Part, pins: Vec<Pin>) {
+        for (k, pin) in pins.into_iter().enumerate() {
+            let slot = part.pins.get(k).copied().unwrap_or(0);
+            if slot < self.pins.len() {
+                self.pins[slot] = pin;
+            } else {
+                self.pins.push(pin);
+            }
+        }
+        if id < self.parts.len() {
+            self.parts[id] = part;
+        } else {
+            self.parts.push(part);
+        }
+        if self.parts[id].kind == Kind::Arduino {
+            self.arduino = Some(id);
+        }
+    }
+
+    pub fn restore_wire(&mut self, id: WireId, wire: Wire) {
+        if id < self.wires.len() {
+            self.wires[id] = wire;
+        } else {
+            self.wires.push(wire);
+        }
+    }
+
+    pub fn remove_wire(&mut self, id: WireId) {
+        if id < self.wires.len() {
+            self.wires[id].active = false;
         }
     }
 
@@ -626,6 +692,15 @@ impl Circuit {
             Hole::Rail(r, h, i) => Some(self.board.rail_hole(r, h, i)),
             Hole::OffBoard => None,
         }
+    }
+
+    /// A part may only be seated in holes that no live pin already uses.
+    /// The electrical model joins every pin in a hole, so sharing one by
+    /// accident would silently short two components together.
+    pub fn holes_free(&self, holes: &[Hole]) -> bool {
+        holes.iter().all(|h| {
+            *h == Hole::OffBoard || !self.pins().any(|p| p.hole == *h)
+        })
     }
 
     pub fn end_pos(&self, end: End) -> Pt {
@@ -778,7 +853,7 @@ impl Circuit {
         match end {
             End::Pin(p) => Some(self.pins[p].part),
             End::Hole(h) if h != Hole::OffBoard => {
-                self.pins.iter().find(|p| p.hole == h).map(|p| p.part)
+                self.pins().find(|p| p.hole == h).map(|p| p.part)
             }
             End::Hole(_) => None,
         }
@@ -980,14 +1055,14 @@ impl Circuit {
         };
         let mut next = n;
         let mut hole_edges: Vec<(usize, Hole)> = Vec::new();
-        for pin in &self.pins {
+        for pin in self.pins() {
             if pin.hole != Hole::OffBoard {
                 let id = node_of_hole(pin.hole, &mut next);
                 hole_edges.push((id, pin.hole));
             }
         }
         let mut wire_ends: Vec<(usize, Hole)> = Vec::new();
-        for w in &self.wires {
+        for w in self.wires() {
             for end in [w.a, w.b] {
                 if let End::Hole(h) = end {
                     let id = node_of_hole(h, &mut next);
@@ -996,10 +1071,10 @@ impl Circuit {
             }
         }
         let mut uf = UnionFind::new(next);
-        for w in &self.wires {
+        for w in self.wires() {
             uf.union(end_node(w.a, &holes, &self.pins), end_node(w.b, &holes, &self.pins));
         }
-        for p in &self.parts {
+        for p in self.parts() {
             for &(a, b) in &p.internal {
                 uf.union(a, b);
             }
@@ -1008,7 +1083,7 @@ impl Circuit {
         // exactly that in most builds), so every pin in the hole joins it,
         // not just the first one found.
         for &(id, hole) in &hole_edges {
-            for (pid, p) in self.pins.iter().enumerate() {
+            for (pid, p) in self.pins_id() {
                 if p.hole == hole {
                     uf.union(id, pid);
                 }
@@ -1059,6 +1134,50 @@ impl Circuit {
             groups.entry(r).or_default().push(i);
         }
         Nets { roots, groups }
+    }
+
+    /// A net is named by its members, so adding one more wire to the same net
+    /// does not lose the name the user typed.
+    pub fn net_key(&self, nets: &Nets, root: usize) -> String {
+        let mut pins: Vec<usize> = nets
+            .pins_in(root)
+            .iter()
+            .copied()
+            .filter(|&p| self.pins.get(p).is_some_and(|pin| pin.active))
+            .collect();
+        pins.sort_unstable();
+        pins.dedup();
+        pins.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+    }
+
+    /// The name shown in the inspector and written to a netlist.
+    pub fn net_name(&self, nets: &Nets, root: usize) -> String {
+        let key = self.net_key(nets, root);
+        if let Some(name) = self.net_names.get(&key) {
+            return name.clone();
+        }
+        let pins = nets.pins_in(root);
+        if pins.iter().any(|&p| self.pins[p].kind == PinKind::Ground) {
+            "GND".to_string()
+        } else if pins.iter().any(|&p| self.pins[p].kind == PinKind::Power) {
+            "+5V".to_string()
+        } else {
+            let code = nets.roots_sorted().iter().position(|&r| r == root).unwrap_or(0) + 1;
+            format!("N${code}")
+        }
+    }
+
+    pub fn set_net_name(&mut self, nets: &Nets, root: usize, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 32 || name.contains(')') {
+            return false;
+        }
+        let key = self.net_key(nets, root);
+        if self.net_names.get(&key).map(String::as_str) == Some(name) {
+            return false;
+        }
+        self.net_names.insert(key, name.to_string());
+        true
     }
 
     /// The pivot a part turns around. The Uno turns around the middle of its
@@ -1179,7 +1298,7 @@ impl Circuit {
         }
         // The holes must be free: a leg may not share a socket with another
         // part, or the netlist would join things that are only touching.
-        for p in self.pins.iter() {
+        for p in self.pins() {
             if p.part == idx {
                 continue;
             }
@@ -1208,7 +1327,7 @@ impl Circuit {
         if bare == self.bare {
             return true;
         }
-        if bare && self.parts.iter().any(|p| self.part_is_seated(p)) {
+        if bare && self.parts().any(|p| self.part_is_seated(p)) {
             return false;
         }
         self.bare = bare;
@@ -1314,15 +1433,15 @@ impl Circuit {
             eat(Pt::new(b.x, b.y));
             eat(Pt::new(b.right(), b.bottom()));
         }
-        for p in &self.pins {
+        for p in self.pins() {
             eat(p.pos);
         }
-        for p in &self.parts {
+        for p in self.parts() {
             let r = self.part_rect(p);
             eat(Pt::new(r.x, r.y));
             eat(Pt::new(r.right(), r.bottom()));
         }
-        for w in &self.wires {
+        for w in self.wires() {
             eat(self.end_pos(w.a));
             eat(self.end_pos(w.b));
             match style {
@@ -1346,7 +1465,7 @@ impl Circuit {
     }
 
     pub fn parts_of(&self, kind: Kind) -> impl Iterator<Item = &Part> {
-        self.parts.iter().filter(move |p| p.kind == kind)
+        self.parts().filter(move |p| p.kind == kind)
     }
 
     /// Names of the parts sharing a net with `pin`, for the hover readout.
@@ -1383,6 +1502,12 @@ impl Nets {
     }
     pub fn group_count(&self) -> usize {
         self.groups.len()
+    }
+    /// Roots ordered by their first pin, so export and numbering are stable.
+    pub fn roots_sorted(&self) -> Vec<usize> {
+        let mut roots: Vec<usize> = self.groups.keys().copied().collect();
+        roots.sort_by_key(|r| self.groups.get(r).and_then(|p| p.first()).copied().unwrap_or(usize::MAX));
+        roots
     }
     /// True when both pins sit on some third pin's net, i.e. they are wired
     /// together, directly or through the board.
@@ -1673,13 +1798,16 @@ mod tests {
         let tail = c.pin(3, "2");
         c.wire(End::Pin(tail), End::Hole(Hole::Col(10, Row::B)), NetClass::Signal);
         c.remove_part(2);
-        assert_eq!(c.parts.len(), 3, "one part went away");
+        assert_eq!(c.parts().count(), 3, "one part went away");
+        assert!(!c.parts[2].active, "the removed slot stays in place");
         assert_eq!(c.arduino, Some(0));
-        for (i, pin) in c.pins.iter().enumerate() {
+        assert!(c.pins[tail].active, "a surviving id still names its pin");
+        assert_eq!(c.pins[tail].name, "2");
+        for (i, pin) in c.pins_id() {
             assert!(pin.part < c.parts.len());
             assert!(c.parts[pin.part].pins.contains(&i));
         }
-        let kept = c.wires.iter().find(|w| matches!(w.a, End::Pin(_))).expect("wire survived");
+        let kept = c.wires().find(|w| matches!(w.a, End::Pin(_))).expect("wire survived");
         if let End::Pin(p) = kept.a {
             assert_eq!(c.parts[c.pins[p].part].label, "R");
         }
@@ -1690,8 +1818,8 @@ mod tests {
         let mut c = bench();
         c.remove_part(0);
         assert!(c.arduino.is_none());
-        assert!(c.parts.is_empty());
-        assert!(c.pins.is_empty());
+        assert_eq!(c.parts().count(), 0);
+        assert_eq!(c.pins().count(), 0);
     }
 
     /// Every logical pin has exactly one physical socket, all of them sit on
@@ -1996,7 +2124,7 @@ mod tests {
     fn angled_wires_bend_at_right_angles() {
         let circuit = wired();
         assert_eq!(circuit.wires.len(), 2, "the sample circuit has no wires");
-        for w in &circuit.wires {
+        for w in circuit.wires() {
             let pts = circuit.wire_points(w, WireStyle::Ortho);
             assert!(pts.len() >= 2, "a wire needs at least two points");
             assert_eq!(pts[0], circuit.end_pos(w.a), "the wire left its start");
@@ -2121,7 +2249,7 @@ mod tests {
     #[test]
     fn angled_routing_is_stable() {
         let circuit = wired();
-        for w in &circuit.wires {
+        for w in circuit.wires() {
             let a = circuit.wire_points(w, WireStyle::Ortho);
             let b = circuit.wire_points(w, WireStyle::Ortho);
             assert_eq!(a, b);
@@ -2145,7 +2273,7 @@ mod tests {
             let Some(built) = crate::templates::build(&parsed.intent, 0, crate::text::Lang::Ru) else {
                 continue;
             };
-            for (i, w) in built.circuit.wires.iter().enumerate() {
+            for (i, w) in built.circuit.wires_id() {
                 let pts = built.circuit.wire_points(w, WireStyle::Ortho);
                 for seg in pts.windows(2) {
                     let flat = (seg[0].x - seg[1].x).abs() < 1e-3;
@@ -2174,7 +2302,7 @@ mod tests {
             })
         };
         let mut stepped = 0;
-        for w in &c.wires {
+        for w in c.wires() {
             let pts = c.wire_points(w, WireStyle::Ortho);
             if matches!(w.a, End::Pin(_)) && has_step(&pts) {
                 stepped += 1;

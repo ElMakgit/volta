@@ -17,7 +17,7 @@ use eframe::egui::{
 use crate::checks::{self, Report, Sev};
 use crate::icons::{self, Icon};
 use crate::manual::{self, Draft, Place};
-use crate::model::{Circuit, Pt, WireStyle};
+use crate::model::{Circuit, Kind, NetClass, Pt, WireStyle};
 use crate::parse::{self, Parse};
 use crate::project;
 use crate::scene::{self, Anchor, Prim, Rgba, Scene};
@@ -49,6 +49,8 @@ enum SaveKind {
     Svg,
     Sketch,
     Csv,
+    /// A KiCad-readable connectivity file.
+    Netlist,
     /// SVG plus the sketch in one folder.
     Bundle,
 }
@@ -60,6 +62,7 @@ impl SaveKind {
             SaveKind::Svg => "svg",
             SaveKind::Sketch => "sketch",
             SaveKind::Csv => "csv",
+            SaveKind::Netlist => "netlist",
             SaveKind::Bundle => "bundle",
         }
     }
@@ -69,6 +72,7 @@ impl SaveKind {
             "svg" => Some(SaveKind::Svg),
             "sketch" => Some(SaveKind::Sketch),
             "csv" => Some(SaveKind::Csv),
+            "netlist" => Some(SaveKind::Netlist),
             "bundle" => Some(SaveKind::Bundle),
             _ => None,
         }
@@ -79,6 +83,7 @@ impl SaveKind {
             SaveKind::Svg => "circuit.svg",
             SaveKind::Sketch => "sketch.ino",
             SaveKind::Csv => "components.csv",
+            SaveKind::Netlist => "circuit.net",
             SaveKind::Bundle => "circuit",
         }
     }
@@ -89,6 +94,7 @@ impl SaveKind {
             SaveKind::Svg => "SVG",
             SaveKind::Sketch => ".ino",
             SaveKind::Csv => "CSV",
+            SaveKind::Netlist => ".net",
             SaveKind::Bundle => "SVG+.ino",
         }
     }
@@ -258,6 +264,16 @@ struct Drag {
     frame: Option<crate::model::Rect>,
 }
 
+enum InspectAction {
+    Label(String),
+    Value(String),
+    Variant(String, Kind),
+    Rotate,
+    WireClass(NetClass),
+    NetName(String),
+    ClearVias,
+}
+
 impl Drag {
     fn active(&self) -> bool {
         self.part.is_some() || self.via.is_some()
@@ -280,6 +296,11 @@ pub struct App {
     manual_report: Option<Report>,
     tool: Tool,
     palette_filter: String,
+    /// Draft text of the property inspector, committed on Enter or blur.
+    inspect_for: String,
+    inspect_label: String,
+    inspect_value: String,
+    inspect_net: String,
     wire_style: WireStyle,
     /// The cable whose grips are shown: the one under the pointer or being
     /// bent by hand.
@@ -289,6 +310,8 @@ pub struct App {
     hover_world: Option<Pt>,
     /// The bench point under the last press, kept until a drag consumes it.
     press_world: Option<Pt>,
+    /// First corner of a rubber-band selection, in bench coordinates.
+    marquee: Option<Pt>,
     tab: Tab,
     labels: bool,
     hover: Option<usize>,
@@ -352,10 +375,15 @@ impl App {
             manual_report: None,
             tool: Tool::Select,
             palette_filter: String::new(),
+            inspect_for: String::new(),
+            inspect_label: String::new(),
+            inspect_value: String::new(),
+            inspect_net: String::new(),
             wire_style: crate::config::load_wire_style(),
             active_wire: None,
             hover_world: None,
             press_world: None,
+            marquee: None,
             tab: Tab::Circuit,
             labels: false,
             hover: None,
@@ -631,6 +659,7 @@ impl App {
                 bench: self.bench(),
                 style: self.wire_style,
                 selected: None,
+                selected_many: Vec::new(),
                 frame: None,
                 active_wire: None,
                 handles: Vec::new(),
@@ -650,6 +679,7 @@ impl App {
                 bench: self.bench(),
                 style: self.wire_style,
                 selected: self.draft.selected_part(),
+                selected_many: self.draft.selected_parts.iter().copied().collect(),
                 frame: self.drag.frame,
                 active_wire: self.active_wire,
                 handles: self
@@ -1028,6 +1058,16 @@ impl App {
                     Err(e) => Err(format!("{}: {e}", out.display())),
                 }
             }
+            SaveKind::Netlist => {
+                let Some(circuit) = self.active_circuit().cloned() else {
+                    return;
+                };
+                let out = with_ext(&path, "net");
+                match std::fs::write(&out, crate::netlist::netlist(&circuit)) {
+                    Ok(()) => Ok(out),
+                    Err(e) => Err(format!("{}: {e}", out.display())),
+                }
+            }
             SaveKind::Bundle => {
                 let Some(sc) = self.active_scene().cloned() else {
                     return;
@@ -1089,7 +1129,8 @@ impl App {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        let (ctrl, shift, enter, s, e, z, q, f, r, esc, del, quest, b) = ctx.input(|i| {
+        let (ctrl, shift, enter, s, e, z, q, f, r, esc, del, quest, b, a, c, v, x, dd, left, right, up, down) =
+            ctx.input(|i| {
             (
                 i.modifiers.ctrl,
                 i.modifiers.shift,
@@ -1104,8 +1145,17 @@ impl App {
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
                 i.key_pressed(egui::Key::Questionmark),
                 i.key_pressed(egui::Key::B),
+                i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::V),
+                i.key_pressed(egui::Key::X),
+                i.key_pressed(egui::Key::D),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
             )
-        });
+            });
         let typing = ctx.memory(|m| m.focused().is_some());
 
         // While the save window is open it owns the keyboard: Escape closes
@@ -1137,14 +1187,55 @@ impl App {
             }
         }
         if del && !typing && self.mode == Mode::Manual {
-            if let Some(part) = self.draft.selected_part() {
-                if self.draft.circuit.arduino != Some(part) {
-                    self.draft.snapshot();
-                    self.draft.circuit.remove_part(part);
-                    self.draft.selected = None;
+            if !self.draft.selected_parts.is_empty() {
+                if self.draft.delete_selected() {
                     self.hover = None;
+                    self.active_wire = None;
                     self.refresh_manual();
                 }
+            } else if let Some(wire) = self.active_wire {
+                self.draft.snapshot();
+                self.draft.remove_wire_recorded(wire);
+                self.active_wire = None;
+                self.refresh_manual();
+            }
+        }
+        if ctrl && !typing && self.mode == Mode::Manual {
+            let mut changed = false;
+            if a {
+                self.draft.select_all();
+                changed = true;
+            }
+            if c {
+                changed |= self.draft.copy_selected();
+            }
+            if x {
+                changed |= self.draft.cut_selected();
+            }
+            if v {
+                let at = self.hover_world.unwrap_or_else(|| {
+                    self.draft
+                        .selected_part()
+                        .and_then(|i| self.draft.circuit.parts.get(i))
+                        .map(|p| Pt::new(p.at.x + 10.16, p.at.y))
+                        .unwrap_or_default()
+                });
+                changed |= self.draft.paste(at);
+            }
+            if dd {
+                changed |= self.draft.duplicate_selected();
+            }
+            if changed {
+                self.active_wire = None;
+                self.refresh_manual();
+            }
+        }
+        if !ctrl && !typing && self.mode == Mode::Manual && !self.draft.selected_parts.is_empty() {
+            let step = crate::model::PITCH * if shift { 0.5 } else { 1.0 };
+            let dx = if left { -step } else if right { step } else { 0.0 };
+            let dy = if up { -step } else if down { step } else { 0.0 };
+            if (dx != 0.0 || dy != 0.0) && self.draft.nudge_selected(dx, dy) {
+                self.refresh_manual();
             }
         }
         if f && !typing {
@@ -1343,6 +1434,20 @@ impl eframe::App for App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.mode == Mode::Manual {
+                            if self.draft.selected_parts.len() > 1 {
+                                for (key, edge) in [
+                                    ("◧", manual::Align::Left),
+                                    ("◨", manual::Align::Right),
+                                    ("⌃", manual::Align::Top),
+                                    ("⌄", manual::Align::Bottom),
+                                ] {
+                                    if ui.button(key).on_hover_text(self.t("manual.align")).clicked() {
+                                        if self.draft.align_selected(edge) {
+                                            self.refresh_manual();
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(sel) = self.draft.selected_part() {
                                 let p = &self.draft.circuit.parts[sel];
                                 ui.label(
@@ -1994,6 +2099,10 @@ impl App {
                     picked = Some(SaveKind::Csv);
                     ui.close();
                 }
+                if ui.button(self.t("save.netlist")).clicked() {
+                    picked = Some(SaveKind::Netlist);
+                    ui.close();
+                }
             });
             arrow_resp.response.on_hover_text(self.t("export.more"));
         });
@@ -2187,14 +2296,14 @@ impl App {
             if step == (0, 0) {
                 return;
             }
-            if self.draft.circuit.reseat_part(part, step.0, step.1) {
+            if self.draft.reseat_recorded(part, step.0, step.1) {
                 self.drag.applied = (dcol, drow);
                 self.drag.moved = true;
                 self.refresh_manual();
             }
         } else {
             let to = Pt::new(self.drag.at.x + dx, self.drag.at.y + dy);
-            if self.draft.circuit.move_part(part, to) {
+            if self.draft.move_part_recorded(part, to) {
                 self.drag.moved = true;
                 self.refresh_manual();
             }
@@ -2204,7 +2313,7 @@ impl App {
     /// Start a drag: a cable bend if the pointer is on one, otherwise a part.
     /// A cable is only a couple of millimetres wide, so a hit on it is meant
     /// for it even when it runs across a part's body.
-    fn grab_at(&mut self, at: Pt, frame: crate::model::Rect) -> bool {
+    fn grab_at(&mut self, at: Pt, frame: crate::model::Rect, add: bool) -> bool {
         if std::env::var("VOLTA_DEBUG").is_ok() {
             eprintln!(
                 "grab ({:.2},{:.2}) via {:?} wire {:?} part {:?}",
@@ -2259,7 +2368,7 @@ impl App {
         self.draft.snapshot();
         self.active_wire = None;
         let changed = self.draft.selected != Some(part);
-        self.draft.selected = Some(part);
+        self.draft.select_part(part, add);
         if changed {
             self.refresh_manual();
         }
@@ -2375,7 +2484,10 @@ impl App {
                         .circuit
                         .bbox_with(self.wire_style)
                         .inflate(crate::scene::PAD);
-                    self.grab_at(at, frame);
+                    let add = ui.input(|i| i.modifiers.shift);
+                    if !self.grab_at(at, frame, add) && self.mode == Mode::Manual && !add {
+                        self.marquee = Some(at);
+                    }
                 }
             }
             if let (Some((wire, via)), Some(pos)) = (self.drag.via, resp.interact_pointer_pos()) {
@@ -2388,6 +2500,28 @@ impl App {
                 if resp.dragged() {
                     self.drag_to(part, to_world(pos));
                 }
+            }
+            if let (Some(a), Some(pos)) = (self.marquee, resp.interact_pointer_pos()) {
+                if resp.dragged() {
+                    let b = to_world(pos);
+                    let box_ = crate::model::Rect::new(
+                        a.x.min(b.x),
+                        a.y.min(b.y),
+                        (a.x - b.x).abs(),
+                        (a.y - b.y).abs(),
+                    );
+                    let ids: Vec<_> = circuit
+                        .parts_id()
+                        .filter(|(_, p)| box_.intersects(circuit.part_rect(p)))
+                        .map(|(i, _)| i)
+                        .collect();
+                    self.draft.clear_selection();
+                    self.draft.selected_parts.extend(ids);
+                    self.draft.selected = self.draft.selected_parts.iter().next_back().copied();
+                }
+            }
+            if resp.drag_stopped() && self.marquee.take().is_some() {
+                self.refresh_manual();
             }
             if resp.drag_stopped() && self.drag.active() {
                 if !self.drag.moved {
@@ -2423,7 +2557,7 @@ impl App {
         if let Some(w) = hit.hover {
             let radius = 9.0 / scale;
             let mut best = (radius, None);
-            for (i, pin) in circuit.pins.iter().enumerate() {
+            for (i, pin) in circuit.pins_id() {
                 let d = pin.pos.dist(Pt::new(w.x, w.y));
                 if d < best.0 {
                     best = (d, Some(i));
@@ -2529,7 +2663,7 @@ impl App {
         match self.tool {
             Tool::Wire => {
                 let end = self.draft.end_at(at, 1.6);
-                if end == crate::model::End::Hole(crate::model::Hole::OffBoard) && self.draft.pending.is_none() {
+                if end == crate::model::End::Hole(crate::model::Hole::OffBoard) {
                     return;
                 }
                 match self.draft.pending {
@@ -2553,8 +2687,23 @@ impl App {
             }
             Tool::Select => {
                 let picked = self.draft.part_at(at);
-                if self.draft.selected != picked {
-                    self.draft.selected = picked;
+                let add = ui.input(|i| i.modifiers.shift);
+                if let Some(p) = picked {
+                    let before = self.draft.selected_parts.clone();
+                    self.draft.select_part(p, add);
+                    if before != self.draft.selected_parts {
+                        self.refresh_manual();
+                    }
+                } else if let Some(wire) = self.draft.wire_at(at, self.wire_style) {
+                    let before = self.draft.selected_wires.clone();
+                    self.draft.select_wire(wire, add);
+                    self.active_wire = Some(wire);
+                    if before != self.draft.selected_wires {
+                        self.refresh_manual();
+                    }
+                } else if !add && !self.draft.selected_parts.is_empty() {
+                    self.draft.clear_selection();
+                    self.active_wire = None;
                     self.refresh_manual();
                 }
             }
@@ -3413,10 +3562,12 @@ impl App {
         }
     }
 
+    /// The property inspector: reference, value and rotation of a selected
+    /// part, or the net class and hand bends of the active cable.
     fn value_window(
         &mut self,
         ctx: &egui::Context,
-        accent: Color32,
+        _accent: Color32,
         fg: Color32,
         muted: Color32,
         panel: Color32,
@@ -3425,15 +3576,59 @@ impl App {
         if self.mode != Mode::Manual || self.help {
             return;
         }
-        let Some(part) = self.draft.selected_part() else { return };
-        let choices = manual::variants_for(self.draft.circuit.parts[part].kind);
-        if choices.is_empty() {
+        let part = self.draft.selected_part().filter(|&i| {
+            self.draft.circuit.parts.get(i).is_some_and(|p| p.active)
+        });
+        let wire = self.active_wire.filter(|&i| {
+            self.draft.circuit.wires.get(i).is_some_and(|w| w.active)
+        });
+        if part.is_none() && wire.is_none() {
             return;
         }
-        let current = self.draft.circuit.parts[part].value.clone();
-        let label = self.draft.circuit.parts[part].label.clone();
-        let title = self.t("variant.title");
-        let mut pick: Option<(usize, &'static str, crate::model::Kind)> = None;
+        let key = format!("{part:?}/{wire:?}");
+        if self.inspect_for != key {
+            self.inspect_for = key.clone();
+            self.inspect_label = part
+                .map(|i| self.draft.circuit.parts[i].label.clone())
+                .unwrap_or_default();
+            self.inspect_value = part
+                .map(|i| self.draft.circuit.parts[i].value.clone())
+                .unwrap_or_default();
+        }
+        if let Some(w) = wire {
+            let nets = self.draft.circuit.nets();
+            let pin = [self.draft.circuit.wires[w].a, self.draft.circuit.wires[w].b]
+                .into_iter()
+                .find_map(|e| match e {
+                    crate::model::End::Pin(p) => Some(p),
+                    _ => None,
+                });
+            self.inspect_net = pin
+                .map(|p| self.draft.circuit.net_name(&nets, nets.root(p)))
+                .unwrap_or_default();
+        }
+        let current = part
+            .map(|i| self.draft.circuit.parts[i].value.clone())
+            .unwrap_or_default();
+        let choices: &[manual::Variant] = part
+            .map(|i| manual::variants_for(self.draft.circuit.parts[i].kind))
+            .unwrap_or(&[]);
+        let via_count = wire
+            .map(|i| self.draft.circuit.wires[i].via.len())
+            .unwrap_or(0);
+        let wire_class = wire.map(|i| self.draft.circuit.wires[i].class);
+        let title = if part.is_some() {
+            self.t("inspect.title")
+        } else {
+            self.t("inspect.wire")
+        };
+        let class_key = |c: NetClass| match c {
+            NetClass::Vcc => "class.vcc",
+            NetClass::Gnd => "class.gnd",
+            NetClass::Signal => "class.signal",
+            NetClass::Analog => "class.analog",
+        };
+        let mut action: Option<InspectAction> = None;
         egui::Window::new(title)
             .id(egui::Id::unique("value-window"))
             .anchor(Align2::LEFT_BOTTOM, [520.0, -64.0])
@@ -3448,28 +3643,113 @@ impl App {
                     .inner_margin(Margin::same(10)),
             )
             .show(ctx, |ui| {
-                ui.set_width(196.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).size(12.0).strong().color(accent));
-                    ui.label(RichText::new(self.t("variant.hint")).size(10.5).color(muted));
-                });
-                ui.add_space(4.0);
-                egui::ComboBox::from_id_salt("variant-pick")
-                    .selected_text(RichText::new(current.clone()).size(12.0).color(fg))
-                    .width(176.0)
-                    .show_ui(ui, |ui| {
-                        for v in choices {
-                            let on = v.value == current;
-                            if ui.selectable_label(on, v.value).clicked() && !on {
-                                pick = Some((part, v.value, v.kind));
-                            }
+                ui.set_width(228.0);
+                if let Some(i) = part {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{i}")).size(10.5).color(muted));
+                        ui.label(RichText::new(self.t("variant.hint")).size(10.5).color(muted));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(self.t("inspect.label")).size(11.0).color(muted));
+                        let r = ui.add(
+                            TextEdit::singleline(&mut self.inspect_label).desired_width(140.0),
+                        );
+                        if r.lost_focus() {
+                            action = Some(InspectAction::Label(self.inspect_label.clone()));
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(self.t("inspect.value")).size(11.0).color(muted));
+                        let r = ui.add(
+                            TextEdit::singleline(&mut self.inspect_value).desired_width(140.0),
+                        );
+                        if r.lost_focus() {
+                            action = Some(InspectAction::Value(self.inspect_value.clone()));
+                        }
+                    });
+                    ui.add_space(3.0);
+                    if ui.button(RichText::new(self.t("inspect.rotate")).size(11.0)).clicked() {
+                        action = Some(InspectAction::Rotate);
+                    }
+                    if !choices.is_empty() {
+                        egui::ComboBox::from_id_salt("variant-pick")
+                            .selected_text(RichText::new(current.clone()).size(12.0).color(fg))
+                            .width(208.0)
+                            .show_ui(ui, |ui| {
+                                for v in choices {
+                                    let on = v.value == current;
+                                    if ui.selectable_label(on, v.value).clicked() && !on {
+                                        action = Some(InspectAction::Variant(
+                                            v.value.to_string(),
+                                            v.kind,
+                                        ));
+                                    }
+                                }
+                            });
+                    }
+                } else if let Some(w) = wire {
+                    ui.label(RichText::new(format!("{w}")).size(10.5).color(muted));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(self.t("inspect.class")).size(11.0).color(muted));
+                        egui::ComboBox::from_id_salt("wire-class-pick")
+                            .selected_text(RichText::new(self.t(class_key(wire_class.unwrap()))).size(12.0).color(fg))
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
+                                for class in [
+                                    NetClass::Gnd,
+                                    NetClass::Vcc,
+                                    NetClass::Signal,
+                                    NetClass::Analog,
+                                ] {
+                                    let label = self.t(class_key(class));
+                                    if ui.selectable_label(wire_class == Some(class), label).clicked()
+                                        && wire_class != Some(class)
+                                    {
+                                        action = Some(InspectAction::WireClass(class));
+                                    }
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(self.t("inspect.net")).size(11.0).color(muted));
+                        let r = ui.add(
+                            TextEdit::singleline(&mut self.inspect_net).desired_width(140.0),
+                        );
+                        if r.lost_focus() {
+                            action = Some(InspectAction::NetName(self.inspect_net.clone()));
+                        }
+                    });
+                    ui.label(
+                        RichText::new(format!("{}: {}", self.t("inspect.vias"), via_count))
+                            .size(11.0)
+                            .color(muted),
+                    );
+                    if via_count > 0
+                        && ui.button(RichText::new(self.t("inspect.clear_vias")).size(11.0)).clicked()
+                    {
+                        action = Some(InspectAction::ClearVias);
+                    }
+                }
             });
-        if let Some((part, value, kind)) = pick {
-            if self.draft.set_variant(part, value, kind) {
-                self.refresh_manual();
+        let done = match action {
+            Some(InspectAction::Label(text)) => part.is_some_and(|i| self.draft.set_label(i, &text)),
+            Some(InspectAction::Value(text)) => part.is_some_and(|i| self.draft.set_value(i, &text)),
+            Some(InspectAction::Variant(value, kind)) => {
+                part.is_some_and(|i| self.draft.set_variant(i, &value, kind))
             }
+            Some(InspectAction::Rotate) => self.draft.rotate_selected(1),
+            Some(InspectAction::WireClass(class)) => {
+                wire.is_some_and(|i| self.draft.set_wire_class(i, class))
+            }
+            Some(InspectAction::NetName(name)) => {
+                wire.is_some_and(|i| self.draft.set_net_name(i, &name))
+            }
+            Some(InspectAction::ClearVias) => wire.is_some_and(|i| self.draft.clear_vias(i)),
+            None => false,
+        };
+        if done {
+            self.inspect_for.clear();
+            self.refresh_manual();
         }
     }
 
@@ -3634,12 +3914,17 @@ impl App {
             let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("help-dim"));
             ctx.layer_painter(layer)
                 .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(DIM_ALPHA));
-            let keys: [(&str, &str); 13] = [
+            let keys: [(&str, &str); 18] = [
                 ("Ctrl+Enter", "help.plan"),
                 ("Ctrl+S", "export.title"),
                 ("Ctrl+E", "help.export"),
                 ("Ctrl+Z", "manual.undo"),
                 ("Ctrl+Shift+Z", "manual.redo"),
+                ("Ctrl+A", "help.select_all"),
+                ("Ctrl+C/V/X", "help.clipboard"),
+                ("Ctrl+D", "help.duplicate"),
+                ("Shift+click", "help.multi"),
+                ("← ↑ → ↓", "help.nudge"),
                 ("R", "manual.rotate_part"),
                 ("Shift+R", "manual.rotate_board"),
                 ("Delete", "manual.delete_hint"),
@@ -4026,7 +4311,7 @@ fn part_why(kind: crate::model::Kind, lang: Lang) -> &'static str {
 /// The smallest part whose footprint is under the pointer.
 fn part_under(c: &Circuit, at: Pt) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
-    for (i, p) in c.parts.iter().enumerate() {
+    for (i, p) in c.parts_id() {
         let r = c.part_rect(p);
         if r.inflate(0.8).contains(at) {
             let area = r.w * r.h;
@@ -4169,7 +4454,7 @@ mod tests {
         let mut circuit = Circuit::new();
         circuit.add_arduino(uno_spot());
         let scene = draw(&circuit, &Theme::default(), &scene::Opts::default());
-        for (i, pin) in circuit.pins.iter().enumerate() {
+        for (i, pin) in circuit.pins_id() {
             for (origin, scale) in [
                 (Pos2::new(0.0, 0.0), 2.0),
                 (Pos2::new(120.0, 300.0), 0.7),

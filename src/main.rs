@@ -12,6 +12,7 @@ mod config;
 mod icons;
 mod lessons;
 mod manual;
+mod netlist;
 mod model;
 mod modules;
 mod parse;

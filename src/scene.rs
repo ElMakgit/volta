@@ -285,6 +285,8 @@ pub struct Opts {
     pub style: WireStyle,
     /// The part the user is working with; drawn with a visible frame.
     pub selected: Option<usize>,
+    /// Every part in a marquee selection gets the same frame.
+    pub selected_many: Vec<usize>,
     /// Freeze the frame while a part is being dragged, so the drawing does not
     /// re-centre under the pointer on every mouse move.
     pub frame: Option<Rect>,
@@ -302,6 +304,7 @@ impl Default for Opts {
             hover: None,
             style: WireStyle::default(),
             selected: None,
+            selected_many: Vec::new(),
             frame: None,
             active_wire: None,
             handles: Vec::new(),
@@ -1588,7 +1591,7 @@ impl D {
 
     fn wires(&mut self, c: &Circuit) {
         let straight = self.opt.style == WireStyle::Straight;
-        for (i, w) in c.wires.iter().enumerate() {
+        for (i, w) in c.wires_id() {
             let a = c.end_pos(w.a);
             let b = c.end_pos(w.b);
             let pts = c.wire_points(w, self.opt.style);
@@ -1767,6 +1770,7 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
             bench: opt.bench,
             style: opt.style,
             selected: opt.selected,
+            selected_many: opt.selected_many.clone(),
             frame: opt.frame,
             active_wire: opt.active_wire,
             handles: opt.handles.clone(),
@@ -1789,14 +1793,14 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
         d.board(&flat);
         d.s.rotate_prims(mark, c.board.center(), c.board.rot as i32);
     }
-    for part in c.parts.iter().filter(|p| p.kind == Kind::Arduino) {
+    for part in c.parts().filter(|p| p.kind == Kind::Arduino) {
         let x = c.part_xform(part);
         let mark = d.s.prims.len();
         d.arduino(part);
         d.s.rotate_prims(mark, x.pivot, x.quarter);
     }
     let nets = c.nets();
-    for part in &c.parts {
+    for part in c.parts() {
         let x = c.part_xform(part);
         let mark = d.s.prims.len();
         match part.kind {
@@ -1824,12 +1828,18 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
         d.s.rotate_prims(mark, x.pivot, x.quarter);
     }
     d.wires(c);
-    for part in &c.parts {
+    for part in c.parts() {
         let at = c.part_xform(part).apply(part.at);
         d.label(part, at);
     }
+    let mut marked: Vec<usize> = opt.selected_many.clone();
     if let Some(i) = opt.selected {
-        if let Some(part) = c.parts.get(i) {
+        if !marked.contains(&i) {
+            marked.push(i);
+        }
+    }
+    for i in marked {
+        if let Some(part) = c.parts.get(i).filter(|p| p.active) {
             d.selection_frame(&c.part_rect(part).inflate(1.4));
         }
     }
@@ -1859,6 +1869,7 @@ mod tests {
             class,
             lift: 0.0,
             via: vec![],
+            active: true,
         };
         let mut colours = std::collections::BTreeSet::new();
         for pin in 1..20 {
@@ -2173,7 +2184,7 @@ mod tests {
         let sc = draw(&c, &Theme::default(), &Opts::default());
         assert!(sc.prims.len() > 20, "the capacitors painted nothing");
         fits_frame("capacitors", &c, true);
-        for part in c.parts.iter().filter(|p| p.kind != Kind::Arduino) {
+        for part in c.parts().filter(|p| p.kind != Kind::Arduino) {
             let r = c.part_rect(part);
             assert!(r.h > 4.5, "{:?} has no body above the board", part.kind);
         }

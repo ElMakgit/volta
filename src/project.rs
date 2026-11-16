@@ -212,6 +212,7 @@ fn circuit_json(c: &Circuit) -> Value {
                 "rot": p.rot,
                 "pins": p.pins,
                 "internal": internal,
+                "active": p.active,
             })
         })
         .collect();
@@ -225,6 +226,7 @@ fn circuit_json(c: &Circuit) -> Value {
                 "pos": [p.pos.x, p.pos.y],
                 "kind": pin_kind_name(p.kind),
                 "hole": hole_json(p.hole),
+                "active": p.active,
             })
         })
         .collect();
@@ -239,6 +241,7 @@ fn circuit_json(c: &Circuit) -> Value {
                 "class": net_class_name(w.class),
                 "lift": w.lift,
                 "via": via,
+                "active": w.active,
             })
         })
         .collect();
@@ -253,6 +256,11 @@ fn circuit_json(c: &Circuit) -> Value {
         "parts": parts,
         "pins": pins,
         "wires": wires,
+        "net_names": c
+            .net_names
+            .iter()
+            .map(|(k, v)| json!([k, v]))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -472,8 +480,21 @@ fn circuit_from(v: &Value) -> Result<Circuit, String> {
         }
     };
     let bare = obj.get("bare").and_then(|b| b.as_bool()).unwrap_or(false);
+    let mut net_names = std::collections::BTreeMap::new();
+    if let Some(list) = obj.get("net_names").and_then(|n| n.as_array()) {
+        for pair in list.iter().take(2000) {
+            let Some(pair) = pair.as_array() else { continue };
+            if pair.len() != 2 {
+                continue;
+            }
+            let (Some(key), Some(name)) = (pair[0].as_str(), pair[1].as_str()) else { continue };
+            if key.len() <= 256 && name.chars().count() <= 32 {
+                net_names.insert(key.to_string(), name.to_string());
+            }
+        }
+    }
 
-    Ok(Circuit { board, parts, pins, wires, arduino, notes: Vec::new(), bare })
+    Ok(Circuit { board, parts, pins, wires, arduino, notes: Vec::new(), bare, net_names })
 }
 
 fn part_from(v: &Value) -> Result<Part, String> {
@@ -516,6 +537,7 @@ fn part_from(v: &Value) -> Result<Part, String> {
         pins,
         internal,
         rot: rot.rem_euclid(4) as u8,
+        active: obj.get("active").and_then(|a| a.as_bool()).unwrap_or(true),
     })
 }
 
@@ -542,7 +564,14 @@ fn pin_from(v: &Value, parts: &[Part]) -> Result<Pin, String> {
         .get("hole")
         .and_then(hole_from)
         .ok_or("bad pin hole")?;
-    Ok(Pin { part, name: intern(&name), pos, hole, kind })
+    Ok(Pin {
+        part,
+        name: intern(&name),
+        pos,
+        hole,
+        kind,
+        active: obj.get("active").and_then(|a| a.as_bool()).unwrap_or(true),
+    })
 }
 
 fn wire_from(v: &Value, pins: usize, cols: u8) -> Result<Wire, String> {
@@ -561,7 +590,14 @@ fn wire_from(v: &Value, pins: usize, cols: u8) -> Result<Wire, String> {
             via.push(point(Some(p)).ok_or("bad wire bend")?);
         }
     }
-    Ok(Wire { a, b, class, lift, via })
+    Ok(Wire {
+        a,
+        b,
+        class,
+        lift,
+        via,
+        active: obj.get("active").and_then(|a| a.as_bool()).unwrap_or(true),
+    })
 }
 
 fn end_from(v: Option<&Value>, pins: usize, cols: u8) -> Option<End> {
