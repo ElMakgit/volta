@@ -1,92 +1,271 @@
 //! PNG export.
 //!
-//! The SVG is rasterised by `rsvg-convert` instead of a hand-written rasteriser:
-//! text shaping and anti-aliasing come out right, and the tool is part of the
-//! same librsvg package Omarchy already ships.
+//! The scene is a flat list of primitives drawn for both the screen and the
+//! SVG writer, so the PNG is rasterised from the same list. No external
+//! `rsvg-convert` is needed: an export works on a clean machine with just the
+//! binary, including Windows.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-pub fn have_tool() -> bool {
-    Command::new("rsvg-convert")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use image::{Rgba, RgbaImage};
+
+use crate::scene::{Anchor, Prim, Rgba as SRgba, Scene};
+
+const FONT: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
+
+/// Where the export dialog starts when no folder was chosen yet.
+pub fn default_dir() -> PathBuf {
+    crate::paths::home().join("Pictures").join("volta")
 }
 
-/// Rasterise the SVG next to the target, then remove the temporary file.
-pub fn png_from_svg(svg: &str, out: &Path, width_px: u32) -> Result<(), String> {
-    let tmp = out.with_extension("tmp.svg");
-    std::fs::write(&tmp, svg).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    let result = Command::new("rsvg-convert")
-        .arg("-w")
-        .arg(width_px.to_string())
-        .arg("-o")
-        .arg(out)
-        .arg(&tmp)
-        .output();
-    let _ = std::fs::remove_file(&tmp);
-    match result {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!(
-            "rsvg-convert: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) => Err(format!(
-            "rsvg-convert not available: {e}. Install librsvg and try again."
-        )),
+fn px(colour: SRgba) -> Rgba<u8> {
+    Rgba([colour.0, colour.1, colour.2, colour.3])
+}
+
+fn blend(img: &mut RgbaImage, x: i32, y: i32, colour: Rgba<u8>) {
+    if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
+        return;
+    }
+    let a = colour[3] as f32 / 255.0;
+    if a <= 0.0 {
+        return;
+    }
+    let old = *img.get_pixel(x as u32, y as u32);
+    let f = |c: u8, b: u8| (c as f32 * a + b as f32 * (1.0 - a)).round() as u8;
+    let mixed = Rgba([
+        f(colour[0], old[0]),
+        f(colour[1], old[1]),
+        f(colour[2], old[2]),
+        255,
+    ]);
+    img.put_pixel(x as u32, y as u32, mixed);
+}
+
+fn disc(img: &mut RgbaImage, cx: f32, cy: f32, radius: f32, colour: Rgba<u8>) {
+    let r = radius.max(0.5);
+    let x0 = (cx - r).floor() as i32;
+    let x1 = (cx + r).ceil() as i32;
+    let y0 = (cy - r).floor() as i32;
+    let y1 = (cy + r).ceil() as i32;
+    let r2 = r * r;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= r2 {
+                blend(img, x, y, colour);
+            }
+        }
     }
 }
 
-pub fn default_dir() -> PathBuf {
-    crate::paths::home().join("Pictures").join("volta")
+fn segment(img: &mut RgbaImage, ax: f32, ay: f32, bx: f32, by: f32, w: f32, colour: Rgba<u8>) {
+    let len = ((bx - ax) * (bx - ax) + (by - ay) * (by - ay)).sqrt();
+    let steps = (len / 0.7).ceil().max(1.0) as usize;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        disc(
+            img,
+            ax + (bx - ax) * t,
+            ay + (by - ay) * t,
+            w / 2.0,
+            colour,
+        );
+    }
+}
+
+fn rect(img: &mut RgbaImage, x: f32, y: f32, w: f32, h: f32, colour: Rgba<u8>) {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = (x + w).ceil() as i32;
+    let y1 = (y + h).ceil() as i32;
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            blend(img, xx, yy, colour);
+        }
+    }
+}
+
+fn draw_text(
+    img: &mut RgbaImage,
+    string: &str,
+    x: f32,
+    y: f32,
+    size_px: f32,
+    bold: bool,
+    anchor: Anchor,
+    colour: Rgba<u8>,
+) {
+    let _ = bold;
+    let Ok(font) = FontRef::try_from_slice(FONT) else { return };
+    let scale = PxScale::from(size_px);
+    let scaled = font.as_scaled(scale);
+    let mut caret = 0.0;
+    let advance: f32 = string.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum();
+    let start = match anchor {
+        Anchor::Start => x,
+        Anchor::Center => x - advance / 2.0,
+        Anchor::End => x - advance,
+    };
+    let baseline = y + size_px * 0.36;
+    for ch in string.chars() {
+        let id = font.glyph_id(ch);
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(start + caret, baseline));
+        if let Some(outline) = font.outline_glyph(glyph) {
+            let bounds = outline.px_bounds();
+            let ox = bounds.min.x as i32;
+            let oy = bounds.min.y as i32;
+            outline.draw(|gx, gy, coverage| {
+                let mut c = colour;
+                c.0[3] = (c.0[3] as f32 * coverage).round() as u8;
+                blend(img, ox + gx as i32, oy + gy as i32, c);
+            });
+        }
+        caret += scaled.h_advance(id);
+    }
+}
+
+/// Rasterise a scene into a PNG. `width_px` fixes the horizontal resolution;
+/// the height follows the scene aspect so nothing is stretched.
+pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
+    let scale = width_px as f32 / scene.w.max(1e-3);
+    let height = (scene.h * scale).round().max(1.0) as u32;
+    let mut img = RgbaImage::from_pixel(width_px, height, px(scene.bg));
+
+    for prim in &scene.prims {
+        match prim {
+            Prim::Rect { r, fill, stroke, .. } => {
+                rect(
+                    &mut img,
+                    (r.x - scene.origin.x) * scale,
+                    (r.y - scene.origin.y) * scale,
+                    r.w * scale,
+                    r.h * scale,
+                    px(*fill),
+                );
+                if let Some((colour, w)) = stroke {
+                    let (x, y) = ((r.x - scene.origin.x) * scale, (r.y - scene.origin.y) * scale);
+                    let (wpx, hpx) = (r.w * scale, r.h * scale);
+                    let s = px(*colour);
+                    segment(&mut img, x, y, x + wpx, y, *w * scale, s);
+                    segment(&mut img, x + wpx, y, x + wpx, y + hpx, *w * scale, s);
+                    segment(&mut img, x + wpx, y + hpx, x, y + hpx, *w * scale, s);
+                    segment(&mut img, x, y + hpx, x, y, *w * scale, s);
+                }
+            }
+            Prim::Circle { c, r, fill, stroke } => {
+                let (cx, cy) = ((c.x - scene.origin.x) * scale, (c.y - scene.origin.y) * scale);
+                disc(&mut img, cx, cy, *r * scale, px(*fill));
+                if let Some((colour, w)) = stroke {
+                    let steps = (2.0 * std::f32::consts::PI * *r * scale / 1.0).ceil().max(8.0) as usize;
+                    for i in 0..steps {
+                        let a = i as f32 * std::f32::consts::TAU / steps as f32;
+                        let b = (i + 1) as f32 * std::f32::consts::TAU / steps as f32;
+                        segment(
+                            &mut img,
+                            cx + a.cos() * *r * scale,
+                            cy + a.sin() * *r * scale,
+                            cx + b.cos() * *r * scale,
+                            cy + b.sin() * *r * scale,
+                            *w * scale,
+                            px(*colour),
+                        );
+                    }
+                }
+            }
+            Prim::Poly { pts, w, color, closed } => {
+                let mut it = pts.iter().peekable();
+                while let Some(p) = it.next() {
+                    let Some(q) = it.peek() else { break };
+                    segment(
+                        &mut img,
+                        (p.x - scene.origin.x) * scale,
+                        (p.y - scene.origin.y) * scale,
+                        (q.x - scene.origin.x) * scale,
+                        (q.y - scene.origin.y) * scale,
+                        *w * scale,
+                        px(*color),
+                    );
+                }
+                if *closed && pts.len() > 2 {
+                    let (a, b) = (pts.first().unwrap(), pts.last().unwrap());
+                    segment(
+                        &mut img,
+                        (a.x - scene.origin.x) * scale,
+                        (a.y - scene.origin.y) * scale,
+                        (b.x - scene.origin.x) * scale,
+                        (b.y - scene.origin.y) * scale,
+                        *w * scale,
+                        px(*color),
+                    );
+                }
+            }
+            Prim::Text { p, size, text, color, anchor, bold, angle } => {
+                if angle.abs() > 1.0 {
+                    continue;
+                }
+                draw_text(
+                    &mut img,
+                    text,
+                    (p.x - scene.origin.x) * scale,
+                    (p.y - scene.origin.y) * scale,
+                    *size * scale,
+                    *bold,
+                    *anchor,
+                    px(*color),
+                );
+            }
+        }
+    }
+    img
+}
+
+pub fn png_from_scene(scene: &Scene, out: &Path, width_px: u32) -> Result<(), String> {
+    image_from_scene(scene, width_px)
+        .save(out)
+        .map_err(|e| format!("{}: {e}", out.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{Anchor, Prim, Rgba, Scene};
     use crate::model::{Pt, Rect};
+    use crate::scene::Rgba;
 
     #[test]
-    fn the_screenshot_round_trips_through_librsvg() {
-        if !have_tool() {
-            eprintln!("rsvg-convert is missing, skipping");
-            return;
-        }
+    fn a_scene_becomes_a_png() {
+        let dir = std::env::temp_dir().join(format!("volta-png-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("test.png");
         let scene = Scene {
             prims: vec![
                 Prim::Rect {
-                    r: Rect::new(1.0, 1.0, 8.0, 6.0),
-                    radius: 0.4,
-                    fill: Rgba::rgb(0x2A, 0x75, 0xB8),
-                    stroke: Some((Rgba::rgb(0, 0, 0), 0.2)),
+                    r: Rect::new(0.0, 0.0, 10.0, 8.0),
+                    radius: 0.0,
+                    fill: Rgba::rgb(10, 20, 30),
+                    stroke: None,
                 },
                 Prim::Text {
-                    p: Pt::new(5.0, 4.0),
-                    size: 1.4,
+                    p: Pt::new(5.0, 5.0),
+                    size: 1.5,
                     text: "volta".into(),
-                    color: Rgba::rgb(0xFF, 0xFF, 0xFF),
+                    color: Rgba::rgb(255, 255, 255),
                     anchor: Anchor::Center,
-                    bold: true,
+                    bold: false,
                     angle: 0.0,
                 },
             ],
-            bg: Rgba::rgb(0xEF, 0xEE, 0xEB),
+            owners: vec![],
+            bg: Rgba::rgb(240, 240, 240),
             w: 10.0,
             h: 8.0,
-            origin: Pt::default(),
+            origin: Pt::new(0.0, 0.0),
         };
-        let dir = std::env::temp_dir().join("volta-png-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let out = dir.join("shot.png");
-        let _ = std::fs::remove_file(&out);
-        let svg = crate::svg::render(&scene, 1.0);
-        png_from_svg(&svg, &out, 600).expect("rasterising failed");
-        let bytes = std::fs::read(&out).expect("no PNG written");
-        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
-        assert!(bytes.len() > 2000, "the PNG is suspiciously small: {}", bytes.len());
-        let _ = std::fs::remove_dir_all(&dir);
+        png_from_scene(&scene, &out, 400).expect("writes a png");
+        let data = std::fs::read(&out).expect("png exists");
+        assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert!(data.len() > 100);
+        let _ = std::fs::remove_file(out);
     }
 }

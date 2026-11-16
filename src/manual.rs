@@ -254,6 +254,9 @@ pub struct Draft {
     pub circuit: Circuit,
     /// Which ready-made board a `Place::Module` click drops on the bench.
     pub module: &'static str,
+    /// The sketch that came with a generated circuit, kept when the user
+    /// switches to the hand editor so the code-side checks still run.
+    pub code: Option<String>,
     /// The first end of a wire that is being pulled.
     pub pending: Option<End>,
     pub selected: Option<PartId>,
@@ -279,6 +282,7 @@ impl Draft {
         Self {
             circuit,
             module: crate::modules::DEFAULT,
+            code: None,
             pending: None,
             selected: None,
             selected_parts: BTreeSet::new(),
@@ -392,13 +396,28 @@ impl Draft {
         }
     }
 
+    fn snapshot_vias(&self) -> Vec<(WireId, Vec<Pt>)> {
+        self.circuit.wires_id().map(|(i, w)| (i, w.via.clone())).collect()
+    }
+
+    fn record_via_deltas(&mut self, before: &[(WireId, Vec<Pt>)]) {
+        for (id, old) in before {
+            let new = self.circuit.wires.get(*id).map(|w| w.via.clone()).unwrap_or_default();
+            if *old != new {
+                self.record(Command::Via(*id, old.clone(), new));
+            }
+        }
+    }
+
     pub fn move_part_recorded(&mut self, id: PartId, to: Pt) -> bool {
         let Some(part) = self.circuit.parts.get(id).filter(|p| p.active) else {
             return false;
         };
         let from = part.at;
+        let vias = self.snapshot_vias();
         if self.circuit.move_part(id, to) {
             self.record(Command::MovePart(id, from, to));
+            self.record_via_deltas(&vias);
             true
         } else {
             false
@@ -412,6 +431,7 @@ impl Draft {
         let old: Vec<Pin> = self.circuit.parts.get(id).map(|p| {
             p.pins.iter().filter_map(|&q| self.circuit.pins.get(q).cloned()).collect()
         }).unwrap_or_default();
+        let vias = self.snapshot_vias();
         self.snapshot();
         if !self.circuit.reseat_part(id, dcol, drow) {
             self.cancel_snapshot();
@@ -429,6 +449,7 @@ impl Draft {
             .filter_map(|&q| self.circuit.pins.get(q).cloned())
             .collect();
         self.record(Command::Seat(id, old, new));
+        self.record_via_deltas(&vias);
         true
     }
 
@@ -439,6 +460,7 @@ impl Draft {
                 return;
             }
             w.via = via.clone();
+            self.circuit.touch();
             self.record(Command::Via(id, old, via));
         }
     }
@@ -476,6 +498,7 @@ impl Draft {
             Command::Via(id, _, new) => {
                 if let Some(w) = self.circuit.wires.get_mut(*id) {
                     w.via = new.clone();
+                    self.circuit.touch();
                 }
             }
             Command::Label(id, _, new) => {
@@ -521,7 +544,7 @@ impl Draft {
             Command::WireAdded(id, _) => self.circuit.remove_wire(*id),
             Command::WireRemoved(id, w) => self.circuit.restore_wire(*id, w.clone()),
             Command::MovePart(id, from, _) => {
-                self.circuit.move_part(*id, *from);
+                self.circuit.move_part_silent(*id, *from);
             }
             Command::Rot(id, old, _) => {
                 if let Some(p) = self.circuit.parts.get_mut(*id) {
@@ -538,6 +561,7 @@ impl Draft {
             Command::Via(id, old, _) => {
                 if let Some(w) = self.circuit.wires.get_mut(*id) {
                     w.via = old.clone();
+                    self.circuit.touch();
                 }
             }
             Command::Label(id, old, _) => {
@@ -603,9 +627,10 @@ impl Draft {
 
     /// Take over a generated circuit. The switch itself is an edit, so the
     /// bench the user came from can still be reached with Ctrl+Z.
-    pub fn adopt(&mut self, circuit: Circuit) {
+    pub fn adopt(&mut self, circuit: Circuit, code: Option<String>) {
         self.snapshot_full();
         self.circuit = circuit;
+        self.code = code;
         self.redo.clear();
         self.pending = None;
         self.clear_selection();
@@ -616,6 +641,7 @@ impl Draft {
         let mut fresh = Circuit::new();
         fresh.add_arduino(uno_spot());
         self.circuit = fresh;
+        self.code = None;
         self.pending = None;
         self.clear_selection();
     }
@@ -1684,6 +1710,26 @@ mod tests {
     /// A half-finished cable must never end in the corner of the sheet: the
     /// old code turned `OffBoard` into point (0, 0).
     #[test]
+    fn a_bend_travels_with_the_part_it_hangs_from() {
+        let mut d = Draft::new();
+        d.place(Place::Motor, Pt::new(20.0, 80.0));
+        let pin = d.circuit.parts[1].pins[0];
+        let d9 = d.circuit.pin(0, "D9");
+        assert!(d.connect(End::Pin(pin), End::Pin(d9)));
+        let near = d.circuit.pins[pin].pos.off(0.0, -1.27);
+        d.circuit.wires[0].via.push(near);
+        let at = d.circuit.parts[1].at;
+        let to = Pt::new(at.x + 5.0, at.y + 5.0);
+        d.snapshot();
+        assert!(d.move_part_recorded(1, to));
+        let moved = d.circuit.wires[0].via[0].off(-near.x, -near.y);
+        assert!(moved.dist(Pt::new(5.0, 5.0)) < 1e-3);
+        assert!(d.undo());
+        let back = d.circuit.wires[0].via[0].off(-near.x, -near.y);
+        assert!(back.dist(Pt::new(0.0, 0.0)) < 1e-3);
+    }
+
+    #[test]
     fn undo_keeps_the_selection_context() {
         let mut d = Draft::new();
         d.place(Place::Resistor, at(&d, 5, Row::A));
@@ -1921,7 +1967,7 @@ mod tests {
         };
         let built = crate::templates::build(&intent, 0, crate::text::Lang::Ru).unwrap();
         let mut d = Draft::new();
-        d.adopt(built.circuit.clone());
+        d.adopt(built.circuit.clone(), None);
         assert!(consistent(&d.circuit));
         assert_eq!(d.circuit.wires().count(), built.circuit.wires().count());
         assert!(d.can_undo(), "the handover itself can be undone");

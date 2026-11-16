@@ -494,7 +494,17 @@ fn circuit_from(v: &Value) -> Result<Circuit, String> {
         }
     }
 
-    Ok(Circuit { board, parts, pins, wires, arduino, notes: Vec::new(), bare, net_names })
+    Ok(Circuit {
+        board,
+        parts,
+        pins,
+        wires,
+        arduino,
+        notes: Vec::new(),
+        bare,
+        net_names,
+        ..Default::default()
+    })
 }
 
 fn part_from(v: &Value) -> Result<Part, String> {

@@ -223,6 +223,128 @@ pub fn run(built: &Built, lang: Lang) -> Report {
     Report { sim: simulate(built), ..run_circuit(&built.circuit, lang, Some(&built.code)) }
 }
 
+/// Checks that need no Arduino at all: a hand-drawn signal chain is still a
+/// circuit and deserves to be checked.
+fn run_bare(c: &Circuit, lang: Lang) -> Report {
+    let nets = c.nets();
+    let mut checks = Vec::new();
+    let parts: Vec<(usize, &Part)> = c.parts_id().collect();
+
+    if parts.is_empty() {
+        checks.push(Check::warn(
+            L::new("Монтаж", "Assembly"),
+            tr(lang, "На макетке пока нет деталей.", "There are no parts on the bench yet.").to_string(),
+        ));
+        return Report { checks, sim: None };
+    }
+
+    // Duplicate reference designators make a bill of materials ambiguous.
+    let mut seen: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for (id, part) in &parts {
+        seen.entry(part.label.as_str()).or_default().push(*id);
+    }
+    let repeated: Vec<usize> = seen.values().filter(|v| v.len() > 1).flatten().copied().collect();
+    checks.push(if repeated.is_empty() {
+        Check::pass(
+            L::new("Обозначения", "Designators"),
+            tr(lang, "Каждая деталь имеет своё обозначение.", "Every part has its own designator.").to_string(),
+        )
+    } else {
+        Check::fail_at(
+            L::new("Обозначения", "Designators"),
+            tr(lang, "одинаковые обозначения", "duplicate designators").to_string(),
+            focus_on_parts(&repeated),
+        )
+    });
+
+    // A pin on its own is a loose end; signal pins need a partner.
+    let loose: Vec<usize> = c
+        .pins_id()
+        .filter(|(_, p)| p.active && p.kind != PinKind::Power && p.kind != PinKind::Ground)
+        .filter(|(i, _)| nets.pins_in(nets.root(*i)).len() < 2)
+        .map(|(i, _)| i)
+        .collect();
+    checks.push(if loose.is_empty() {
+        Check::pass(
+            L::new("Связи", "Connections"),
+            tr(lang, "Все сигнальные выводы подключены.", "Every signal pin is connected.").to_string(),
+        )
+    } else {
+        Check::warn_at(
+            L::new("Связи", "Connections"),
+            format!("{}: {}", tr(lang, "свободные выводы", "unused pins"), loose.len()),
+            focus_on_pins(c, &loose),
+        )
+    });
+
+    // Power and ground on one net is a short, whether or not an Uno is there.
+    let mut shorted: Vec<usize> = Vec::new();
+    for root in nets.roots_sorted() {
+        let pins = nets.pins_in(root);
+        let has_power = pins.iter().any(|&i| c.pins[i].kind == PinKind::Power);
+        let has_gnd = pins.iter().any(|&i| c.pins[i].kind == PinKind::Ground);
+        if has_power && has_gnd {
+            shorted.extend(pins.iter().copied());
+        }
+    }
+    checks.push(if shorted.is_empty() {
+        Check::pass(
+            L::new("Короткое", "Short circuit"),
+            tr(lang, "Питание и земля разведены.", "Power and ground are separate.").to_string(),
+        )
+    } else {
+        Check::fail_at(
+            L::new("Короткое", "Short circuit"),
+            tr(lang, "питание замкнуто на землю", "power shorted to ground").to_string(),
+            focus_on_pins(c, &shorted),
+        )
+    });
+
+    // 3.3 V logic must not be tied straight to the 5 V rail.
+    let mixed = nets.roots_sorted().into_iter().find(|root| {
+        let pins = nets.pins_in(*root);
+        pins.iter().any(|&i| c.pins[i].name == "3V3") && pins.iter().any(|&i| c.pins[i].name == "5V")
+    });
+    checks.push(match mixed {
+        None => Check::pass(
+            L::new("Напряжение", "Voltage"),
+            tr(lang, "Уровни 3.3 В и 5 В не смешаны.", "3.3 V and 5 V are not mixed.").to_string(),
+        ),
+        Some(root) => Check::fail_at(
+            L::new("Напряжение", "Voltage"),
+            tr(lang, "3.3 В замкнут на 5 В", "3.3 V tied to 5 V").to_string(),
+            focus_on_pins(c, nets.pins_in(root)),
+        ),
+    });
+
+    // Cases drawn on top of each other are a geometry error, not a netlist.
+    let mut overlapping: Vec<usize> = Vec::new();
+    for (i, (ia, a)) in parts.iter().enumerate() {
+        for (ib, b) in parts.iter().skip(i + 1) {
+            if c.part_rect(a).intersects(c.part_rect(b)) {
+                overlapping.push(*ia);
+                overlapping.push(*ib);
+            }
+        }
+    }
+    overlapping.sort_unstable();
+    overlapping.dedup();
+    checks.push(if overlapping.is_empty() {
+        Check::pass(
+            L::new("Корпуса", "Cases"),
+            tr(lang, "Корпуса деталей не перекрываются.", "No two cases overlap.").to_string(),
+        )
+    } else {
+        Check::warn_at(
+            L::new("Корпуса", "Cases"),
+            tr(lang, "наложенные детали", "overlapping parts").to_string(),
+            focus_on_parts(&overlapping),
+        )
+    });
+
+    Report { checks, sim: None }
+}
+
 /// The same checks on a bare netlist, for circuits drawn by hand. Without a
 /// sketch the code-side checks are skipped instead of failing.
 pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
@@ -230,7 +352,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
     let nets = c.nets();
     let roots: Vec<usize> = (0..c.pins.len()).map(|i| nets.root(i)).collect();
     let Some(uno) = c.arduino else {
-        return Report { checks: Vec::new(), sim: None };
+        return run_bare(c, lang);
     };
     let uno_5v = roots[c.pin(uno, "5V")];
     let uno_gnd = roots[c.pin(uno, "GND1")];
@@ -902,6 +1024,43 @@ fn simulate(built: &Built) -> Option<Sim> {
 mod tests {
     use super::*;
     use crate::parse::{Intent, Load, Input};
+
+    #[test]
+    fn a_bench_without_an_uno_is_still_checked() {
+        let mut c = Circuit::new();
+        let r = run_circuit(&c, crate::text::Lang::Ru, None);
+        assert!(!r.checks.is_empty(), "an empty bench must still be reported");
+        assert!(r.checks.iter().any(|ch| ch.name.ru == "Монтаж"));
+
+        c.add_part(
+            Kind::Resistor,
+            "R1",
+            "220 Ω",
+            Pt::new(20.0, 20.0),
+            vec![
+                PinSpec { name: "1", pos: Pt::new(20.0, 20.0), hole: Hole::OffBoard, kind: PinKind::Passive },
+                PinSpec { name: "2", pos: Pt::new(24.0, 20.0), hole: Hole::OffBoard, kind: PinKind::Passive },
+            ],
+            vec![],
+        );
+        let r = run_circuit(&c, crate::text::Lang::Ru, None);
+        assert!(r.checks.iter().any(|ch| ch.name.ru == "Связи"));
+        assert!(r.checks.iter().any(|ch| ch.sev == Sev::Warn));
+
+        c.add_part(
+            Kind::Resistor,
+            "R1",
+            "220 Ω",
+            Pt::new(28.0, 20.0),
+            vec![
+                PinSpec { name: "1", pos: Pt::new(28.0, 20.0), hole: Hole::OffBoard, kind: PinKind::Passive },
+                PinSpec { name: "2", pos: Pt::new(32.0, 20.0), hole: Hole::OffBoard, kind: PinKind::Passive },
+            ],
+            vec![],
+        );
+        let r = run_circuit(&c, crate::text::Lang::Ru, None);
+        assert!(r.checks.iter().any(|ch| ch.name.ru == "Обозначения" && ch.sev == Sev::Fail));
+    }
 
     fn build_all() -> Vec<Built> {
         let cases = [

@@ -198,5 +198,10 @@
   "help.duplicate": "Duplicate with an offset",
   "help.multi": "Add to selection",
   "help.nudge": "Nudge by one grid step",
-  "manual.align": "Align the selection"
+  "manual.align": "Align the selection",
+  "help.tools": "Select / wire / part",
+  "help.grid": "Grid",
+  "save.pdf": "PDF for print",
+  "help.language": "Interface language",
+  "help.bench": "Light / dark bench"
 }

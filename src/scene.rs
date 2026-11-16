@@ -208,9 +208,19 @@ pub enum Prim {
     },
 }
 
+/// Which object painted a primitive. The flat primitive list keeps this as a
+/// parallel array, so hit-testing can use the real drawn shape instead of a
+/// second, approximate bounding box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Owner {
+    Part(usize),
+    Wire(usize),
+}
+
 #[derive(Clone)]
 pub struct Scene {
     pub prims: Vec<Prim>,
+    pub owners: Vec<Option<Owner>>,
     pub bg: Rgba,
     pub w: f32,
     pub h: f32,
@@ -219,6 +229,20 @@ pub struct Scene {
     /// the screen and the circuit has to pass through this point.
     pub origin: Pt,
 }
+impl Scene {
+    /// The topmost painted object under a point in scene coordinates. Unlike
+    /// a bounding-box test on the model, this follows what is actually drawn.
+    pub fn hit_owner(&self, p: Pt) -> Option<Owner> {
+        self.prims
+            .iter()
+            .zip(&self.owners)
+            .rev()
+            .find(|(prim, _)| prim.bbox().contains(p))
+            .and_then(|(_, owner)| *owner)
+    }
+}
+
+
 
 impl Scene {
     /// Bench millimetres to scene millimetres.
@@ -382,11 +406,18 @@ struct D {
     /// a caption for a part on the left edge is never cropped.
     frame: Rect,
     pin_pts: Vec<Pt>,
+    owner: Option<Owner>,
 }
 
 impl D {
+    /// Paint a primitive and remember which object asked for it.
+    fn push(&mut self, prim: Prim) {
+        self.s.owners.push(self.owner);
+        self.s.prims.push(prim);
+    }
+
     fn rrect(&mut self, r: Rect, rad: f32, fill: Rgba) {
-        self.s.prims.push(Prim::Rect {
+        self.push(Prim::Rect {
             r,
             radius: rad,
             fill,
@@ -394,7 +425,7 @@ impl D {
         });
     }
     fn rrect_stroke(&mut self, r: Rect, rad: f32, fill: Rgba, stroke: Rgba, w: f32) {
-        self.s.prims.push(Prim::Rect {
+        self.push(Prim::Rect {
             r,
             radius: rad,
             fill,
@@ -402,7 +433,7 @@ impl D {
         });
     }
     fn circle(&mut self, c: Pt, r: f32, fill: Rgba) {
-        self.s.prims.push(Prim::Circle {
+        self.push(Prim::Circle {
             c,
             r,
             fill,
@@ -410,7 +441,7 @@ impl D {
         });
     }
     fn circle_stroke(&mut self, c: Pt, r: f32, fill: Rgba, stroke: Rgba, w: f32) {
-        self.s.prims.push(Prim::Circle {
+        self.push(Prim::Circle {
             c,
             r,
             fill,
@@ -418,7 +449,7 @@ impl D {
         });
     }
     fn line(&mut self, a: Pt, b: Pt, w: f32, color: Rgba) {
-        self.s.prims.push(Prim::Poly {
+        self.push(Prim::Poly {
             pts: vec![a, b],
             w,
             color,
@@ -426,10 +457,10 @@ impl D {
         });
     }
     fn poly(&mut self, pts: Vec<Pt>, w: f32, color: Rgba, closed: bool) {
-        self.s.prims.push(Prim::Poly { pts, w, color, closed });
+        self.push(Prim::Poly { pts, w, color, closed });
     }
     fn text(&mut self, p: Pt, size: f32, text: impl Into<String>, color: Rgba, anchor: Anchor) {
-        self.s.prims.push(Prim::Text {
+        self.push(Prim::Text {
             p,
             size,
             text: text.into(),
@@ -441,7 +472,7 @@ impl D {
     }
 
     fn text_bold(&mut self, p: Pt, size: f32, text: impl Into<String>, color: Rgba, anchor: Anchor) {
-        self.s.prims.push(Prim::Text {
+        self.push(Prim::Text {
             p,
             size,
             text: text.into(),
@@ -461,7 +492,7 @@ impl D {
         anchor: Anchor,
         angle: f32,
     ) {
-        self.s.prims.push(Prim::Text {
+        self.push(Prim::Text {
             p,
             size,
             text: text.into(),
@@ -1592,6 +1623,7 @@ impl D {
     fn wires(&mut self, c: &Circuit) {
         let straight = self.opt.style == WireStyle::Straight;
         for (i, w) in c.wires_id() {
+            self.owner = Some(Owner::Wire(i));
             let a = c.end_pos(w.a);
             let b = c.end_pos(w.b);
             let pts = c.wire_points(w, self.opt.style);
@@ -1626,6 +1658,7 @@ impl D {
                 self.circle(p, 0.58, core);
             }
         }
+        self.owner = None;
         // Bend grips come last, on top of every cable, so a crowded board
         // never hides the one the user is about to pull.
         let handles = self.opt.handles.clone();
@@ -1753,6 +1786,7 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
     let mut d = D {
         s: Scene {
             prims: Vec::new(),
+            owners: Vec::new(),
             bg: bench,
             w: bb.w,
             h: bb.h,
@@ -1779,6 +1813,7 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
         frame: bb,
         // Painters draw a part upright, so they see pins turned back into the
         // part's own frame; wires and hit-testing use the real positions.
+        owner: None,
         pin_pts: c
             .pins
             .iter()
@@ -1793,16 +1828,19 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
         d.board(&flat);
         d.s.rotate_prims(mark, c.board.center(), c.board.rot as i32);
     }
-    for part in c.parts().filter(|p| p.kind == Kind::Arduino) {
+    for (id, part) in c.parts_id().filter(|(_, p)| p.kind == Kind::Arduino) {
         let x = c.part_xform(part);
         let mark = d.s.prims.len();
+        d.owner = Some(Owner::Part(id));
         d.arduino(part);
         d.s.rotate_prims(mark, x.pivot, x.quarter);
+        d.owner = None;
     }
     let nets = c.nets();
-    for part in c.parts() {
+    for (id, part) in c.parts_id() {
         let x = c.part_xform(part);
         let mark = d.s.prims.len();
+        d.owner = Some(Owner::Part(id));
         match part.kind {
             Kind::Arduino => {}
             Kind::Resistor => d.resistor(part),
@@ -1826,6 +1864,7 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
             Kind::Module => d.module(part),
         }
         d.s.rotate_prims(mark, x.pivot, x.quarter);
+        d.owner = None;
     }
     d.wires(c);
     for part in c.parts() {

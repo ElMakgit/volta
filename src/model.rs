@@ -5,7 +5,15 @@
 //! decorative image: its strips and rails are part of the netlist, which is
 //! what makes the electrical checks mean something.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+
+thread_local! {
+    /// Routes are expensive A* searches. A circuit's `uid` and `rev` keep a
+    /// cached polyline tied to exactly the geometry it was computed from.
+    static WIRE_ROUTES: RefCell<std::collections::HashMap<u64, Vec<Pt>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
 
 /// Standard breadboard hole pitch.
 pub const PITCH: f32 = 2.54;
@@ -492,8 +500,12 @@ pub struct PinSpec {
     pub kind: PinKind,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Circuit {
+    /// Identity and revision of this bench, used to key the wire-route cache.
+    /// They are not saved: a loaded project gets a fresh identity.
+    pub uid: u64,
+    pub rev: u64,
     pub board: Board,
     pub parts: Vec<Part>,
     pub pins: Vec<Pin>,
@@ -506,6 +518,25 @@ pub struct Circuit {
     /// A key changes only when the net itself changes, so a name survives
     /// adding another wire to the same net.
     pub net_names: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for Circuit {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+            rev: 0,
+            board: Board::default(),
+            parts: Vec::new(),
+            pins: Vec::new(),
+            wires: Vec::new(),
+            arduino: None,
+            notes: Vec::new(),
+            bare: false,
+            net_names: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 impl Default for Board {
@@ -521,6 +552,12 @@ impl Circuit {
             board: Board::default(),
             ..Default::default()
         }
+    }
+
+    /// Mark the geometry as changed. Every operation that moves a pin or a
+    /// bend calls this so the route cache is invalidated.
+    pub fn touch(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
     }
 
     /// Live objects only. The vectors also hold the slots of deleted objects
@@ -605,6 +642,7 @@ impl Circuit {
             links.push((ia, ib));
         }
         self.parts[idx].internal = links;
+        self.touch();
         idx
     }
 
@@ -626,6 +664,7 @@ impl Circuit {
             return;
         }
         self.wires.push(Wire { a, b, class, lift, via: Vec::new(), active: true });
+        self.touch();
     }
 
     /// Remove a part without renumbering anything. Its slot and the slots of
@@ -649,6 +688,7 @@ impl Circuit {
         if self.arduino == Some(victim) {
             self.arduino = None;
         }
+        self.touch();
     }
 
     /// Put a previously removed part back into its original slot, keeping
@@ -670,6 +710,7 @@ impl Circuit {
         if self.parts[id].kind == Kind::Arduino {
             self.arduino = Some(id);
         }
+        self.touch();
     }
 
     pub fn restore_wire(&mut self, id: WireId, wire: Wire) {
@@ -678,11 +719,13 @@ impl Circuit {
         } else {
             self.wires.push(wire);
         }
+        self.touch();
     }
 
     pub fn remove_wire(&mut self, id: WireId) {
         if id < self.wires.len() {
             self.wires[id].active = false;
+            self.touch();
         }
     }
 
@@ -755,9 +798,43 @@ impl Circuit {
             .collect()
     }
 
+    /// The key includes the circuit identity, its revision, both terminals,
+    /// every hand bend and the style. A moved pin or a new bend gets a new
+    /// key, so a stale route can never be returned.
+    fn route_key(&self, w: &Wire, style: WireStyle) -> u64 {
+        let mut h = self.uid
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ self.rev.wrapping_mul(0xC2B2_AE3D_282F_713B)
+            ^ (wire_seed(w.a, w.b) as u64)
+            ^ ((w.via.len() as u64) << 24)
+            ^ (style as u64);
+        for v in &w.via {
+            h = h
+                .wrapping_mul(0x100_0000_01B3)
+                .wrapping_add((v.x.to_bits() as u64).rotate_left(17) ^ v.y.to_bits() as u64);
+        }
+        h
+    }
+
     /// The polyline a wire is painted and hit-tested along. Every style ends
     /// exactly on the two terminals; only the way between them changes.
     pub fn wire_points(&self, w: &Wire, style: WireStyle) -> Vec<Pt> {
+        let key = self.route_key(w, style);
+        if let Some(pts) = WIRE_ROUTES.with(|cache| cache.borrow().get(&key).cloned()) {
+            return pts;
+        }
+        let pts = self.wire_points_uncached(w, style);
+        WIRE_ROUTES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() > 4096 {
+                cache.clear();
+            }
+            cache.insert(key, pts.clone());
+        });
+        pts
+    }
+
+    fn wire_points_uncached(&self, w: &Wire, style: WireStyle) -> Vec<Pt> {
         if !w.via.is_empty() {
             // The bends belong to the user, so every style honours them.
             let mut pts: Vec<Pt> = Vec::new();
@@ -1225,6 +1302,7 @@ impl Circuit {
         }
         let part = &mut self.parts[idx];
         part.rot = ((part.rot as i32 + quarter).rem_euclid(4)) as u8;
+        self.touch();
         true
     }
 
@@ -1248,11 +1326,74 @@ impl Circuit {
                 *v = v.rotate(pivot, quarter);
             }
         }
+        self.touch();
         true
     }
 
     /// Move a loose part by a delta, carrying its legs and therefore its
     /// cables. Parts plugged into the board are re-seated instead.
+    /// Bend points are stored in bench coordinates. When a part moves, the
+    /// bends near its pins travel with it instead of being left behind.
+    fn carry_vias(&mut self, moved: &[PinId], old: &[(PinId, Pt)], dx: f32, dy: f32) {
+        if moved.is_empty() || (dx.abs() < 1e-4 && dy.abs() < 1e-4) {
+            return;
+        }
+        let plans: Vec<(Vec<Pt>, Vec<Pt>)> = self.wires.iter().map(|w| {
+            if !w.active || w.via.is_empty() {
+                return (Vec::new(), Vec::new());
+            }
+            let anchors: Vec<Pt> = [w.a, w.b]
+                .into_iter()
+                .filter_map(|e| match e {
+                    End::Pin(p) if moved.contains(&p) => {
+                        old.iter().find(|(id, _)| *id == p).map(|(_, pos)| *pos)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let far: Vec<Pt> = [w.a, w.b]
+                .into_iter()
+                .filter_map(|e| match e {
+                    End::Pin(p) if moved.contains(&p) => None,
+                    other => Some(self.end_pos(other)),
+                })
+                .collect();
+            (anchors, far)
+        }).collect();
+        for (w, (anchors, far)) in self.wires.iter_mut().zip(plans) {
+            if anchors.is_empty() {
+                continue;
+            }
+            for v in &mut w.via {
+                let near = anchors.iter().map(|a| v.dist(*a)).fold(f32::MAX, f32::min);
+                let away = far.iter().map(|a| v.dist(*a)).fold(f32::MAX, f32::min);
+                if near <= away {
+                    *v = v.off(dx, dy);
+                }
+            }
+        }
+    }
+
+    /// Move without dragging bends along: used when undo restores a saved
+    /// position while the saved bends are restored separately.
+    pub fn move_part_silent(&mut self, idx: usize, to: Pt) -> bool {
+        if idx >= self.parts.len() || self.part_is_seated(&self.parts[idx]) {
+            return false;
+        }
+        let from = self.parts[idx].at;
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        if dx.abs() < 1e-4 && dy.abs() < 1e-4 {
+            return false;
+        }
+        for p in self.parts[idx].pins.clone() {
+            self.pins[p].pos = self.pins[p].pos.off(dx, dy);
+        }
+        self.parts[idx].at = to;
+        self.touch();
+        true
+    }
+
     pub fn move_part(&mut self, idx: usize, to: Pt) -> bool {
         if idx >= self.parts.len() || self.part_is_seated(&self.parts[idx]) {
             return false;
@@ -1265,9 +1406,12 @@ impl Circuit {
         }
         self.parts[idx].at = to;
         let pins = self.parts[idx].pins.clone();
+        let old: Vec<(PinId, Pt)> = pins.iter().map(|&p| (p, self.pins[p].pos)).collect();
+        self.carry_vias(&pins, &old, dx, dy);
         for p in pins {
             self.pins[p].pos = self.pins[p].pos.off(dx, dy);
         }
+        self.touch();
         true
     }
 
@@ -1309,15 +1453,17 @@ impl Circuit {
             }
         }
         let at = self.parts[idx].at;
-        self.parts[idx].at = Pt::new(
-            at.x + dcol as f32 * PITCH,
-            at.y + drow as f32 * PITCH,
-        );
+        let moved = self.parts[idx].pins.clone();
+        let old: Vec<(PinId, Pt)> = moved.iter().map(|&p| (p, self.pins[p].pos)).collect();
+        let (dx, dy) = (dcol as f32 * PITCH, drow as f32 * PITCH);
+        self.carry_vias(&moved, &old, dx, dy);
+        self.parts[idx].at = Pt::new(at.x + dx, at.y + dy);
         for (pin, c, r) in plan {
             let row = Row::from_idx(r);
             self.pins[pin].hole = Hole::Col(c, row);
             self.pins[pin].pos = self.board.hole(c, row);
         }
+        self.touch();
         true
     }
 
@@ -1331,6 +1477,7 @@ impl Circuit {
             return false;
         }
         self.bare = bare;
+        self.touch();
         true
     }
 

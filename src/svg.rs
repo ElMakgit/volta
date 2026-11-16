@@ -164,6 +164,7 @@ mod tests {
                     angle: 90.0,
                 },
             ],
+            owners: vec![],
             bg: Rgba::rgb(0xEF, 0xEE, 0xEB),
             w: 10.0,
             h: 12.0,

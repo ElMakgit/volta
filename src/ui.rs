@@ -51,6 +51,8 @@ enum SaveKind {
     Csv,
     /// A KiCad-readable connectivity file.
     Netlist,
+    /// A printable one-page PDF.
+    Pdf,
     /// SVG plus the sketch in one folder.
     Bundle,
 }
@@ -63,6 +65,7 @@ impl SaveKind {
             SaveKind::Sketch => "sketch",
             SaveKind::Csv => "csv",
             SaveKind::Netlist => "netlist",
+            SaveKind::Pdf => "pdf",
             SaveKind::Bundle => "bundle",
         }
     }
@@ -73,6 +76,7 @@ impl SaveKind {
             "sketch" => Some(SaveKind::Sketch),
             "csv" => Some(SaveKind::Csv),
             "netlist" => Some(SaveKind::Netlist),
+            "pdf" => Some(SaveKind::Pdf),
             "bundle" => Some(SaveKind::Bundle),
             _ => None,
         }
@@ -84,6 +88,7 @@ impl SaveKind {
             SaveKind::Sketch => "sketch.ino",
             SaveKind::Csv => "components.csv",
             SaveKind::Netlist => "circuit.net",
+            SaveKind::Pdf => "circuit.pdf",
             SaveKind::Bundle => "circuit",
         }
     }
@@ -95,6 +100,7 @@ impl SaveKind {
             SaveKind::Sketch => ".ino",
             SaveKind::Csv => "CSV",
             SaveKind::Netlist => ".net",
+            SaveKind::Pdf => "PDF",
             SaveKind::Bundle => "SVG+.ino",
         }
     }
@@ -314,6 +320,8 @@ pub struct App {
     marquee: Option<Pt>,
     tab: Tab,
     labels: bool,
+    /// A faint breadboard-pitch grid, toggled with G.
+    show_grid: bool,
     hover: Option<usize>,
     drag: Drag,
     view: View,
@@ -386,6 +394,7 @@ impl App {
             marquee: None,
             tab: Tab::Circuit,
             labels: false,
+            show_grid: false,
             hover: None,
             drag: Drag::default(),
             view: View::default(),
@@ -689,12 +698,16 @@ impl App {
                     .unwrap_or_default(),
             },
         ));
-        self.manual_report = Some(checks::run_circuit(&self.draft.circuit, self.lang, None));
+        self.manual_report = Some(checks::run_circuit(
+            &self.draft.circuit,
+            self.lang,
+            self.draft.code.as_deref(),
+        ));
     }
 
     fn edit_by_hand(&mut self) {
         let Some(built) = &self.built else { return };
-        self.draft.adopt(built.circuit.clone());
+        self.draft.adopt(built.circuit.clone(), Some(built.code.clone()));
         // The generated picture is replaced by the editable one right away.
         self.scene = None;
         self.check_focus = None;
@@ -863,7 +876,7 @@ impl App {
         self.task = p.task.clone();
         if p.manual {
             if let Some(circuit) = p.circuit {
-                self.draft.adopt(circuit);
+                self.draft.adopt(circuit, None);
             }
             self.mode = Mode::Manual;
             self.scene = None;
@@ -1026,8 +1039,7 @@ impl App {
                     return;
                 };
                 let out = with_ext(&path, "png");
-                let src = svg::render(&sc, 1.0);
-                crate::png::png_from_svg(&src, &out, 2400).map(|()| out)
+                crate::png::png_from_scene(&sc, &out, 2400).map(|()| out)
             }
             SaveKind::Svg => {
                 let Some(sc) = self.active_scene().cloned() else {
@@ -1066,6 +1078,16 @@ impl App {
                 match std::fs::write(&out, crate::netlist::netlist(&circuit)) {
                     Ok(()) => Ok(out),
                     Err(e) => Err(format!("{}: {e}", out.display())),
+                }
+            }
+            SaveKind::Pdf => {
+                let Some(sc) = self.active_scene().cloned() else {
+                    return;
+                };
+                let out = with_ext(&path, "pdf");
+                match crate::pdf::pdf_from_scene(&sc, &out, 1600) {
+                    Ok(()) => Ok(out),
+                    Err(e) => Err(e),
                 }
             }
             SaveKind::Bundle => {
@@ -1129,7 +1151,7 @@ impl App {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        let (ctrl, shift, enter, s, e, z, q, f, r, esc, del, quest, b, a, c, v, x, dd, left, right, up, down) =
+        let (ctrl, shift, enter, s, e, z, q, f, r, esc, del, quest, b, a, c, v, x, dd, left, right, up, down, g, k1, k2, k3) =
             ctx.input(|i| {
             (
                 i.modifiers.ctrl,
@@ -1154,6 +1176,10 @@ impl App {
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::ArrowUp),
                 i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::G),
+                i.key_pressed(egui::Key::Num1),
+                i.key_pressed(egui::Key::Num2),
+                i.key_pressed(egui::Key::Num3),
             )
             });
         let typing = ctx.memory(|m| m.focused().is_some());
@@ -1236,6 +1262,19 @@ impl App {
             let dy = if up { -step } else if down { step } else { 0.0 };
             if (dx != 0.0 || dy != 0.0) && self.draft.nudge_selected(dx, dy) {
                 self.refresh_manual();
+            }
+        }
+        if g && !typing {
+            self.show_grid = !self.show_grid;
+        }
+        if !typing && self.mode == Mode::Manual {
+            if k1 {
+                self.tool = Tool::Select;
+            } else if k2 {
+                self.tool = Tool::Wire;
+                self.draft.pending = None;
+            } else if k3 {
+                self.tool = Tool::Place(Place::Resistor);
             }
         }
         if f && !typing {
@@ -1375,7 +1414,28 @@ impl eframe::App for App {
                         {
                             self.about = true;
                         }
-                        ui.label(RichText::new(self.lang.code().to_uppercase()).size(12.0).color(muted));
+                        if ui
+                            .button(RichText::new(self.lang.code().to_uppercase()).size(12.0).color(accent))
+                            .on_hover_text(self.t("help.language"))
+                            .clicked()
+                        {
+                            self.lang = match self.lang {
+                                crate::text::Lang::Ru => crate::text::Lang::En,
+                                crate::text::Lang::En => crate::text::Lang::Ru,
+                            };
+                            self.tr = crate::text::Tr::new(self.lang);
+                            self.refresh_ai();
+                            self.refresh_manual();
+                        }
+                        if ui
+                            .button(RichText::new("◐").size(12.0).color(muted))
+                            .on_hover_text(self.t("help.bench"))
+                            .clicked()
+                        {
+                            self.toggle_bench();
+                            self.refresh_ai();
+                            self.refresh_manual();
+                        }
                         let summary = match self.mode {
                             Mode::Ai => self.ai_report(),
                             Mode::Manual => self.manual_report.clone(),
@@ -2103,6 +2163,10 @@ impl App {
                     picked = Some(SaveKind::Netlist);
                     ui.close();
                 }
+                if ui.button(self.t("save.pdf")).clicked() {
+                    picked = Some(SaveKind::Pdf);
+                    ui.close();
+                }
             });
             arrow_resp.response.on_hover_text(self.t("export.more"));
         });
@@ -2457,6 +2521,29 @@ impl App {
         // to be mapped back through that shift before they mean anything to the
         // circuit.
         let to_world = |p: Pos2| screen_to_bench(p, origin, scale, scene.origin);
+        if self.show_grid {
+            let tl = to_world(rect.min);
+            let br = to_world(rect.max);
+            let step = crate::model::PITCH;
+            let colour = Color32::from_rgba_unmultiplied(120, 140, 160, 28);
+            let stroke = Stroke::new(0.6, colour);
+            let mut col = (tl.x / step).floor() as i32;
+            while col as f32 * step <= br.x {
+                let x = col as f32 * step;
+                let a = bench_to_screen(Pt::new(x, tl.y), origin, scale, scene.origin);
+                let b = bench_to_screen(Pt::new(x, br.y), origin, scale, scene.origin);
+                painter.line_segment([a, b], stroke);
+                col += 1;
+            }
+            let mut row = (tl.y / step).floor() as i32;
+            while row as f32 * step <= br.y {
+                let y = row as f32 * step;
+                let a = bench_to_screen(Pt::new(tl.x, y), origin, scale, scene.origin);
+                let b = bench_to_screen(Pt::new(br.x, y), origin, scale, scene.origin);
+                painter.line_segment([a, b], stroke);
+                row += 1;
+            }
+        }
         if !resp.dragged() {
             if let Some(p) = resp.hover_pos() {
                 self.hover_world = Some(to_world(p));
@@ -2686,19 +2773,27 @@ impl App {
                 }
             }
             Tool::Select => {
-                let picked = self.draft.part_at(at);
+                let scene_at = Pt::new(at.x - scene.origin.x, at.y - scene.origin.y);
+                let painted = scene.hit_owner(scene_at);
+                let picked = match painted {
+                    Some(crate::scene::Owner::Part(p)) => Some(p),
+                    _ => self.draft.part_at(at),
+                };
                 let add = ui.input(|i| i.modifiers.shift);
-                if let Some(p) = picked {
-                    let before = self.draft.selected_parts.clone();
-                    self.draft.select_part(p, add);
-                    if before != self.draft.selected_parts {
-                        self.refresh_manual();
-                    }
-                } else if let Some(wire) = self.draft.wire_at(at, self.wire_style) {
+                if let Some(wire) = match painted {
+                    Some(crate::scene::Owner::Wire(w)) => Some(w),
+                    _ => None,
+                } {
                     let before = self.draft.selected_wires.clone();
                     self.draft.select_wire(wire, add);
                     self.active_wire = Some(wire);
                     if before != self.draft.selected_wires {
+                        self.refresh_manual();
+                    }
+                } else if let Some(p) = picked {
+                    let before = self.draft.selected_parts.clone();
+                    self.draft.select_part(p, add);
+                    if before != self.draft.selected_parts {
                         self.refresh_manual();
                     }
                 } else if !add && !self.draft.selected_parts.is_empty() {
@@ -3914,7 +4009,7 @@ impl App {
             let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("help-dim"));
             ctx.layer_painter(layer)
                 .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(DIM_ALPHA));
-            let keys: [(&str, &str); 18] = [
+            let keys: [(&str, &str); 20] = [
                 ("Ctrl+Enter", "help.plan"),
                 ("Ctrl+S", "export.title"),
                 ("Ctrl+E", "help.export"),
@@ -3925,6 +4020,8 @@ impl App {
                 ("Ctrl+D", "help.duplicate"),
                 ("Shift+click", "help.multi"),
                 ("← ↑ → ↓", "help.nudge"),
+                ("1 / 2 / 3", "help.tools"),
+                ("G", "help.grid"),
                 ("R", "manual.rotate_part"),
                 ("Shift+R", "manual.rotate_board"),
                 ("Delete", "manual.delete_hint"),

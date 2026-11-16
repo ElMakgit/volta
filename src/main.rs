@@ -17,6 +17,7 @@ mod model;
 mod modules;
 mod parse;
 mod paths;
+mod pdf;
 mod png;
 mod project;
 mod scene;
@@ -271,7 +272,7 @@ fn cmd_render(args: &[String]) {
         eprintln!("volta render: {}: {e}", svg_path.display());
         std::process::exit(1);
     }
-    let png_err = png::png_from_svg(&svg_src, &png_path, 2400).err();
+    let png_err = png::png_from_scene(&sc, &png_path, 2400).err();
     let _ = std::fs::write(&ino_path, &built.code);
     let serialised = serde_json::json!({
         "ok": report.failed() == 0,

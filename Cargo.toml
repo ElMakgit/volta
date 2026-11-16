@@ -1,6 +1,6 @@
 [package]
 name = "volta"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [features]
@@ -11,6 +11,7 @@ book-tasks = []
 
 [dependencies]
 chrono = "0.4"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ab_glyph = "0.2"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"] }
 serde_json = "1"
