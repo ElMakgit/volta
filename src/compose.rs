@@ -288,11 +288,21 @@ fn choice(r: &Resolved, lang: Lang) -> Choice {
             ],
         )
     } else {
+        let decimals = r.variant.decimals;
+        let unit = r.variant.unit.get(lang);
         let threshold = match r.condition {
             Condition::Above(v) | Condition::Below(v) => {
-                format!("{} {}", number(v, r.variant.decimals), r.variant.unit.get(lang))
+                format!("{} {}", number(v, decimals), unit)
             }
-            Condition::Active => r.variant.unit.get(lang).to_string(),
+            Condition::AboveBand { on, off } | Condition::BelowBand { on, off } => {
+                format!(
+                    "{} → {} {}",
+                    number(on, decimals),
+                    number(off, decimals),
+                    unit
+                )
+            }
+            Condition::Active => unit.to_string(),
         };
         (
             vec![
@@ -405,6 +415,10 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
             Condition::Above(_) | Condition::Below(_) => L::new(
                 "Порог можно подобрать по выводу в мониторе порта.",
                 "Tune the threshold from the serial monitor.",
+            ),
+            Condition::AboveBand { .. } | Condition::BelowBand { .. } => L::new(
+                "Гистерезис не даёт дребезжать у порога: вход на одном значении, выход на другом.",
+                "Hysteresis stops chatter at the threshold: it comes on at one value and off at another.",
             ),
             Condition::Active => L::new(
                 "Условие — уровень с модуля: подстроечник задаёт его на месте.",
@@ -612,14 +626,35 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
         // and no output pin to drive.
         (String::new(), String::new(), spec.show.to_string())
     } else {
-        let threshold = match r.condition {
-            Condition::Above(v) | Condition::Below(v) => number(v, r.variant.decimals),
-            Condition::Active => "0".to_string(),
-        };
-        let active = match r.condition {
-            Condition::Above(_) => format!("  bool active = value > {threshold};\n"),
-            Condition::Below(_) => format!("  bool active = value < {threshold};\n"),
-            Condition::Active => "  bool active = value != 0;\n".to_string(),
+        let decimals = r.variant.decimals;
+        let (persist, active) = match r.condition {
+            Condition::Above(v) => (
+                String::new(),
+                format!("  bool active = value > {};\n", number(v, decimals)),
+            ),
+            Condition::Below(v) => (
+                String::new(),
+                format!("  bool active = value < {};\n", number(v, decimals)),
+            ),
+            Condition::Active => (String::new(), "  bool active = value != 0;\n".to_string()),
+            // A band keeps its state between polls, so `active` lives next to
+            // `last` instead of being recomputed from one reading.
+            Condition::AboveBand { on, off } => (
+                "bool active = false;\n".to_string(),
+                format!(
+                    "  if (!active && value > {}) active = true;\n  if (active && value < {}) active = false;\n",
+                    number(on, decimals),
+                    number(off, decimals)
+                ),
+            ),
+            Condition::BelowBand { on, off } => (
+                "bool active = false;\n".to_string(),
+                format!(
+                    "  if (!active && value < {}) active = true;\n  if (active && value > {}) active = false;\n",
+                    number(on, decimals),
+                    number(off, decimals)
+                ),
+            ),
         };
         let (extra, action) = match (r.sink, r.behavior) {
             (SinkId::Led, Behavior::Blink) => (
@@ -648,7 +683,7 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
             // exhaustive without pretending a display has a threshold.
             (SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled, _) => ("", ""),
         };
-        (extra.to_string(), active, action.to_string())
+        (format!("{persist}{extra}"), active, action.to_string())
     };
     let (pins, output) = if show {
         (String::new(), String::new())
@@ -1045,6 +1080,39 @@ mod tests {
         }
         assert!(built.code.contains("digitalWrite(R_PIN, active ? HIGH : LOW)"));
         assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// A spoken hysteresis turns one threshold into two: the relay comes on
+    /// at 400 and lets go only below 350, so it does not chatter.
+    #[test]
+    fn a_hysteresis_band_keeps_its_state() {
+        let p = parse("газ выше 400 реле с гистерезисом 50");
+        let recipe = p.intent.recipe.expect("composes");
+        assert_eq!(
+            recipe.condition,
+            Some(Condition::AboveBand { on: 400.0, off: 350.0 })
+        );
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("bool active = false;"));
+        assert!(built.code.contains("value > 400"));
+        assert!(built.code.contains("value < 350"));
+        assert!(!built.code.contains("bool active = value >"));
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+    }
+
+    /// The band works from the low side too: "ниже 20" comes on under 20 and
+    /// clears only above 23.
+    #[test]
+    fn a_low_band_returns_above_the_threshold() {
+        let p = parse("температура ниже 20 серво с гистерезисом 3");
+        let recipe = p.intent.recipe.expect("composes");
+        assert_eq!(
+            recipe.condition,
+            Some(Condition::BelowBand { on: 20.0, off: 23.0 })
+        );
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("value < 20"));
+        assert!(built.code.contains("value > 23"));
     }
 
     /// A request to print in the serial port is not a request for a screen.

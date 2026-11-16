@@ -391,6 +391,9 @@ pressure on the oled | compose:Pressure/Oled/Show
 distance below 20 servo | compose:Range/Servo/Turn
 temperature above 30 motor | compose:Temperature/Motor/Spin
 gas above 400 rgb | compose:Gas/Rgb/Color
+газ выше 400 реле с гистерезисом 50 | compose:Gas/Relay/Switch
+температура ниже 20 серво с гистерезисом 3 | compose:Temperature/Servo/Turn
+gas above 400 relay hysteresis 50 | compose:Gas/Relay/Switch
 
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse

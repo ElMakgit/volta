@@ -114,22 +114,32 @@ fn spoken_condition(raw: &str) -> Option<crate::spec::Condition> {
         ("below", false),
         ("under", false),
     ];
+    // Numbers stay within the next couple of words, so "выше порога 700"
+    // still reads as a threshold.
+    let number_after = |i: usize| -> Option<f32> {
+        words.iter().skip(i + 1).take(2).find_map(|next| {
+            let value = next.trim_end_matches(['.', '-']).replace(',', ".");
+            value.parse::<f32>().ok()
+        })
+    };
     for (i, word) in words.iter().enumerate() {
         let Some((_, above)) = directions.iter().find(|(d, _)| word.starts_with(d)) else {
             continue;
         };
-        // Numbers stay within the next couple of words, so "выше порога 700"
-        // still reads as a threshold.
-        for next in words.iter().skip(i + 1).take(2) {
-            let value = next.trim_end_matches(['.', '-']);
-            let value = value.replace(',', ".");
-            if let Ok(n) = value.parse::<f32>() {
-                return Some(if *above {
-                    Condition::Above(n)
-                } else {
-                    Condition::Below(n)
-                });
-            }
+        if let Some(n) = number_after(i) {
+            // "с гистерезисом 50" names the width of the dead band, so the
+            // sink turns on at the spoken threshold and off a band later.
+            let band = words
+                .iter()
+                .position(|w| w.starts_with("гистерезис") || w.starts_with("hysteresis"))
+                .and_then(number_after)
+                .filter(|b| *b > 0.0 && (!*above || *b < n));
+            return Some(match (*above, band) {
+                (true, Some(b)) => Condition::AboveBand { on: n, off: n - b },
+                (false, Some(b)) => Condition::BelowBand { on: n, off: n + b },
+                (true, None) => Condition::Above(n),
+                (false, None) => Condition::Below(n),
+            });
         }
     }
     None

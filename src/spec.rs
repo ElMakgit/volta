@@ -56,6 +56,11 @@ pub enum Condition {
     Above(f32),
     Below(f32),
     Active,
+    /// Turns on above `on` and off only after falling back to `off`: the
+    /// relay does not chatter around one noisy threshold.
+    AboveBand { on: f32, off: f32 },
+    /// The same from the other side: comes on below `on`, clears above `off`.
+    BelowBand { on: f32, off: f32 },
 }
 
 impl Condition {
@@ -64,6 +69,12 @@ impl Condition {
             Condition::Above(_) => L::new("выше порога", "above the threshold"),
             Condition::Below(_) => L::new("ниже порога", "below the threshold"),
             Condition::Active => L::new("есть сигнал", "signal present"),
+            Condition::AboveBand { .. } => {
+                L::new("выше порога с возвратом", "above the threshold, with a return")
+            }
+            Condition::BelowBand { .. } => {
+                L::new("ниже порога с возвратом", "below the threshold, with a return")
+            }
         }
     }
 }
