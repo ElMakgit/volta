@@ -40,9 +40,7 @@ pub fn png_from_svg(svg: &str, out: &Path, width_px: u32) -> Result<(), String> 
 }
 
 pub fn default_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let pics = PathBuf::from(home).join("Pictures").join("volta");
-    pics
+    crate::paths::home().join("Pictures").join("volta")
 }
 
 #[cfg(test)]

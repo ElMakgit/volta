@@ -9,12 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::model::WireStyle;
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
-}
-
 pub fn config_dir() -> PathBuf {
-    home().join(".config/volta")
+    crate::paths::config_dir()
 }
 
 pub fn config_path() -> PathBuf {

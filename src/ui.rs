@@ -19,6 +19,7 @@ use crate::icons::{self, Icon};
 use crate::manual::{self, Draft, Place};
 use crate::model::{Circuit, Pt, WireStyle};
 use crate::parse::{self, Parse};
+use crate::project;
 use crate::scene::{self, Anchor, Prim, Rgba, Scene};
 use crate::spec::{self, Behavior, Composition, Condition, SINKS, SOURCES};
 use crate::svg;
@@ -110,6 +111,14 @@ struct RecipeAsk {
     number: f32,
 }
 
+/// A failure of the checks tab, pinned to the bench while the user looks at
+/// it. The name is kept for the chip over the drawing.
+struct CheckFocus {
+    focus: checks::Focus,
+    name: String,
+    sev: Sev,
+}
+
 /// One ready-made circuit on the start screen.
 struct Sample {
     icon: Icon,
@@ -187,6 +196,11 @@ enum Tool {
 /// a part fills the window.
 const MIN_ZOOM: f32 = 0.35;
 const MAX_ZOOM: f32 = 12.0;
+
+/// How dark the bench goes under a window. A dialog needs to stand out, but
+/// the circuit behind it stays readable: at 150 the screen turned into a black
+/// sheet and the user lost the context the question is about.
+const DIM_ALPHA: u8 = 84;
 
 struct View {
     zoom: f32,
@@ -304,6 +318,16 @@ pub struct App {
     checks_all: bool,
     /// The chip of "I read it as" whose picker is open.
     recipe_ask: Option<RecipeAsk>,
+    /// The failure of the checks tab shown on the bench.
+    check_focus: Option<CheckFocus>,
+    /// The projects window and the file it is working with.
+    projects_open: bool,
+    project_name: String,
+    project_path: Option<PathBuf>,
+    project_list: Vec<project::Entry>,
+    project_error: Option<String>,
+    /// A project the user asked to delete, waiting for a second click.
+    project_delete: Option<PathBuf>,
 }
 
 impl App {
@@ -355,6 +379,13 @@ impl App {
             narrow: false,
             checks_all: false,
             recipe_ask: None,
+            check_focus: None,
+            projects_open: false,
+            project_name: String::new(),
+            project_path: None,
+            project_list: Vec::new(),
+            project_error: None,
+            project_delete: None,
         }
     }
 
@@ -563,6 +594,7 @@ impl App {
         self.built = None;
         self.scene = None;
         self.error = None;
+        self.check_focus = None;
         self.draft.clear();
         self.draft_scene = None;
         self.manual_report = None;
@@ -574,6 +606,7 @@ impl App {
 
     fn build_now(&mut self) {
         self.error = None;
+        self.check_focus = None;
         let Some(parsed) = &self.parsed else { return };
         let Some(built) = templates::build(&parsed.intent, self.chosen, self.lang) else {
             self.error = Some(self.t("err.unsupported"));
@@ -634,6 +667,7 @@ impl App {
         self.draft.adopt(built.circuit.clone());
         // The generated picture is replaced by the editable one right away.
         self.scene = None;
+        self.check_focus = None;
         self.mode = Mode::Manual;
         self.tool = Tool::Select;
         self.tab = Tab::Circuit;
@@ -660,6 +694,7 @@ impl App {
         }
         self.mode = mode;
         self.hover = None;
+        self.check_focus = None;
         self.view = View::default();
         match mode {
             Mode::Ai => {
@@ -691,6 +726,178 @@ impl App {
 
     fn ai_report(&self) -> Option<Report> {
         self.built.as_ref().map(|b| checks::run(b, self.lang))
+    }
+
+    // -------------------------------------------------------------- projects
+
+    /// The current bench as a project. AI projects keep the sentence and the
+    /// chosen option and are rebuilt on open; the hand-drawn circuit is stored
+    /// because there is no sentence that could reproduce it.
+    fn project_snapshot(&self, name: &str) -> project::Project {
+        project::Project {
+            name: name.to_string(),
+            task: self.task.clone(),
+            manual: self.mode == Mode::Manual,
+            chosen: self.chosen,
+            recipe: self.parsed.as_ref().and_then(|p| p.intent.recipe),
+            circuit: match self.mode {
+                Mode::Manual => Some(self.draft.circuit.clone()),
+                Mode::Ai => None,
+            },
+            view: project::ViewData {
+                zoom: self.view.zoom,
+                pan_x: self.view.pan.x,
+                pan_y: self.view.pan.y,
+            },
+            saved: 0,
+        }
+    }
+
+    fn refresh_projects(&mut self) {
+        self.project_list = project::list();
+    }
+
+    fn open_projects(&mut self) {
+        self.refresh_projects();
+        if self.project_name.trim().is_empty() {
+            self.project_name = if self.task.trim().is_empty() {
+                self.t("projects.untitled")
+            } else {
+                self.task.trim().chars().take(40).collect()
+            };
+        }
+        self.project_error = None;
+        self.project_delete = None;
+        self.projects_open = true;
+    }
+
+    fn save_project(&mut self) {
+        let name = if self.project_name.trim().is_empty() {
+            let from_task: String = self.task.trim().chars().take(40).collect();
+            if from_task.is_empty() {
+                self.t("projects.untitled")
+            } else {
+                from_task
+            }
+        } else {
+            self.project_name.trim().to_string()
+        };
+        let p = self.project_snapshot(&name);
+        let path = project::dir().join(project::file_name(&name));
+        match project::save(&path, &p) {
+            Ok(()) => {
+                self.project_name = name;
+                self.project_path = Some(path);
+                self.project_error = None;
+                self.status = self.t("projects.saved");
+                self.status_bad = false;
+                self.refresh_projects();
+            }
+            Err(e) => self.project_error = Some(e),
+        }
+    }
+
+    fn open_project(&mut self, path: &Path) {
+        // Opening another project must not throw away what is on the bench.
+        // The autosave is the safety net, and opening the autosave itself is
+        // the one case where writing it first would destroy what is being
+        // read.
+        if !project::is_autosave(path) {
+            self.autosave();
+        }
+        let p = match project::load(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.project_error = Some(e);
+                return;
+            }
+        };
+        self.projects_open = false;
+        self.project_delete = None;
+        self.project_error = None;
+        self.resume = None;
+        self.check_focus = None;
+        self.error = None;
+        self.status = self.t("projects.opened");
+        self.status_bad = false;
+        self.project_path = Some(path.to_path_buf());
+        self.project_name = if p.name.trim().is_empty() {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .trim_end_matches(project::SUFFIX)
+                .to_string()
+        } else {
+            p.name.clone()
+        };
+        self.task = p.task.clone();
+        if p.manual {
+            if let Some(circuit) = p.circuit {
+                self.draft.adopt(circuit);
+            }
+            self.mode = Mode::Manual;
+            self.scene = None;
+            self.draft_scene = None;
+            self.manual_report = None;
+            self.parsed = None;
+            self.plan = None;
+            self.built = None;
+            self.tab = Tab::Circuit;
+            self.refresh_manual();
+        } else {
+            self.mode = Mode::Ai;
+            self.scene = None;
+            self.draft_scene = None;
+            self.manual_report = None;
+            self.plan_now();
+            if self.parsed.is_some() {
+                if let Some(recipe) = p.recipe {
+                    self.apply_recipe(recipe);
+                }
+                if self.plan.is_some() {
+                    let last = self
+                        .plan
+                        .as_ref()
+                        .map(|pl| pl.choices.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    self.chosen = p.chosen.min(last);
+                    self.build_now();
+                }
+            }
+        }
+        self.view = View {
+            zoom: p.view.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+            pan: vec2(p.view.pan_x, p.view.pan_y),
+            fitted: true,
+        };
+    }
+
+    fn remove_project(&mut self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+        if self.project_path.as_deref() == Some(path) {
+            self.project_path = None;
+        }
+        self.project_delete = None;
+        self.refresh_projects();
+    }
+
+    /// The bench written on exit, so a closed window never loses the work.
+    /// It is a project like any other and shows up in the list as autosave.
+    fn autosave(&self) {
+        let has_work = !self.task.trim().is_empty()
+            || self.built.is_some()
+            || self.draft.circuit.parts.len() > 1
+            || !self.draft.circuit.wires.is_empty();
+        if !has_work {
+            return;
+        }
+        let name = if self.project_name.trim().is_empty() {
+            self.t("projects.autosave")
+        } else {
+            format!("{} · {}", self.project_name.trim(), self.t("projects.autosave"))
+        };
+        let p = self.project_snapshot(&name);
+        let _ = project::save(&project::autosave_path(), &p);
     }
 
     // ---------------------------------------------------------------- export
@@ -759,7 +966,7 @@ impl App {
             let _ = std::fs::create_dir_all(&dir);
         }
         if !dir.is_dir() {
-            dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+            dir = crate::paths::home();
         }
         self.save_ask = Some(SaveAsk {
             kind,
@@ -964,6 +1171,9 @@ impl App {
             self.recipe_ask = None;
             self.draft.pending = None;
             self.tool = Tool::Select;
+            self.check_focus = None;
+            self.projects_open = false;
+            self.project_delete = None;
         }
         if quest && !typing {
             self.help = !self.help;
@@ -1041,6 +1251,18 @@ impl eframe::App for App {
                             .size(12.0)
                             .color(muted),
                     );
+                    ui.add_space(14.0);
+                    let projects = self.t("projects.title");
+                    if tab_button(ui, &projects, self.projects_open, crate::style::TEXT_BODY, accent, fg, muted)
+                        .on_hover_text(self.t("projects.hint"))
+                        .clicked()
+                    {
+                        if self.projects_open {
+                            self.projects_open = false;
+                        } else {
+                            self.open_projects();
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(Button::new(RichText::new("?").size(15.0)).min_size(vec2(30.0, 26.0)))
@@ -1226,6 +1448,11 @@ impl eframe::App for App {
         self.value_window(ctx, accent, fg, muted, panel, radius);
         self.save_window(ctx, accent, fg, muted, panel, radius);
         self.recipe_window(ctx, accent, fg, muted, panel, radius);
+        self.projects_window(ctx, accent, fg, muted, panel, radius);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.autosave();
     }
 }
 
@@ -1824,6 +2051,21 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.tab == Tab::Circuit {
+                    if let Some(f) = &self.check_focus {
+                        let label = format!("{} · {} ×", self.t("checks.show"), f.name);
+                        let resp = ui
+                            .add(
+                                Button::new(RichText::new(label).size(11.0))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.7)))
+                                    .corner_radius(radius),
+                            )
+                            .on_hover_text(self.t("checks.show.hint"));
+                        if resp.clicked() {
+                            self.check_focus = None;
+                        }
+                        ui.add_space(4.0);
+                    }
                     ui.label(
                         RichText::new(format!("{}%", (self.view.zoom * 100.0).round() as i32))
                             .size(11.0)
@@ -2097,6 +2339,9 @@ impl App {
             self.c32(scene.bg),
         );
         paint_scene(&painter, &scene, origin, scale, rect);
+        if let Some(f) = &self.check_focus {
+            paint_focus(&painter, &circuit, f, origin, scale, scene.origin, rect);
+        }
 
         // The scene is drawn shifted to its own origin, so screen pixels have
         // to be mapped back through that shift before they mean anything to the
@@ -2163,9 +2408,11 @@ impl App {
         let mut hit = Hit { origin, scale, rect, ..Default::default() };
         if resp.clicked() {
             hit.click = resp.interact_pointer_pos().map(to_world);
+            self.check_focus = None;
         }
         if resp.secondary_clicked() {
             hit.right = resp.interact_pointer_pos().map(to_world);
+            self.check_focus = None;
         }
         if resp.hovered() {
             if let Some(p) = resp.hover_pos() {
@@ -2611,13 +2858,14 @@ impl App {
                             RichText::new(self.t("checks.clean")).size(12.0).color(accent),
                         );
                     }
-                    for c in shown {
+                    for (row, c) in shown.iter().enumerate() {
                         let (mark, col) = match c.sev {
                             Sev::Pass => ("✓", accent),
                             Sev::Warn => ("!", Color32::from_rgb(0xD8, 0xA3, 0x2E)),
                             Sev::Fail => ("×", Color32::from_rgb(0xD2, 0x4B, 0x45)),
                         };
-                        ui.horizontal_wrapped(|ui| {
+                        let can_show = c.focus.as_ref().map(|f| !f.is_empty()).unwrap_or(false);
+                        let inner = ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(mark).size(13.0).color(col));
                             ui.label(
                                 RichText::new(format!("{:<22}", c.name.get(self.lang)))
@@ -2625,7 +2873,32 @@ impl App {
                                     .color(fg),
                             );
                             ui.label(RichText::new(&c.detail).size(11.5).color(muted));
+                            if can_show {
+                                ui.label(RichText::new("→").size(11.0).color(accent));
+                            }
                         });
+                        if can_show {
+                            // The row itself is the button, not the little
+                            // arrow: the whole line is a comfortable target.
+                            let resp = ui.interact(
+                                inner.response.rect,
+                                ui.make_persistent_id(("check-focus", row)),
+                                Sense::click(),
+                            );
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                if let Some(f) = c.focus.clone() {
+                                    self.check_focus = Some(CheckFocus {
+                                        focus: f,
+                                        name: c.name.get(self.lang).to_string(),
+                                        sev: c.sev,
+                                    });
+                                    self.tab = Tab::Circuit;
+                                }
+                            }
+                        }
                         ui.add_space(3.0);
                     }
                 });
@@ -2658,6 +2931,209 @@ impl App {
     /// A small window that follows the selection: pick the value of the part
     /// being worked on. It is shown only for parts that have a choice, and it
     /// does not crowd the palette with one button per value.
+    /// The projects window: a name, Save, and the folder of what was saved
+    /// before. It is a list, not a file manager: open, rename by saving under
+    /// a new name, delete with one confirmation.
+    fn projects_window(
+        &mut self,
+        ctx: &egui::Context,
+        accent: Color32,
+        fg: Color32,
+        muted: Color32,
+        panel: Color32,
+        radius: CornerRadius,
+    ) {
+        if !self.projects_open {
+            return;
+        }
+        let title = self.t("projects.title");
+        let name_lbl = self.t("projects.name");
+        let save_lbl = self.t("projects.save");
+        let list_lbl = self.t("projects.list");
+        let empty_lbl = self.t("projects.empty");
+        let open_lbl = self.t("projects.open");
+        let del_lbl = self.t("projects.delete");
+        let confirm_lbl = self.t("projects.confirm");
+        let close_lbl = self.t("projects.close");
+        let autosave_lbl = self.t("projects.autosave");
+        let autosave_hint = self.t("projects.autosave.hint");
+        let manual_lbl = self.t("projects.manual");
+        let ai_lbl = self.t("projects.ai");
+        let parts_lbl = self.t("projects.parts");
+        let current_lbl = self.t("projects.current");
+        let broken_lbl = self.t("projects.broken");
+
+        let mut close = false;
+        let mut save = false;
+        let mut open: Option<PathBuf> = None;
+        let mut remove: Option<PathBuf> = None;
+        let mut name = self.project_name.clone();
+        let list = self.project_list.clone();
+        let current = self.project_path.clone();
+        let mut pending = self.project_delete.clone();
+
+        // Dim the bench under the window, like the export and help sheets.
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("projects-dim"));
+        ctx.layer_painter(layer)
+            .rect_filled(ctx.content_rect(), CornerRadius::ZERO, Color32::from_black_alpha(DIM_ALPHA));
+
+        egui::Window::new(title.clone())
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .frame(
+                Frame::NONE
+                    .fill(panel)
+                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                    .corner_radius(radius)
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&title).size(16.0).strong().color(accent));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(&close_lbl).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                ui.label(RichText::new(&name_lbl).size(11.0).color(muted));
+                let resp = ui.add(TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+                ui.add_space(6.0);
+                let save_btn = Button::new(RichText::new(&save_lbl).strong().size(12.5))
+                    .fill(accent)
+                    .corner_radius(crate::style::RADIUS)
+                    .min_size(vec2(150.0, 30.0));
+                if ui.add(save_btn).clicked() {
+                    save = true;
+                }
+                if let Some(e) = &self.project_error {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(e)
+                            .size(11.5)
+                            .color(Color32::from_rgb(0xD2, 0x4B, 0x45)),
+                    );
+                }
+                ui.add_space(12.0);
+                ui.label(RichText::new(&list_lbl).size(11.0).color(muted));
+                ui.add_space(4.0);
+                ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if list.is_empty() {
+                            ui.label(RichText::new(&empty_lbl).size(11.5).color(muted));
+                        }
+                        for e in &list {
+                            let auto = project::is_autosave(&e.path);
+                            let label = e.name.clone();
+                            Frame::NONE
+                                .fill(if current.as_deref() == Some(e.path.as_path()) {
+                                    accent.gamma_multiply(0.10)
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .corner_radius(crate::style::RADIUS)
+                                .inner_margin(Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            let mut head = label.clone();
+                                            if auto {
+                                                head = format!("{head} · {autosave_lbl}");
+                                            }
+                                            ui.label(RichText::new(head).size(12.5).strong().color(
+                                                if e.broken {
+                                                    Color32::from_rgb(0xD2, 0x4B, 0x45)
+                                                } else {
+                                                    fg
+                                                },
+                                            ));
+                                            let mut meta = if e.manual {
+                                                format!(
+                                                    "{} · {} · {}",
+                                                    manual_lbl,
+                                                    parts_lbl.replace("{}", &e.parts.to_string()),
+                                                    project::date_text(e.saved)
+                                                )
+                                            } else {
+                                                format!("{} · {}", ai_lbl, project::date_text(e.saved))
+                                            };
+                                            if e.broken {
+                                                meta = broken_lbl.clone();
+                                            }
+                                            if auto {
+                                                meta = autosave_hint.clone();
+                                            }
+                                            if current.as_deref() == Some(e.path.as_path()) {
+                                                meta = format!("{meta} · {current_lbl}");
+                                            }
+                                            ui.label(RichText::new(meta).size(10.5).color(muted));
+                                        });
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if pending.as_deref() == Some(e.path.as_path()) {
+                                                let btn = Button::new(
+                                                    RichText::new(&confirm_lbl)
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(0xD2, 0x4B, 0x45)),
+                                                )
+                                                .corner_radius(radius)
+                                                .min_size(vec2(74.0, 24.0));
+                                                if ui.add(btn).clicked() {
+                                                    remove = Some(e.path.clone());
+                                                }
+                                            } else {
+                                                let btn = Button::new(RichText::new(&del_lbl).size(11.0))
+                                                    .corner_radius(radius)
+                                                    .min_size(vec2(74.0, 24.0));
+                                                if ui.add(btn).clicked() {
+                                                    pending = Some(e.path.clone());
+                                                }
+                                            }
+                                            let op = Button::new(RichText::new(&open_lbl).size(11.0))
+                                                .corner_radius(radius)
+                                                .min_size(vec2(74.0, 24.0));
+                                            if ui
+                                                .add(op)
+                                                .on_hover_text(if auto {
+                                                    autosave_hint.as_str()
+                                                } else {
+                                                    ""
+                                                })
+                                                .clicked()
+                                            {
+                                                open = Some(e.path.clone());
+                                            }
+                                        });
+                                    });
+                                });
+                            ui.add_space(2.0);
+                        }
+                    });
+            });
+
+        self.project_name = name;
+        self.project_delete = pending;
+        if close {
+            self.projects_open = false;
+            self.project_delete = None;
+        } else if let Some(path) = remove {
+            self.remove_project(&path);
+        } else if let Some(path) = open {
+            self.open_project(&path);
+        } else if save {
+            self.save_project();
+        }
+    }
+
     /// "Save as", in the app's own clothes: the folder to browse, the name
     /// to type, Save and Cancel. No portal and no extra dependency, so the
     /// build stays offline and the window matches the rest of the app.
@@ -2691,7 +3167,7 @@ impl App {
         // save question is the only thing that matters while it is open.
         let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("save-dim"));
         ctx.layer_painter(layer)
-            .rect_filled(ctx.content_rect(), CornerRadius::ZERO, Color32::from_black_alpha(150));
+            .rect_filled(ctx.content_rect(), CornerRadius::ZERO, Color32::from_black_alpha(DIM_ALPHA));
 
         egui::Window::new(title.clone())
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -3083,7 +3559,7 @@ impl App {
             let screen = ctx.content_rect();
             let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("resume-dim"));
             ctx.layer_painter(layer)
-                .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(150));
+                .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(DIM_ALPHA));
             let title = self.t("resume.title");
             let body = self.t("resume.body");
             let yes = self.t("resume.yes");
@@ -3156,7 +3632,7 @@ impl App {
             let screen = ctx.content_rect();
             let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("help-dim"));
             ctx.layer_painter(layer)
-                .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(160));
+                .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(DIM_ALPHA));
             let keys: [(&str, &str); 13] = [
                 ("Ctrl+Enter", "help.plan"),
                 ("Ctrl+S", "export.title"),
@@ -3240,6 +3716,41 @@ fn screen_to_bench(p: Pos2, origin: Pos2, scale: f32, scene_origin: Pt) -> Pt {
 /// The inverse of [`screen_to_bench`].
 fn bench_to_screen(p: Pt, origin: Pos2, scale: f32, scene_origin: Pt) -> Pos2 {
     origin + vec2((p.x - scene_origin.x) * scale, (p.y - scene_origin.y) * scale)
+}
+
+/// Ring the parts a failed check is talking about and dot the pins, without
+/// redrawing the bench. The marks sit on top of the scene and are clipped to
+/// the canvas, so a zoomed-in view does not paint over the side panels.
+fn paint_focus(
+    painter: &egui::Painter,
+    c: &Circuit,
+    f: &CheckFocus,
+    origin: Pos2,
+    scale: f32,
+    scene_origin: Pt,
+    clip: egui::Rect,
+) {
+    let col = match f.sev {
+        Sev::Pass => Color32::from_rgb(0x3E, 0x9E, 0x5A),
+        Sev::Warn => Color32::from_rgb(0xD8, 0xA3, 0x2E),
+        Sev::Fail => Color32::from_rgb(0xD2, 0x4B, 0x45),
+    };
+    let p = painter.with_clip_rect(clip);
+    for &i in &f.focus.parts {
+        let Some(part) = c.parts.get(i) else { continue };
+        let r = c.part_rect(part);
+        let a = bench_to_screen(Pt::new(r.x, r.y), origin, scale, scene_origin);
+        let b = bench_to_screen(Pt::new(r.right(), r.bottom()), origin, scale, scene_origin);
+        let rect = egui::Rect::from_min_max(a.min(b), a.max(b)).expand(4.0);
+        p.rect_filled(rect, 6.0, col.gamma_multiply(0.12));
+        p.rect_stroke(rect, 6.0, Stroke::new(2.0, col), StrokeKind::Outside);
+    }
+    for &i in &f.focus.pins {
+        let Some(pin) = c.pins.get(i) else { continue };
+        let at = bench_to_screen(pin.pos, origin, scale, scene_origin);
+        p.circle_filled(at, 4.5, col.gamma_multiply(0.35));
+        p.circle_stroke(at, 7.0, Stroke::new(1.8, col));
+    }
 }
 
 /// egui's built-in fonts have no ✓ or ↶, which the checks and the undo

@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use crate::scene::Rgba;
 
 fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
+    crate::paths::home()
 }
 
 pub fn strip_dir() -> PathBuf {

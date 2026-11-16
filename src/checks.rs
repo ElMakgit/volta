@@ -17,22 +17,58 @@ pub enum Sev {
     Fail,
 }
 
+/// The place a check is talking about: whole parts and single pins, in the
+/// circuit's own indices. An empty focus means the line has no single place
+/// (a code-style remark, for example), and clicking it does nothing.
+#[derive(Clone, Default, Debug)]
+pub struct Focus {
+    pub parts: Vec<usize>,
+    pub pins: Vec<usize>,
+}
+
+impl Focus {
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty() && self.pins.is_empty()
+    }
+}
+
+fn focus_on_pins(c: &Circuit, pins: &[usize]) -> Focus {
+    let mut parts: Vec<usize> = pins.iter().map(|&i| c.pins[i].part).collect();
+    parts.sort_unstable();
+    parts.dedup();
+    let mut pins = pins.to_vec();
+    pins.sort_unstable();
+    pins.dedup();
+    Focus { parts, pins }
+}
+
+fn focus_on_parts(parts: &[usize]) -> Focus {
+    let mut parts = parts.to_vec();
+    parts.sort_unstable();
+    parts.dedup();
+    Focus { parts, pins: Vec::new() }
+}
+
 #[derive(Clone)]
 pub struct Check {
     pub name: L,
     pub sev: Sev,
     pub detail: String,
+    pub focus: Option<Focus>,
 }
 
 impl Check {
     fn pass(name: L, detail: String) -> Self {
-        Self { name, sev: Sev::Pass, detail }
+        Self { name, sev: Sev::Pass, detail, focus: None }
     }
     fn warn(name: L, detail: String) -> Self {
-        Self { name, sev: Sev::Warn, detail }
+        Self { name, sev: Sev::Warn, detail, focus: None }
     }
-    fn fail(name: L, detail: String) -> Self {
-        Self { name, sev: Sev::Fail, detail }
+    fn warn_at(name: L, detail: String, focus: Focus) -> Self {
+        Self { name, sev: Sev::Warn, detail, focus: Some(focus) }
+    }
+    fn fail_at(name: L, detail: String, focus: Focus) -> Self {
+        Self { name, sev: Sev::Fail, detail, focus: Some(focus) }
     }
 }
 
@@ -246,13 +282,13 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         .collect();
 
     // 1. Every part ground reaches the board ground.
-    let flying: Vec<String> = c
+    let flying: Vec<(usize, String)> = c
         .pins
         .iter()
         .enumerate()
         .filter(|(_, p)| p.kind == PinKind::Ground && p.part != uno)
         .filter(|(i, _)| roots[*i] != uno_gnd)
-        .map(|(i, _)| pin_label(c, i))
+        .map(|(i, _)| (i, pin_label(c, i)))
         .collect();
     checks.push(if flying.is_empty() {
         Check::pass(
@@ -260,24 +296,27 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Все выводы земли на одном узле с GND платы.", "Every ground pin shares the board's GND node.").to_string(),
         )
     } else {
-        Check::fail(
+        let labels: Vec<&str> = flying.iter().map(|(_, l)| l.as_str()).collect();
+        let pins: Vec<usize> = flying.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
             L::new("Земля", "Ground"),
             format!(
                 "{}: {}",
                 tr(lang, "не доходит до GND", "does not reach GND"),
-                flying.join(", ")
+                labels.join(", ")
             ),
+            focus_on_pins(c, &pins),
         )
     });
 
     // 1b. Nothing may hang in the air, and an empty board is not a circuit.
-    let loose: Vec<String> = c
+    let loose: Vec<(usize, String)> = c
         .pins
         .iter()
         .enumerate()
         .filter(|(_, p)| p.part != uno && p.hole == Hole::OffBoard && p.kind == PinKind::Passive)
         .filter(|(i, _)| nets.pins_in(roots[*i]).len() < 2)
-        .map(|(i, _)| pin_label(c, i))
+        .map(|(i, _)| (i, pin_label(c, i)))
         .collect();
     let parts_total = c.parts.iter().filter(|p| p.kind != Kind::Arduino).count();
     checks.push(if parts_total == 0 {
@@ -286,9 +325,12 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "На макетке пока нет деталей.", "There are no parts on the breadboard yet.").to_string(),
         )
     } else if !loose.is_empty() {
-        Check::warn(
+        let labels: Vec<&str> = loose.iter().map(|(_, l)| l.as_str()).collect();
+        let pins: Vec<usize> = loose.iter().map(|(i, _)| *i).collect();
+        Check::warn_at(
             L::new("Монтаж", "Assembly"),
-            format!("{}: {}", tr(lang, "выводы без подключения", "unconnected terminals"), loose.join(", ")),
+            format!("{}: {}", tr(lang, "выводы без подключения", "unconnected terminals"), labels.join(", ")),
+            focus_on_pins(c, &pins),
         )
     } else {
         Check::pass(
@@ -298,7 +340,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
     });
 
     // 2. Every power pin reaches 5 V, 3V3 or VIN.
-    let orphan_power: Vec<String> = c
+    let orphan_power: Vec<(usize, String)> = c
         .pins
         .iter()
         .enumerate()
@@ -312,7 +354,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 && r != roots[c.pin(uno, "VIN")]
                 && !module_out_roots.contains(&r)
         })
-        .map(|(i, _)| pin_label(c, i))
+        .map(|(i, _)| (i, pin_label(c, i)))
         .collect();
     checks.push(if orphan_power.is_empty() {
         Check::pass(
@@ -320,9 +362,12 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Питание приходит с платы, висящих выводов нет.", "Power comes from the board, nothing floats.").to_string(),
         )
     } else {
-        Check::fail(
+        let labels: Vec<&str> = orphan_power.iter().map(|(_, l)| l.as_str()).collect();
+        let pins: Vec<usize> = orphan_power.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
             L::new("Питание", "Power"),
-            format!("{}: {}", tr(lang, "без питания", "unpowered"), orphan_power.join(", ")),
+            format!("{}: {}", tr(lang, "без питания", "unpowered"), labels.join(", ")),
+            focus_on_pins(c, &pins),
         )
     });
 
@@ -333,9 +378,16 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "5 В, 3.3 В и земля — разные узлы.", "5 V, 3.3 V and ground are separate nodes.").to_string(),
         )
     } else {
-        Check::fail(
+        let pins: Vec<usize> = (0..c.pins.len())
+            .filter(|&i| {
+                let r = roots[i];
+                r == uno_5v || r == uno_gnd || r == uno_3v3
+            })
+            .collect();
+        Check::fail_at(
             L::new("Короткое замыкание", "Short circuit"),
             tr(lang, "Питание соединено с землёй — плата сгорит.", "Power is wired to ground — the board would die.").to_string(),
+            focus_on_pins(c, &pins),
         )
     });
 
@@ -353,7 +405,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 .enumerate()
                 .any(|(i, p)| roots[i] == r && c.parts[p.part].kind == Kind::Resistor);
             if !has_r {
-                led_problems.push(pin_label(c, pin));
+                led_problems.push((pin, pin_label(c, pin)));
             }
         }
     }
@@ -363,9 +415,12 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "У каждого канала свой токоограничивающий резистор.", "Every channel has its own current-limiting resistor.").to_string(),
         )
     } else {
-        Check::fail(
+        let labels: Vec<&str> = led_problems.iter().map(|(_, l)| l.as_str()).collect();
+        let pins: Vec<usize> = led_problems.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
             L::new("Резисторы светодиодов", "LED resistors"),
-            format!("{}: {}", tr(lang, "без резистора", "no resistor"), led_problems.join(", ")),
+            format!("{}: {}", tr(lang, "без резистора", "no resistor"), labels.join(", ")),
+            focus_on_pins(c, &pins),
         )
     });
 
@@ -387,7 +442,12 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             }
             let i = (5.0 - vf) / r;
             if i > 0.02 {
-                over.push(format!("{} — {:.0} мА", led.label, i * 1000.0));
+                let led_idx = c
+                    .parts
+                    .iter()
+                    .position(|p| std::ptr::eq(p, led))
+                    .unwrap_or(0);
+                over.push((led_idx, format!("{} — {:.0} мА", led.label, i * 1000.0)));
             }
         }
     }
@@ -397,15 +457,23 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Ток каждого канала ниже 20 мА.", "Every channel stays under 20 mA.").to_string(),
         )
     } else {
-        Check::fail(
+        let labels: Vec<&str> = over.iter().map(|(_, l)| l.as_str()).collect();
+        let parts: Vec<usize> = over.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
             L::new("Ток пина", "Pin current"),
-            over.join("; "),
+            labels.join("; "),
+            focus_on_parts(&parts),
         )
     });
 
     // 6. Inductive loads get a flyback diode across them.
     let mut fly = Vec::new();
-    for load in c.parts.iter().filter(|p| p.kind.inductive() && p.kind != Kind::Relay) {
+    for (load_idx, load) in c
+        .parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind.inductive() && p.kind != Kind::Relay)
+    {
         // A driver board already carries the flyback diodes for its outputs.
         if load.pins.iter().any(|&i| module_out_roots.contains(&roots[i])) {
             continue;
@@ -433,10 +501,10 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                     b
                 };
                 if k != positive_side {
-                    fly.push(format!("{}: {}", load.label, tr(lang, "диод в обратную сторону", "diode is reversed")));
+                    fly.push((load_idx, format!("{}: {}", load.label, tr(lang, "диод в обратную сторону", "diode is reversed"))));
                 }
             }
-            None => fly.push(format!("{}: {}", load.label, tr(lang, "нет обратного диода", "no flyback diode"))),
+            None => fly.push((load_idx, format!("{}: {}", load.label, tr(lang, "нет обратного диода", "no flyback diode")))),
         }
     }
     checks.push(if fly.is_empty() {
@@ -445,15 +513,26 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Индуктивная нагрузка защищена диодом в правильной полярности.", "The inductive load has a correctly oriented diode.").to_string(),
         )
     } else {
-        Check::fail(L::new("Обратный диод", "Flyback diode"), fly.join("; "))
+        let labels: Vec<&str> = fly.iter().map(|(_, l)| l.as_str()).collect();
+        let parts: Vec<usize> = fly.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
+            L::new("Обратный диод", "Flyback diode"),
+            labels.join("; "),
+            focus_on_parts(&parts),
+        )
     });
 
     // 7. Loads are not hung straight on a pin.
     let mut direct = Vec::new();
-    for load in c.parts.iter().filter(|p| matches!(p.kind, Kind::Motor | Kind::Speaker)) {
+    for (load_idx, load) in c
+        .parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p.kind, Kind::Motor | Kind::Speaker))
+    {
         for &pin in &load.pins {
             if uno_signal_on(c, &roots, roots[pin]) {
-                direct.push(format!("{} → {}", load.label, pin_label(c, pin)));
+                direct.push((load_idx, format!("{} → {}", load.label, pin_label(c, pin))));
                 break;
             }
         }
@@ -464,15 +543,23 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Силовая нагрузка не висит на пине напрямую.", "The power load is not wired straight to a pin.").to_string(),
         )
     } else {
-        Check::fail(
+        let labels: Vec<&str> = direct.iter().map(|(_, l)| l.as_str()).collect();
+        let parts: Vec<usize> = direct.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
             L::new("Нагрузка", "Load"),
-            format!("{}: {}", tr(lang, "прямо на пин", "straight to a pin"), direct.join(", ")),
+            format!("{}: {}", tr(lang, "прямо на пин", "straight to a pin"), labels.join(", ")),
+            focus_on_parts(&parts),
         )
     });
 
     // 8. Transistor gates are driven and not left floating.
     let mut gates = Vec::new();
-    for q in c.parts.iter().filter(|p| p.kind.is_transistor()) {
+    for (q_idx, q) in c
+        .parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind.is_transistor())
+    {
         let gate = q.pins[0];
         let r = roots[gate];
         let resistors = c
@@ -482,7 +569,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             .filter(|(i, p)| roots[*i] == r && c.parts[p.part].kind == Kind::Resistor)
             .count();
         if resistors == 0 {
-            gates.push(format!("{}: {}", q.label, tr(lang, "затвор/база без резистора", "gate/base without a resistor")));
+            gates.push((q_idx, format!("{}: {}", q.label, tr(lang, "затвор/база без резистора", "gate/base without a resistor"))));
         }
         // The source/emitter has to reach ground.
         let tail = q
@@ -492,7 +579,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             .find(|&p| matches!(c.pins[p].name, "S" | "E"))
             .unwrap_or(q.pins[q.pins.len() - 1]);
         if roots[tail] != uno_gnd {
-            gates.push(format!("{}: {}", q.label, tr(lang, "исток/эмиттер не на земле", "source/emitter is not grounded")));
+            gates.push((q_idx, format!("{}: {}", q.label, tr(lang, "исток/эмиттер не на земле", "source/emitter is not grounded"))));
         }
     }
     checks.push(if gates.is_empty() {
@@ -501,13 +588,24 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Ключ управляется через резистор и надёжно привязан к земле.", "The switch is driven through a resistor and tied to ground.").to_string(),
         )
     } else {
-        Check::fail(L::new("Ключ", "Switch"), gates.join("; "))
+        let labels: Vec<&str> = gates.iter().map(|(_, l)| l.as_str()).collect();
+        let parts: Vec<usize> = gates.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
+            L::new("Ключ", "Switch"),
+            labels.join("; "),
+            focus_on_parts(&parts),
+        )
     });
 
     // 9. Buttons bridge a signal to a supply, and the sketch enables a pull-up.
     let mut btns = Vec::new();
     let pullup = code.contains("INPUT_PULLUP");
-    for b in parts_with(c, Kind::Button) {
+    for (b_idx, b) in c
+        .parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind == Kind::Button)
+    {
         let side_a = roots[b.pins[0]];
         let side_b = roots[b.pins[2]];
         let a_signal = uno_signal_on(c, &roots, side_a);
@@ -515,9 +613,9 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         let a_gnd = side_a == uno_gnd;
         let b_gnd = side_b == uno_gnd;
         if !((a_signal && b_gnd) || (b_signal && a_gnd)) {
-            btns.push(format!("{}: {}", b.label, tr(lang, "не замыкает сигнал на землю", "does not bridge signal to ground")));
+            btns.push((b_idx, format!("{}: {}", b.label, tr(lang, "не замыкает сигнал на землю", "does not bridge signal to ground"))));
         } else if !pullup && !code.is_empty() {
-            btns.push(format!("{}: {}", b.label, tr(lang, "нужен INPUT_PULLUP", "needs INPUT_PULLUP")));
+            btns.push((b_idx, format!("{}: {}", b.label, tr(lang, "нужен INPUT_PULLUP", "needs INPUT_PULLUP"))));
         }
     }
     checks.push(if btns.is_empty() {
@@ -526,7 +624,13 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             tr(lang, "Кнопка замыкает сигнал на землю, подтяжка включена в коде.", "The button pulls the signal to ground and the sketch enables the pull-up.").to_string(),
         )
     } else {
-        Check::fail(L::new("Кнопка", "Button"), btns.join("; "))
+        let labels: Vec<&str> = btns.iter().map(|(_, l)| l.as_str()).collect();
+        let parts: Vec<usize> = btns.iter().map(|(i, _)| *i).collect();
+        Check::fail_at(
+            L::new("Кнопка", "Button"),
+            labels.join("; "),
+            focus_on_parts(&parts),
+        )
     });
 
     // Checks 10-12 read the sketch, so a hand-drawn circuit skips them.
@@ -535,11 +639,15 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         let declared = declared(code);
         let modes = pin_mode_pins(code);
         let mut mismatched = Vec::new();
+        let mut bad_pins: Vec<usize> = Vec::new();
         let mut used = Vec::new();
-        let wired = |pin_name: &str| -> bool {
+        let uno_pin = |pin_name: &str| -> Option<usize> {
             (0..c.parts[uno].pins.len())
                 .map(|i| c.parts[uno].pins[i])
                 .find(|&p| c.pins[p].name == pin_name)
+        };
+        let wired = |pin_name: &str| -> bool {
+            uno_pin(pin_name)
                 .map(|p| nets.pins_in(roots[p]).len() >= 2)
                 .unwrap_or(false)
         };
@@ -550,6 +658,9 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             used.push(name.clone());
             let pin_name = if value.starts_with('A') { value.clone() } else { format!("D{value}") };
             if !wired(&pin_name) {
+                if let Some(p) = uno_pin(&pin_name) {
+                    bad_pins.push(p);
+                }
                 mismatched.push(format!("{name} → {pin_name}"));
             }
         }
@@ -562,6 +673,9 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 .unwrap_or(name.clone());
             let pin_name = if value.starts_with('A') { value } else { format!("A{value}") };
             if !wired(&pin_name) {
+                if let Some(p) = uno_pin(&pin_name) {
+                    bad_pins.push(p);
+                }
                 mismatched.push(format!("{name} → {pin_name}"));
             }
         }
@@ -575,9 +689,11 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 ),
             )
         } else {
-            Check::fail(
+            bad_pins.push(c.parts[uno].pins[0]);
+            Check::fail_at(
                 L::new("Код ↔ схема", "Code vs drawing"),
                 format!("{}: {}", tr(lang, "в схеме не подключено", "not wired on the drawing"), mismatched.join(", ")),
+                focus_on_pins(c, &bad_pins),
             )
         });
 
@@ -602,9 +718,10 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 tr(lang, "ШИМ только на пинах таймеров: 3, 5, 6, 9, 10, 11.", "PWM only on timer pins: 3, 5, 6, 9, 10, 11.").to_string(),
             )
         } else {
-            Check::fail(
+            Check::fail_at(
                 L::new("ШИМ", "PWM"),
                 format!("{}: {}", tr(lang, "аппаратного ШИМ нет на", "no hardware PWM on"), bad_pwm.join(", ")),
+                focus_on_parts(&[uno]),
             )
         });
 
@@ -660,10 +777,15 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
 
     // 13b. Modules from the book: the hungry ones need their own supply, and
     // the 3.3 V ones must not be tied to 5 V.
-    for part in c.parts.iter().filter(|p| p.kind == Kind::Module) {
+    for (part_idx, part) in c
+        .parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.kind == Kind::Module)
+    {
         let Some(m) = crate::modules::find(&part.value) else { continue };
         if m.current_ma >= 400 {
-            checks.push(Check::warn(
+            checks.push(Check::warn_at(
                 L::new("Питание модуля", "Module supply"),
                 format!(
                     "{} {} {} {}",
@@ -672,6 +794,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                     m.current_ma,
                     tr(lang, "мА в импульсе: нужен отдельный блок питания.", "mA in bursts: use its own supply.")
                 ),
+                focus_on_parts(&[part_idx]),
             ));
         }
         if m.three_three {
@@ -682,15 +805,16 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 .filter_map(|(name, _, _)| {
                     part.pins.iter().copied().find(|&i| c.pins[i].name == *name)
                 })
-                .any(|i| roots[i] == uno_5v);
-            checks.push(if wired_5v {
-                Check::fail(
+                .find(|&i| roots[i] == uno_5v);
+            checks.push(if let Some(pin) = wired_5v {
+                Check::fail_at(
                     L::new("3.3 В", "3.3 V"),
                     format!(
                         "{} {}",
                         m.name,
                         tr(lang, "питается от 5 В, а рассчитан на 3.3 В.", "is wired to 5 V but expects 3.3 V.")
                     ),
+                    focus_on_pins(c, &[pin]),
                 )
             } else {
                 Check::pass(
@@ -722,9 +846,17 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
     let uses_right = c.pins.iter().any(|p| matches!(p.hole, Hole::Rail(_, RailHalf::Right, _)));
     let uses_left = c.pins.iter().any(|p| matches!(p.hole, Hole::Rail(_, RailHalf::Left, _)));
     checks.push(if uses_left && uses_right && !bridged {
-        Check::fail(
+        let pins: Vec<usize> = c
+            .pins
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.hole, Hole::Rail(..)))
+            .map(|(i, _)| i)
+            .collect();
+        Check::fail_at(
             L::new("Шины питания", "Power rails"),
             tr(lang, "Обе половины шины используются, но перемычки между ними нет.", "Both halves of a rail are used without a bridge between them.").to_string(),
+            focus_on_pins(c, &pins),
         )
     } else {
         Check::pass(
@@ -875,6 +1007,46 @@ mod tests {
         assert_eq!(ohms("10 кОм"), Some(10_000.0));
         assert_eq!(ohms("4.7 кОм"), Some(4700.0));
         assert_eq!(ohms("1 кОм"), Some(1000.0));
+    }
+
+    /// A focus is what the drawing is asked to ring. It must stay inside the
+    /// circuit: a stale or out-of-range index would either paint over nothing
+    /// or point at the wrong part.
+    #[test]
+    fn every_focus_points_at_a_real_part_or_pin() {
+        for built in build_all() {
+            let report = run(&built, Lang::Ru);
+            for chk in &report.checks {
+                let Some(f) = &chk.focus else { continue };
+                for &p in &f.parts {
+                    assert!(
+                        p < built.circuit.parts.len(),
+                        "{}: part {p} of {}",
+                        chk.name.ru,
+                        built.circuit.parts.len()
+                    );
+                }
+                for &p in &f.pins {
+                    assert!(
+                        p < built.circuit.pins.len(),
+                        "{}: pin {p} of {}",
+                        chk.name.ru,
+                        built.circuit.pins.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_focus_deduplicates_pins_and_names_their_parts() {
+        let built = build_all().pop().unwrap();
+        let f = focus_on_pins(&built.circuit, &[1, 0, 1]);
+        assert_eq!(f.pins, vec![0, 1]);
+        assert!(!f.parts.is_empty());
+        assert!(f.parts.windows(2).all(|w| w[0] < w[1]));
+        assert!(!f.is_empty());
+        assert!(Focus::default().is_empty());
     }
 
     #[test]
