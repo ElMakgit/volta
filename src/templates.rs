@@ -227,7 +227,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         return crate::compose::plan(recipe, lang);
     }
     if let Some(i) = intent.lesson {
-        return Some(lesson_plan(i, lang));
+        return Some(display_lesson_plan(i, crate::parse::screens_in(&intent.raw), lang));
     }
     let tid = route(intent.load, intent.input)?;
     let (title, choices, recommended) = match tid {
@@ -903,6 +903,58 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
     })
 }
 
+/// The display types offered when a sentence names a screen but not its
+/// model. `choice` picks one; a second and third screen reuse it.
+fn display_modules(screens: crate::parse::Screens) -> Vec<(&'static str, &'static str)> {
+    use crate::parse::ScreenKind;
+    match screens.kind {
+        ScreenKind::Oled => vec![("OLED 128×64 (I2C)", "OLED 0.96")],
+        ScreenKind::Lcd => vec![("LCD1602 16×2 (I2C)", "LCD1602")],
+        ScreenKind::Lcd2004 => vec![("LCD2004 20×4 (I2C)", "LCD2004")],
+        ScreenKind::Any => vec![
+            ("OLED 128×64 (I2C)", "OLED 0.96"),
+            ("LCD1602 16×2 (I2C)", "LCD1602"),
+            ("LCD2004 20×4 (I2C)", "LCD2004"),
+        ],
+    }
+}
+
+/// A lesson plus an explicitly named display is no longer a single card: the
+/// reader gets to choose which screen to put on the bench.
+fn display_lesson_plan(i: usize, screens: Option<crate::parse::Screens>, lang: Lang) -> Plan {
+    let base = lesson_plan(i, lang);
+    let Some(screens) = screens else { return base };
+    let level = base.choices[0].level;
+    let choices = display_modules(screens)
+        .into_iter()
+        .map(|(name, _)| Choice {
+            name: L::new(name, name),
+            blurb: L::new(
+                "Экран подключён к шине I2C: SDA на A4, SCL на A5.",
+                "The screen sits on I2C: SDA on A4, SCL on A5.",
+            ),
+            pros: Vec::new(),
+            cons: Vec::new(),
+            specs: vec![
+                spec_line("I2C · A4/A5", L::new("Шина", "Bus")),
+                spec_line(&screens.count.to_string(), L::new("Экранов", "Screens")),
+            ],
+            level,
+        })
+        .collect();
+    Plan {
+        tid: base.tid,
+        title: L::new("Экран для урока", "A display for the lesson"),
+        headline: Some(format!(
+            "{} {}",
+            screens.count,
+            if lang == Lang::Ru { "экранов на I2C" } else { "I2C displays" }
+        )),
+        choices,
+        recommended: 0,
+    }
+}
+
 /// A lesson is a single ready-made design, so the plan window shows one card:
 /// the title, what it teaches, and what sits on the bench.
 fn lesson_plan(i: usize, lang: Lang) -> Plan {
@@ -946,7 +998,12 @@ fn lesson_plan(i: usize, lang: Lang) -> Plan {
 
 /// Build a lesson: the boards it names, their supply from the module table,
 /// the extras with their resistors, and the sketch the book prints.
-fn lesson_build(lang: Lang, i: usize) -> (Circuit, String, L, Vec<L>) {
+fn lesson_build(
+    lang: Lang,
+    i: usize,
+    screens: Option<crate::parse::Screens>,
+    choice: usize,
+) -> (Circuit, String, L, Vec<L>) {
     use crate::lessons::{Extra, LoadKind};
 
     let l = &crate::lessons::ALL[i];
@@ -1125,12 +1182,109 @@ fn lesson_build(lang: Lang, i: usize) -> (Circuit, String, L, Vec<L>) {
         }
     }
 
+    // A sentence that names a screen adds it even when the rest of the task
+    // routes to a lesson: "часы ... на любой тип дисплея" is a clock *with* a
+    // display, and "два экрана" means two of them.
+    if let Some(wish) = screens {
+        let modules = display_modules(wish);
+        let module = modules[choice.min(modules.len() - 1)].1;
+        for n in 0..wish.count {
+            let name = format!("U{}", label);
+            label += 1;
+            let at = Pt::new(2.0 + n as f32 * 36.0, bench_y + 36.0);
+            let disp = b.breakout(&name, module, at);
+            if let Some(m) = crate::modules::find(module) {
+                for (pin, dx, _) in m.pins.iter().copied() {
+                    match pin {
+                        "GND" => b.w(b.mp(disp, pin), b.gnd(at.x + dx), NetClass::Gnd),
+                        "VCC" | "+5V" | "3V3" | "+" => {
+                            b.w(b.mp(disp, pin), b.vcc(at.x + dx), NetClass::Vcc)
+                        }
+                        "SDA" => b.w(b.mp(disp, pin), b.uno_pin("A4"), NetClass::Signal),
+                        "SCL" => b.w(b.mp(disp, pin), b.uno_pin("A5"), NetClass::Signal),
+                        _ => {}
+                    }
+                }
+            }
+            placed.push((at, 30.0));
+        }
+    }
+
     feeds(&mut b);
     let mut notes = l.notes.to_vec();
     if let Some(m) = l.boards.first().and_then(|s| crate::modules::note(s.name)) {
         notes.push(m);
     }
-    (b.finish(), l.code.render(l.title.get(lang)), l.summary, notes)
+    let base_code = l.code.render(l.title.get(lang));
+    let code = if i == 31 && screens.is_some() {
+        clock_display_code(lang, screens.unwrap(), choice.min(display_modules(screens.unwrap()).len() - 1))
+    } else if screens.is_some() {
+        format!("{}\n// Экран по I2C: SDA A4, SCL A5\n{}", base_code, display_note(screens.unwrap(), lang))
+    } else {
+        base_code
+    };
+    (b.finish(), code, l.summary, notes)
+}
+
+fn display_note(screens: crate::parse::Screens, lang: Lang) -> &'static str {
+    use crate::parse::ScreenKind;
+    match screens.kind {
+        ScreenKind::Oled => if lang == Lang::Ru {
+            "// OLED: #include <Adafruit_SSD1306.h>, SDA A4, SCL A5, адрес 0x3C."
+        } else {
+            "// OLED: #include <Adafruit_SSD1306.h>, SDA A4, SCL A5, address 0x3C."
+        },
+        _ => if lang == Lang::Ru {
+            "// LCD I2C: #include <LiquidCrystal_I2C.h>, SDA A4, SCL A5, адрес 0x27."
+        } else {
+            "// LCD I2C: #include <LiquidCrystal_I2C.h>, SDA A4, SCL A5, address 0x27."
+        },
+    }
+}
+
+/// A complete sketch for the clock lesson with one or more I2C displays.
+fn clock_display_code(lang: Lang, screens: crate::parse::Screens, choice: usize) -> String {
+    use crate::parse::ScreenKind;
+    let oled = match screens.kind {
+        ScreenKind::Oled => true,
+        ScreenKind::Any => choice == 0,
+        _ => false,
+    };
+    let mut includes = String::from("#include <Wire.h>\n#include <RTClib.h>\n");
+    if oled {
+        includes.push_str("#include <Adafruit_GFX.h>\n#include <Adafruit_SSD1306.h>\n");
+    } else {
+        includes.push_str("#include <LiquidCrystal_I2C.h>\n");
+    }
+    let mut objects = String::from("RTC_DS3231 rtc;\nuint32_t last = 0;\n");
+    let mut setup = String::from("  Wire.begin();\n  Serial.begin(9600);\n  if (!rtc.begin()) Serial.println(F(\"no RTC\"));\n");
+    let mut show = String::new();
+    for n in 0..screens.count {
+        let name = format!("screen{n}");
+        if oled {
+            let addr = if n == 0 { "0x3C" } else { "0x3D" };
+            objects.push_str(&format!("Adafruit_SSD1306 {name}(128, 64, &Wire, -1);\n"));
+            setup.push_str(&format!("  {name}.begin(SSD1306_SWITCHCAPVCC, {addr});\n  {name}.setTextColor(SSD1306_WHITE);\n"));
+            show.push_str(&format!(
+                "  {name}.clearDisplay();\n  {name}.setCursor(0, 0);\n  {name}.print(buf);\n  {name}.display();\n"
+            ));
+        } else {
+            let addr = if n == 0 { "0x27" } else { "0x26" };
+            let cols = if screens.kind == ScreenKind::Lcd2004 { 20 } else { 16 };
+            let rows = if screens.kind == ScreenKind::Lcd2004 { 4 } else { 2 };
+            objects.push_str(&format!("LiquidCrystal_I2C {name}({addr}, {cols}, {rows});\n"));
+            setup.push_str(&format!("  {name}.init();\n  {name}.backlight();\n"));
+            show.push_str(&format!("  {name}.clear();\n  {name}.setCursor(0, 0);\n  {name}.print(buf);\n"));
+        }
+    }
+    let comment = if lang == Lang::Ru {
+        "// Часы DS3231 с выводом даты и времени на экран по I2C."
+    } else {
+        "// DS3231 clock with the date and time on one or more I2C displays."
+    };
+    format!(
+        "{comment}\n{includes}{objects}\nvoid setup() {{\n{setup}}}\n\nvoid loop() {{\n  if (millis() - last >= 1000) {{\n    last = millis();\n    DateTime now = rtc.now();\n    char buf[16];\n    sprintf(buf, \"%02d:%02d  %02d.%02d\", now.hour(), now.minute(), now.day(), now.month());\n{show}  }}\n}}\n"
+    )
 }
 
 /// Pin placement for parts that sit on the bench, not on the breadboard.
@@ -1976,7 +2130,10 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     }
     if let Some(i) = intent.lesson {
         let plan = lesson_plan(i, lang);
-        let (circuit, code, summary, notes) = lesson_build(lang, i);
+        let screens = crate::parse::screens_in(&intent.raw);
+        let plan = display_lesson_plan(i, screens, lang);
+        let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
+        let (circuit, code, summary, notes) = lesson_build(lang, i, screens, choice);
         return Some(Built {
             tid: Tid::Lesson(i),
             title: plan.title_text(lang),
@@ -3956,6 +4113,27 @@ void loop() {
 mod tests {
     use super::*;
     use crate::parse::{parse, Input, Load};
+
+    #[test]
+    fn a_clock_naming_a_display_gets_one_and_two_gets_two() {
+        use crate::text::Lang;
+        let task = "Составить программу электронных часов с выводом даты и времени с выводом на любой тип дисплея.";
+        let parsed = crate::parse::parse(task);
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.choices.len(), 3, "any display offers a choice");
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let screens = built.circuit.parts().filter(|p| p.value == "OLED 0.96").count();
+        assert_eq!(screens, 1);
+        assert!(built.code.contains("Adafruit_SSD1306"), "{}", built.code);
+        assert!(built.code.contains("rtc.now()"));
+
+        let two = "Составить программу электронных часов с выводом даты и времени на два экрана.";
+        let parsed = crate::parse::parse(two);
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let screens = built.circuit.parts().filter(|p| p.value == "OLED 0.96").count();
+        assert_eq!(screens, 2, "two screens means two boards");
+        assert!(built.code.contains("screen0") && built.code.contains("screen1"));
+    }
 
     #[test]
     fn every_choice_builds_and_is_connected() {

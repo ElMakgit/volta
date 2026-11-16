@@ -466,6 +466,54 @@ fn search_text(raw: &str) -> String {
     out
 }
 
+/// A display asked for in words. A book task names the lesson's sensor, but
+/// the reader still has to honour "на любой тип дисплея" or "два экрана".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenKind {
+    Any,
+    Lcd,
+    Lcd2004,
+    Oled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Screens {
+    pub kind: ScreenKind,
+    pub count: usize,
+}
+
+pub fn screens_in(raw: &str) -> Option<Screens> {
+    let text = crate::words::normalize(raw);
+    let named = ["диспле", "экран", "табло", "lcd", "oled", "display", "128x64", "128 64", "16x2", "2004"];
+    let is_screen = named.iter().any(|k| text.contains(k));
+    if !is_screen || (text.contains("порт") && !text.contains("диспле") && !text.contains("экран")) {
+        return None;
+    }
+    let kind = if text.contains("oled") || text.contains("128x64") || text.contains("128 64") {
+        ScreenKind::Oled
+    } else if text.contains("2004") || text.contains("20 4") {
+        ScreenKind::Lcd2004
+    } else if text.contains("lcd") || text.contains("16x2") {
+        ScreenKind::Lcd
+    } else {
+        ScreenKind::Any
+    };
+    let count = if ["два", "две", "двух", "2", "two", "pair"]
+        .iter()
+        .any(|w| text.split_whitespace().any(|t| t == *w))
+    {
+        2
+    } else if ["три", "трёх", "3", "three"]
+        .iter()
+        .any(|w| text.split_whitespace().any(|t| t == *w))
+    {
+        3
+    } else {
+        1
+    };
+    Some(Screens { kind, count })
+}
+
 pub fn parse(raw: &str) -> Parse {
     parse_inner(raw, true)
 }
