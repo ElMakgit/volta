@@ -531,6 +531,14 @@ pub fn parse(raw: &str) -> Parse {
     // Everyday words like "термометр" stand in for a part only when the
     // sentence names nothing else: "шуметь динамиком" must stay a buzzer.
     let mut lesson = crate::lessons::find_with(&text, !named_load && !transistor);
+    // EEPROM is a way to keep data, not the thing the circuit drives: in
+    // "контроль доступа на 49 карт ... в EEPROM" the reader is named, so the
+    // counter lesson (a button and EEPROM) must not win over the RFID lock.
+    if named_load
+        && lesson.is_some_and(|i| crate::lessons::ALL[i].keys.iter().any(|k| *k == "eeprom"))
+    {
+        lesson = None;
+    }
     // "Пусть лампочка плавно гаснет" is the PWM lesson: same parts as the
     // blink, but the code fades instead of switching.
     if lesson.is_none()

@@ -1581,6 +1581,7 @@ impl App {
             let title_key = match plan.choices.len() {
                 1 => "plan.title.one",
                 2 => "plan.title.two",
+                4 => "plan.title.four",
                 _ => "plan.title",
             };
             let heading = match &plan.headline {

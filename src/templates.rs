@@ -133,6 +133,95 @@ fn level_word(n: u8, lang: Lang) -> String {
     words.get(lang).to_string()
 }
 
+/// A door with cards kept in EEPROM is a scene of its own: the reader is the
+/// input, the lock the output, and the table of cards the memory the task
+/// names. "Контроль доступа на 49 карт ... EEPROM" must not fall back to the
+/// EEPROM counter lesson, which counts button presses.
+pub(crate) fn wants_access(raw: &str) -> bool {
+    let text = crate::words::normalize(raw);
+    let door = text.contains("доступ")
+        || text.contains("пропуск")
+        || text.contains("турникет")
+        || text.contains("замок")
+        || text.contains("access");
+    let store = text.contains("eeprom")
+        || text.contains("энергонезависим")
+        || text.contains("памят");
+    door && store
+}
+
+/// The number of cards a table keeps: the task names it ("на 49 карт"),
+/// otherwise the EEPROM of an Uno takes 49 four-byte UIDs with room to spare.
+fn card_slots(raw: &str) -> Option<usize> {
+    let text = crate::words::normalize(raw);
+    let cut = text.find("карт")?;
+    let mut last = None;
+    for word in text[..cut].split(|ch: char| !ch.is_ascii_digit()) {
+        if let Ok(n) = word.parse::<usize>() {
+            last = Some(n);
+        }
+    }
+    last.filter(|n| (1..=200).contains(n))
+}
+
+fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
+    let choices = vec![
+        quick(
+            lang,
+            L::new("RC522, UID в порт", "RC522, UID to serial"),
+            L::new(
+                "Считыватель по SPI, UID карты выводится в терминал.",
+                "The reader on SPI prints the card UID to the terminal.",
+            ),
+            "30 мА",
+            "средняя",
+            2,
+        ),
+        quick(
+            lang,
+            L::new("RC522 + LCD1602", "RC522 + LCD1602"),
+            L::new(
+                "UID показывается на экране 16×2 по I2C.",
+                "The UID is shown on a 16×2 screen over I2C.",
+            ),
+            "55 мА",
+            "средняя",
+            3,
+        ),
+        quick(
+            lang,
+            L::new("RC522 + реле (замок)", "RC522 + relay (lock)"),
+            L::new(
+                "Своя карта открывает замок на 5 секунд, чужая — нет.",
+                "A known card opens the lock for five seconds, any other does not.",
+            ),
+            "100 мА",
+            "средняя",
+            3,
+        ),
+        quick(
+            lang,
+            L::new(
+                "Замок, карты в EEPROM, OLED 128×64",
+                "Lock, cards in EEPROM, a 128×64 OLED",
+            ),
+            L::new(
+                "Кнопка пишет карту в таблицу EEPROM, знакомая карта открывает замок, экран показывает запись и доступ.",
+                "A button saves a card into an EEPROM table, a known card opens the lock, and the screen shows the saving and the access.",
+            ),
+            "115 мА",
+            "высокая",
+            4,
+        ),
+    ];
+    let recommended = if wants_access(raw) { 3 } else { 0 };
+    (
+        L::new("RFID RC522: чтение метки", "RFID RC522: reading a tag"),
+        choices,
+        recommended,
+    )
+}
+
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
     if let Some(recipe) = intent.recipe {
         return crate::compose::plan(recipe, lang);
@@ -618,45 +707,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             ],
             0,
         ),
-        Tid::Rfid => (
-            L::new("RFID RC522: чтение метки", "RFID RC522: reading a tag"),
-            vec![
-                quick(
-                    lang,
-                    L::new("RC522, UID в порт", "RC522, UID to serial"),
-                    L::new(
-                        "Считыватель по SPI, UID карты выводится в терминал.",
-                        "The reader on SPI prints the card UID to the terminal.",
-                    ),
-                    "30 мА",
-                    "средняя",
-                    2,
-                ),
-                quick(
-                    lang,
-                    L::new("RC522 + LCD1602", "RC522 + LCD1602"),
-                    L::new(
-                        "UID показывается на экране 16×2 по I2C.",
-                        "The UID is shown on a 16×2 screen over I2C.",
-                    ),
-                    "55 мА",
-                    "средняя",
-                    3,
-                ),
-                quick(
-                    lang,
-                    L::new("RC522 + реле (замок)", "RC522 + relay (lock)"),
-                    L::new(
-                        "Своя карта открывает замок на 5 секунд, чужая — нет.",
-                        "A known card opens the lock for five seconds, any other does not.",
-                    ),
-                    "100 мА",
-                    "средняя",
-                    3,
-                ),
-            ],
-            0,
-        ),
+        Tid::Rfid => rfid_plan(lang, &intent.raw),
         Tid::Radio433 => (
             L::new("Радио 433 МГц: передатчик и приёмник", "433 MHz radio: transmitter and receiver"),
             vec![
@@ -1958,7 +2009,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::ServoSweep => servo_sweep(lang, choice),
         Tid::ServoPot => servo_sweep(lang, if choice == 1 { 1 } else { 2 }),
         Tid::BuzzerTone => buzzer_tone(lang, choice),
-        Tid::Rfid => rfid(lang, choice),
+        Tid::Rfid => rfid(lang, choice, card_slots(&intent.raw).unwrap_or(49)),
         Tid::Radio433 => radio433(lang, choice),
         Tid::RadioNrf => radio_nrf(lang, choice),
         Tid::Bluetooth => bluetooth(lang, choice),
@@ -2903,7 +2954,7 @@ fn stepper(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
 
 // ---------------------------------------------------------------- lessons 5-10
 
-fn rfid(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
+fn rfid(lang: Lang, choice: usize, slots: usize) -> (Circuit, String, L, Vec<L>) {
     let mut b = B::new(lang);
     let rc = b.breakout("U2", "RC522", Pt::new(2.0, 54.0));
     let gnd = b.gnd(74.0);
@@ -2945,6 +2996,42 @@ fn rfid(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
                     "Контакты COM/NO идут в цепь замка; питание замка — отдельное.",
                     "COM/NO switch the lock circuit; the lock has its own supply.",
                 )],
+            )
+        }
+        3 => {
+            let oled = b.breakout("DS1", "OLED 0.96", Pt::new(2.0, 122.0));
+            b.w(b.uno_pin("5V"), b.mp(oled, "VCC"), NetClass::Vcc);
+            b.w(b.mp(oled, "GND"), b.gnd(78.0), NetClass::Gnd);
+            b.w(b.uno_pin("A4"), b.mp(oled, "SDA"), NetClass::Signal);
+            b.w(b.uno_pin("A5"), b.mp(oled, "SCL"), NetClass::Signal);
+            let rl = b.bench(Kind::Relay, "K1", "SRD-05VDC", Pt::new(44.0, 122.0));
+            b.w(b.uno_pin("D8"), rl[0], NetClass::Signal);
+            b.w(rl[1], b.vcc(82.0), NetClass::Vcc);
+            b.w(rl[2], gnd, NetClass::Gnd);
+            let btn = b.button("B1", 16, Row::E);
+            b.w(b.uno_pin("D2"), btn[3], NetClass::Signal);
+            b.w(btn[0], gnd, NetClass::Gnd);
+            (
+                b.finish(),
+                access_sketch(lang, slots),
+                L::new(
+                    "Таблица карт живёт в EEPROM, кнопка пишет карту, замок открывается знакомой картой.",
+                    "The card table lives in EEPROM, a button saves a card, and a known card opens the lock.",
+                ),
+                vec![
+                    L::new(
+                        "EEPROM Uno — 1024 байта: заголовок 2 байта и по 4 байта на UID карты.",
+                        "An Uno's EEPROM is 1024 bytes: a 2-byte header and 4 bytes per card UID.",
+                    ),
+                    L::new(
+                        "Пишутся только карты на 4 байта (MIFARE Classic); метки на 7 байт не сохраняются.",
+                        "Only 4-byte UIDs (MIFARE Classic) are saved; 7-byte tags are refused.",
+                    ),
+                    L::new(
+                        "Модуль реле активен низким уровнем: экран и замок питаются от 5 В платы.",
+                        "The relay module is active low; the screen and the lock run from the board's 5 V.",
+                    ),
+                ],
             )
         }
         _ => (
@@ -3426,6 +3513,133 @@ void loop() {
     )
 }
 
+fn access_sketch(lang: Lang, slots: usize) -> String {
+    fill(
+        r#"// <<C0>>
+// D2 — кнопка записи, D8 — реле замка, SPI — RC522, I2C — OLED 128x64
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+
+const uint8_t SS_PIN = 10;
+const uint8_t RST_PIN = 9;
+const uint8_t BTN = 2;
+const uint8_t LOCK = 8;
+const uint8_t MAX_CARDS = <<SLOTS>>;
+const uint8_t MAGIC = 0xA5;
+const uint8_t COUNT = 1;              // число карт в таблице
+const uint8_t TABLE = 2;              // начало таблицы UID
+const uint8_t UID_LEN = 4;
+const uint16_t OPEN_MS = 5000;
+const uint16_t GAP_MS = 300;
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+uint32_t openedAt = 0;
+uint32_t seenAt = 0;
+
+uint8_t stored() {
+  if (EEPROM.read(0) != MAGIC) return 0;
+  uint8_t n = EEPROM.read(COUNT);
+  return n > MAX_CARDS ? MAX_CARDS : n;
+}
+
+bool sameUid(uint8_t slot, const byte *uid) {
+  for (uint8_t k = 0; k < UID_LEN; k++)
+    if (EEPROM.read(TABLE + slot * UID_LEN + k) != uid[k]) return false;
+  return true;
+}
+
+int8_t findCard(const byte *uid) {
+  for (uint8_t i = 0; i < stored(); i++)
+    if (sameUid(i, uid)) return (int8_t)i;
+  return -1;
+}
+
+void saveCard(uint8_t slot, const byte *uid) {
+  for (uint8_t k = 0; k < UID_LEN; k++)
+    EEPROM.update(TABLE + slot * UID_LEN + k, uid[k]);
+  if (slot >= stored()) EEPROM.update(COUNT, slot + 1);
+}
+
+void show(const char *line, const byte *uid) {
+  oled.clearDisplay();
+  oled.setCursor(0, 0);
+  oled.println(line);
+  oled.print(F("cards "));
+  oled.print(stored());
+  oled.print('/');
+  oled.println(MAX_CARDS);
+  if (uid) {
+    for (uint8_t i = 0; i < UID_LEN; i++) {
+      if (uid[i] < 0x10) oled.print('0');
+      oled.print(uid[i], HEX);
+      oled.print(' ');
+    }
+    oled.println();
+  }
+  oled.display();
+}
+
+void setup() {
+  pinMode(LOCK, OUTPUT);
+  digitalWrite(LOCK, HIGH);           // модуль реле активен низким
+  pinMode(BTN, INPUT_PULLUP);
+  Serial.begin(9600);
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Wire.begin();
+  oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  if (EEPROM.read(0) != MAGIC) {
+    EEPROM.update(0, MAGIC);
+    EEPROM.update(COUNT, 0);
+  }
+  show("READY", nullptr);
+}
+
+void loop() {
+  if (digitalRead(LOCK) == LOW && millis() - openedAt >= OPEN_MS) {
+    digitalWrite(LOCK, HIGH);
+  }
+  if (millis() - seenAt < GAP_MS) return;
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+  seenAt = millis();
+
+  bool save = digitalRead(BTN) == LOW;
+  int8_t slot = findCard(mfrc522.uid.uidByte);
+  if (mfrc522.uid.size != UID_LEN) {
+    show("UID IS NOT 4 BYTES", mfrc522.uid.uidByte);
+  } else if (save && slot >= 0) {
+    show("ALREADY SAVED", mfrc522.uid.uidByte);
+  } else if (save && stored() >= MAX_CARDS) {
+    show("TABLE IS FULL", mfrc522.uid.uidByte);
+  } else if (save) {
+    saveCard(stored(), mfrc522.uid.uidByte);
+    show("CARD SAVED", mfrc522.uid.uidByte);
+  } else if (slot >= 0) {
+    digitalWrite(LOCK, LOW);
+    openedAt = millis();
+    show("ACCESS OPEN", mfrc522.uid.uidByte);
+  } else {
+    show("ACCESS DENIED", mfrc522.uid.uidByte);
+  }
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+"#,
+        &[
+            ("C0", tr(lang, "Контроль доступа: таблица карт в EEPROM", "Access control: the card table in EEPROM")),
+            ("SLOTS", &slots.to_string()),
+        ],
+    )
+}
+
 fn radio433_sketch(lang: Lang, choice: usize) -> String {
     match choice {
         1 => fill(
@@ -3789,6 +4003,28 @@ mod tests {
                 "the three choices are the same circuit"
             );
         }
+    }
+
+    /// "Контроль доступа на 49 карт ... EEPROM ... дисплей 128x64" is a lock
+    /// with a card table, not the EEPROM counter lesson: the reader is named,
+    /// the table is remembered, and the screen shows both saving and access.
+    #[test]
+    fn an_access_task_builds_the_card_table() {
+        let text = "Составить программу для МК контроля доступа на 49 карт с их записью в энергозависимую память EEPROM и выводом информации записи и доступа на дисплей 128x64";
+        let p = parse(text);
+        assert_eq!(p.intent.load, Load::Rfid, "reader must be recognised");
+        assert!(p.intent.lesson.is_none(), "the EEPROM lesson must not win");
+        let plan = plan(&p.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.recommended, 3, "the access variant is the default");
+        let built = build(&p.intent, plan.recommended, Lang::Ru).expect("builds");
+        assert!(built.code.contains("#include <EEPROM.h>"), "no EEPROM");
+        assert!(built.code.contains("MAX_CARDS = 49"), "wrong table size");
+        assert!(built.code.contains("Adafruit_SSD1306"), "no OLED");
+        assert!(built.code.contains("MFRC522"), "no reader");
+        let values: Vec<&str> = built.circuit.parts.iter().map(|p| p.value.as_str()).collect();
+        assert!(values.iter().any(|v| v.contains("OLED")), "{values:?}");
+        assert!(values.iter().any(|v| *v == "RC522"), "{values:?}");
+        assert!(!built.code.contains("delay("), "loop must not block");
     }
 
     /// Every lesson from the course book has to plan and build without a

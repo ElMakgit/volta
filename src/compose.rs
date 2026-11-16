@@ -62,6 +62,12 @@ pub fn detect(
     let source = lesson
         .and_then(source_for_lesson)
         .or_else(|| source_in(&text))?;
+    // A lesson that teaches a screen is about the screen itself: "цветной
+    // дисплей 1.44" is a screen, not a colour sensor with an OLED readout.
+    // "Давление на OLED" stays a recipe: its sensor is not the word "цвет".
+    if lesson.is_some_and(screen_lesson) && source.id == SourceId::Color {
+        return None;
+    }
     // A window belongs to one reading. If the sentence names a second
     // sensor, its threshold is not this sensor's: refuse rather than show a
     // range that mixes two boards.
@@ -121,6 +127,17 @@ pub fn detect(
         sink,
         behavior,
         condition,
+    })
+}
+
+/// The lesson's own board is a display: the sentence is about showing
+/// something, not about a sensor that happens to end in a screen.
+fn screen_lesson(i: usize) -> bool {
+    use crate::modules::Look;
+    crate::lessons::ALL[i].boards.iter().any(|b| {
+        crate::modules::find(b.name)
+            .map(|m| matches!(m.look, Look::Lcd | Look::Display | Look::Segments | Look::Matrix | Look::Panel))
+            .unwrap_or(false)
     })
 }
 
