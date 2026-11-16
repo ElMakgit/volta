@@ -24,6 +24,7 @@ pub struct Semantic {
 }
 
 const SOURCES: &[(&str, &[&str])] = &[
+    ("clock", &["часы реальн", "часов", "часы", "время", "дата", "ds3231", "ds1307", "rtc", "clock"]),
     ("temperature", &["температур", "термометр", "термодатчик", "градус", "temperature", "температура"]),
     ("humidity", &["влажност", "humidity", "гигрометр"]),
     ("pressure", &["давлен", "барометр", "pressure", "bmp180", "bme280"]),
@@ -32,7 +33,6 @@ const SOURCES: &[(&str, &[&str])] = &[
     ("distance", &["расстоян", "дальномер", "ультразвук", "hc-sr04", "distance"]),
     ("motion", &["движен", "пиро", "hc-sr501", "motion"]),
     ("sound", &["звук", "шум", "громкост", "sound"]),
-    ("clock", &["часы реальн", "время", "дата", "ds3231", "ds1307", "rtc", "clock"]),
     ("card", &["карт", "rfid", "метк", "rc522", "card"]),
     ("alcohol", &["алкометр", "спирт", "алкогол", "mq-3", "alcohol"]),
 ];
@@ -74,15 +74,17 @@ pub fn analyse(raw: &str) -> Semantic {
     if text.is_empty() {
         return Semantic::default();
     }
-    let source = SOURCES
-        .iter()
-        .find(|(_, keys)| mentions_any(&text, keys))
-        .map(|(name, _)| (*name).to_string());
     let sinks: Vec<String> = SINKS
         .iter()
         .filter(|(_, keys)| mentions_any(&text, keys))
         .map(|(name, _)| (*name).to_string())
         .collect();
+    let has_buzzer = sinks.iter().any(|s| s == "buzzer");
+    let source = SOURCES
+        .iter()
+        .filter(|(name, _)| !(*name == "sound" && has_buzzer))
+        .find(|(_, keys)| mentions_any(&text, keys))
+        .map(|(name, _)| (*name).to_string());
     let condition = if ["выше", "ниже", "больше", "меньше", "равно", "когда", "если", "после", "above", "below"]
         .iter()
         .any(|c| text.contains(c))
