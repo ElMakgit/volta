@@ -3,6 +3,12 @@ name = "volta"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# The exact wording of the course-book tasks is a local-only table: it is
+# omitted from the public source, so this feature is off by default there.
+default = ["book-tasks"]
+book-tasks = []
+
 [dependencies]
 chrono = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

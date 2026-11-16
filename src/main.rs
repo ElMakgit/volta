@@ -4,6 +4,7 @@
 //! The GUI is the default; the same engine answers without a display so an
 //! agent can plan and render circuits too.
 
+#[cfg(feature = "book-tasks")]
 mod book_tasks;
 mod checks;
 mod compose;
