@@ -367,7 +367,7 @@ const WIRE_AN: Rgba = Rgba::rgb(0x2C, 0x7B, 0xD1);
 /// The colour box of a real jumper set, as Tinkercad offers it. Power stays
 /// red and ground black, the way a schematic reads; signal cables take a
 /// colour of their own so a bundle does not look like one wire.
-const WIRE_SIGNALS: [Rgba; 10] = [
+pub const WIRE_PALETTE: [Rgba; 10] = [
     WIRE_SIG,
     Rgba::rgb(0xE8, 0x59, 0x0C), // orange
     WIRE_AN,
@@ -381,6 +381,9 @@ const WIRE_SIGNALS: [Rgba; 10] = [
 ];
 
 fn run_color(w: &Wire) -> Rgba {
+    if let Some(index) = w.colour {
+        return WIRE_PALETTE[index as usize % WIRE_PALETTE.len()];
+    }
     match w.class {
         NetClass::Vcc => WIRE_VCC,
         NetClass::Gnd => WIRE_GND,
@@ -389,7 +392,7 @@ fn run_color(w: &Wire) -> Rgba {
         NetClass::Signal | NetClass::Analog => {
             let h = crate::model::wire_seed(w.a, w.b)
                 .wrapping_add(if w.class == NetClass::Analog { 5 } else { 0 });
-            WIRE_SIGNALS[(h % WIRE_SIGNALS.len() as u32) as usize]
+            WIRE_PALETTE[(h % WIRE_PALETTE.len() as u32) as usize]
         }
     }
 }
@@ -1908,6 +1911,7 @@ mod tests {
             class,
             lift: 0.0,
             via: vec![],
+            colour: None,
             active: true,
         };
         let mut colours = std::collections::BTreeSet::new();

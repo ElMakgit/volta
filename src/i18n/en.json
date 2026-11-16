@@ -203,5 +203,7 @@
   "help.grid": "Grid",
   "save.pdf": "PDF for print",
   "help.language": "Interface language",
-  "help.bench": "Light / dark bench"
+  "help.bench": "Light / dark bench",
+  "wire.colour": "Wire colour",
+  "wire.auto": "Auto"
 }

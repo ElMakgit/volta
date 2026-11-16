@@ -203,5 +203,7 @@
   "help.grid": "Сетка",
   "save.pdf": "PDF для печати",
   "help.language": "Язык интерфейса",
-  "help.bench": "Светлый / тёмный стол"
+  "help.bench": "Светлый / тёмный стол",
+  "wire.colour": "Цвет провода",
+  "wire.auto": "Авто"
 }

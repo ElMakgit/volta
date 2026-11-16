@@ -241,6 +241,7 @@ fn circuit_json(c: &Circuit) -> Value {
                 "class": net_class_name(w.class),
                 "lift": w.lift,
                 "via": via,
+                "colour": w.colour,
                 "active": w.active,
             })
         })
@@ -606,6 +607,7 @@ fn wire_from(v: &Value, pins: usize, cols: u8) -> Result<Wire, String> {
         class,
         lift,
         via,
+        colour: obj.get("colour").and_then(|c| c.as_u64()).and_then(|c| u8::try_from(c).ok()),
         active: obj.get("active").and_then(|a| a.as_bool()).unwrap_or(true),
     })
 }

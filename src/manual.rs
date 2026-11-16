@@ -217,6 +217,7 @@ enum Command {
     SetKind(PartId, Kind, Kind),
     WireClass(WireId, NetClass, NetClass),
     NetName(String, Option<String>, Option<String>),
+    WireColour(WireId, Option<u8>, Option<u8>),
 }
 
 #[derive(Clone, Default)]
@@ -259,6 +260,8 @@ pub struct Draft {
     pub code: Option<String>,
     /// The first end of a wire that is being pulled.
     pub pending: Option<End>,
+    /// Colour chosen for the next cable laid by hand.
+    pub new_wire_colour: Option<u8>,
     pub selected: Option<PartId>,
     /// Everything the user marked with a click or a marquee. `selected` stays
     /// the primary part for the inspector and the rotation key.
@@ -284,6 +287,7 @@ impl Draft {
             module: crate::modules::DEFAULT,
             code: None,
             pending: None,
+            new_wire_colour: None,
             selected: None,
             selected_parts: BTreeSet::new(),
             selected_wires: BTreeSet::new(),
@@ -528,6 +532,11 @@ impl Draft {
                     self.circuit.net_names.remove(key);
                 }
             }
+            Command::WireColour(id, _, new) => {
+                if let Some(w) = self.circuit.wires.get_mut(*id) {
+                    w.colour = *new;
+                }
+            }
         }
     }
 
@@ -591,6 +600,11 @@ impl Draft {
                     self.circuit.net_names.remove(key);
                 }
             }
+            Command::WireColour(id, old, _) => {
+                if let Some(w) = self.circuit.wires.get_mut(*id) {
+                    w.colour = *old;
+                }
+            }
         }
     }
 
@@ -633,6 +647,7 @@ impl Draft {
         self.code = code;
         self.redo.clear();
         self.pending = None;
+        self.new_wire_colour = None;
         self.clear_selection();
     }
 
@@ -824,6 +839,19 @@ impl Draft {
         self.snapshot();
         self.circuit.parts[part].value = value.to_string();
         self.record(Command::Value(part, old, value.to_string()));
+        true
+    }
+
+    /// Paint one cable. `None` gives it back its automatic net colour.
+    pub fn set_wire_colour(&mut self, wire: WireId, colour: Option<u8>) -> bool {
+        let Some(w) = self.circuit.wires.get(wire) else { return false };
+        if !w.active || w.colour == colour {
+            return false;
+        }
+        let old = w.colour;
+        self.snapshot();
+        self.circuit.wires[wire].colour = colour;
+        self.record(Command::WireColour(wire, old, colour));
         true
     }
 
@@ -1125,7 +1153,13 @@ impl Draft {
         }
         self.snapshot();
         let class = self.class_between(a, b);
-        self.add_wire_recorded(a, b, class);
+        let id = self.add_wire_recorded(a, b, class);
+        if let Some(colour) = self.new_wire_colour {
+            if let Some(w) = self.circuit.wires.get_mut(id) {
+                w.colour = Some(colour);
+            }
+            self.record(Command::WireColour(id, None, Some(colour)));
+        }
         true
     }
 
@@ -1778,6 +1812,20 @@ mod tests {
         assert_eq!(d.selected_parts.len(), 1);
         d.clear_selection();
         assert!(d.selected_parts.is_empty());
+    }
+
+    #[test]
+    fn a_cable_can_be_painted_by_hand() {
+        let mut d = Draft::new();
+        d.new_wire_colour = Some(7);
+        let d9 = End::Pin(d.circuit.pin(0, "D9"));
+        let hole = End::Hole(Hole::Col(20, Row::J));
+        assert!(d.connect(d9, hole));
+        assert_eq!(d.circuit.wires[0].colour, Some(7));
+        assert!(d.set_wire_colour(0, None));
+        assert_eq!(d.circuit.wires[0].colour, None);
+        assert!(d.undo());
+        assert_eq!(d.circuit.wires[0].colour, Some(7));
     }
 
     #[test]

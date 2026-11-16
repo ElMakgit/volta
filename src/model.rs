@@ -489,6 +489,9 @@ pub struct Wire {
     /// Corners the user pulled out by hand, in bench millimetres, in the order
     /// the cable passes through them. Empty means the style decides the route.
     pub via: Vec<Pt>,
+    /// A colour picked by the user, as an index into the jumper palette.
+    /// `None` means the colour follows the net class.
+    pub colour: Option<u8>,
     /// False for a removed slot, kept so that wire ids stay valid.
     pub active: bool,
 }
@@ -663,7 +666,7 @@ impl Circuit {
         if a == b {
             return;
         }
-        self.wires.push(Wire { a, b, class, lift, via: Vec::new(), active: true });
+        self.wires.push(Wire { a, b, class, lift, via: Vec::new(), colour: None, active: true });
         self.touch();
     }
 

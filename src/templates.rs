@@ -2123,6 +2123,92 @@ void loop() {
     )
 }
 
+fn first_free_pin(c: &Circuit, uno: usize, used: &std::collections::BTreeSet<String>) -> Option<String> {
+    for name in ["D8", "D7", "D6", "D5", "D4", "D3", "D2", "A0"] {
+        let pin = c.pin(uno, name);
+        if !used.contains(&name.to_string()) && c.pins[pin].pos.x > 0.0 {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Add every device the sentence named but the plan did not include. This
+/// runs on both lessons and templates, so "пьезопищалка + экран" is honoured
+/// wherever the wording also matches a ready-made task.
+fn augment_devices(c: &mut Circuit, code: &mut String, named: crate::parse::NamedDevices, lang: Lang) {
+    let Some(uno) = c.arduino else { return };
+    let used: std::collections::BTreeSet<String> = c
+        .wires()
+        .flat_map(|w| [w.a, w.b])
+        .filter_map(|e| match e {
+            End::Pin(p) => Some(c.pins[p].name.to_string()),
+            _ => None,
+        })
+        .collect();
+    for n in 0..named.buzzer {
+        let Some(pin) = first_free_pin(c, uno, &used) else { break };
+        let at = Pt::new(2.0 + n as f32 * 18.0, 104.0);
+        let specs: Vec<PinSpec> = bench_pins(Kind::Buzzer, "пьезо")
+            .iter()
+            .map(|(name, dx, dy)| PinSpec {
+                name,
+                pos: Pt::new(at.x + dx, at.y + dy),
+                hole: Hole::OffBoard,
+                kind: crate::templates::bench_pin_kind(Kind::Buzzer, "пьезо", name),
+            })
+            .collect();
+        let part = c.add_part(Kind::Buzzer, &format!("BZ{}", n + 1), "пьезо", at, specs, vec![]);
+        let signal = c.pin(part, "+");
+        let ground = c.pin(part, "-");
+        c.wire(End::Pin(signal), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
+        c.wire(End::Pin(ground), End::Pin(c.pin(uno, "GND2")), NetClass::Gnd);
+        if n == 0 {
+            inject_buzzer(code, &pin, named.hourly, lang);
+        }
+    }
+    for n in 0..named.relay {
+        let Some(pin) = first_free_pin(c, uno, &used) else { break };
+        let at = Pt::new(2.0 + n as f32 * 40.0, 112.0);
+        let specs: Vec<PinSpec> = bench_pins(Kind::Relay, "SRD-05VDC")
+            .iter()
+            .map(|(name, dx, dy)| PinSpec {
+                name,
+                pos: Pt::new(at.x + dx, at.y + dy),
+                hole: Hole::OffBoard,
+                kind: crate::templates::bench_pin_kind(Kind::Relay, "SRD-05VDC", name),
+            })
+            .collect();
+        let part = c.add_part(Kind::Relay, &format!("K{}", n + 1), "SRD-05VDC", at, specs, vec![]);
+        c.wire(End::Pin(c.pin(part, "IN")), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
+        c.wire(End::Pin(c.pin(part, "VCC")), End::Pin(c.pin(uno, "5V")), NetClass::Vcc);
+        c.wire(End::Pin(c.pin(part, "GND")), End::Pin(c.pin(uno, "GND2")), NetClass::Gnd);
+    }
+}
+
+fn inject_buzzer(code: &mut String, pin: &str, hourly: bool, lang: Lang) {
+    if code.contains(&format!("BUZZ_PIN = {pin}")) {
+        return;
+    }
+    let decl = format!("const uint8_t BUZZ_PIN = {};\nuint32_t lastBeep = 0;\nuint8_t lastHour = 255;\n", pin.trim_start_matches('D'));
+    if let Some(pos) = code.find("void setup()") {
+        code.insert_str(pos, &decl);
+    }
+    if let Some(pos) = code.find("void setup() {") {
+        code.insert_str(pos + "void setup() {".len(), "\n  pinMode(BUZZ_PIN, OUTPUT);");
+    }
+    let tick = if hourly {
+        "  if (now.hour() != lastHour) { lastHour = now.hour(); tone(BUZZ_PIN, 1800, 80); }\n".to_string()
+    } else if lang == Lang::Ru {
+        "  if (millis() - lastBeep >= 3600000UL) { lastBeep = millis(); tone(BUZZ_PIN, 1800, 80); }\n".to_string()
+    } else {
+        "  if (millis() - lastBeep >= 3600000UL) { lastBeep = millis(); tone(BUZZ_PIN, 1800, 80); }\n".to_string()
+    };
+    if let Some(pos) = code.rfind('}') {
+        code.insert_str(pos, &tick);
+    }
+}
+
 // new build body, spliced into templates.rs
 pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     if let Some(recipe) = intent.recipe {
@@ -2130,10 +2216,16 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     }
     if let Some(i) = intent.lesson {
         let plan = lesson_plan(i, lang);
-        let screens = crate::parse::screens_in(&intent.raw);
+        let screens = crate::parse::named_devices(&intent.raw).screens;
         let plan = display_lesson_plan(i, screens, lang);
         let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
-        let (circuit, code, summary, notes) = lesson_build(lang, i, screens, choice);
+        let (mut circuit, mut code, summary, mut notes) = lesson_build(lang, i, screens, choice);
+        let named = crate::parse::named_devices(&intent.raw);
+        augment_devices(&mut circuit, &mut code, named, lang);
+        notes.push(L::new(
+            "Явно названные в задаче детали добавлены к схеме урока.",
+            "Parts named in the sentence were added to the lesson circuit.",
+        ));
         return Some(Built {
             tid: Tid::Lesson(i),
             title: plan.title_text(lang),
@@ -4133,6 +4225,57 @@ mod tests {
         let screens = built.circuit.parts().filter(|p| p.value == "OLED 0.96").count();
         assert_eq!(screens, 2, "two screens means two boards");
         assert!(built.code.contains("screen0") && built.code.contains("screen1"));
+    }
+
+    /// A ladder from nonsense to precise multi-device tasks: every rung must
+    /// answer without panicking, and the precise ones must add what they name.
+    #[test]
+    fn auto_assembly_from_dumb_to_precise() {
+        use crate::text::Lang;
+        let cases: &[(&str, bool, fn(&Built) -> bool)] = &[
+            ("", false, |_| true),
+            ("как дела", false, |_| true),
+            ("сделай что-нибудь", false, |_| true),
+            ("светодиод", true, |b| b.code.contains("void loop()")),
+            ("зажечь светодиод", true, |b| b.code.contains("void loop()")),
+            ("часы реального времени", true, |b| !b.code.is_empty()),
+            (
+                "Составить программу электронных часов с выводом даты и времени с выводом на любой тип дисплея.",
+                true,
+                |b| b.circuit.parts().any(|p| p.value == "OLED 0.96"),
+            ),
+            (
+                "Составить программу электронных часов с выводом даты и времени на два экрана.",
+                true,
+                |b| b.circuit.parts().filter(|p| p.value == "OLED 0.96").count() == 2,
+            ),
+            (
+                "Составить программу электронных часов с пьезопищалкой для выдачи звука каждый час с выводом на любой тип дисплея.",
+                true,
+                |b| b.circuit.parts().any(|p| p.value == "пьезо")
+                    && b.circuit.parts().any(|p| p.value == "OLED 0.96")
+                    && b.code.contains("tone("),
+            ),
+            (
+                "Составить программу для МК контроля доступа на 49 карт с их записью в энергозависимую память EEPROM и выводом информации записи и доступа на дисплей 128x64",
+                true,
+                |b| b.code.contains("MAX_CARDS = 49"),
+            ),
+            ("температура выше 30 включи вентилятор", true, |b| !b.code.is_empty()),
+            ("газ выше 400 включи сирену", true, |b| !b.code.is_empty()),
+            ("включи музыку", false, |_| true),
+        ];
+        for (task, should_build, check) in cases {
+            let parsed = crate::parse::parse(task);
+            let built = plan(&parsed.intent, Lang::Ru).and_then(|p| {
+                build(&parsed.intent, p.recommended, Lang::Ru)
+            });
+            match (should_build, built) {
+                (false, _) => {}
+                (true, Some(b)) => assert!(check(&b), "unexpected build for {task:?}"),
+                (true, None) => panic!("{task:?} should build"),
+            }
+        }
     }
 
     #[test]

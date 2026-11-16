@@ -277,6 +277,7 @@ enum InspectAction {
     Rotate,
     WireClass(NetClass),
     NetName(String),
+    WireColour(Option<u8>),
     ClearVias,
 }
 
@@ -1877,6 +1878,12 @@ impl App {
             });
         });
 
+        if self.tool == Tool::Wire {
+            ui.label(RichText::new(self.t("wire.colour")).size(10.5).color(muted));
+            if let Some(colour) = self.colour_swatches(ui, self.draft.new_wire_colour) {
+                self.draft.new_wire_colour = colour;
+            }
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let has_part = self.draft.selected_part().is_some();
@@ -3657,6 +3664,31 @@ impl App {
         }
     }
 
+    /// A row of jumper colours. `None` is the automatic net colour.
+    fn colour_swatches(&self, ui: &mut egui::Ui, current: Option<u8>) -> Option<Option<u8>> {
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(current.is_none(), "A")
+                .on_hover_text(self.t("wire.auto"))
+                .clicked()
+            {
+                picked = Some(None);
+            }
+            for (i, colour) in crate::scene::WIRE_PALETTE.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::click());
+                ui.painter().rect_filled(rect, CornerRadius::same(3), self.c32(*colour));
+                if current == Some(i as u8) {
+                    ui.painter().rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.5, Color32::WHITE), StrokeKind::Outside);
+                }
+                if resp.clicked() {
+                    picked = Some(Some(i as u8));
+                }
+            }
+        });
+        picked
+    }
+
     /// The property inspector: reference, value and rotation of a selected
     /// part, or the net class and hand bends of the active cable.
     fn value_window(
@@ -3814,6 +3846,13 @@ impl App {
                             action = Some(InspectAction::NetName(self.inspect_net.clone()));
                         }
                     });
+                    ui.label(RichText::new(self.t("wire.colour")).size(11.0).color(muted));
+                    if let Some(colour) = self.colour_swatches(
+                        ui,
+                        wire.and_then(|i| self.draft.circuit.wires[i].colour),
+                    ) {
+                        action = Some(InspectAction::WireColour(colour));
+                    }
                     ui.label(
                         RichText::new(format!("{}: {}", self.t("inspect.vias"), via_count))
                             .size(11.0)
@@ -3838,6 +3877,9 @@ impl App {
             }
             Some(InspectAction::NetName(name)) => {
                 wire.is_some_and(|i| self.draft.set_net_name(i, &name))
+            }
+            Some(InspectAction::WireColour(colour)) => {
+                wire.is_some_and(|i| self.draft.set_wire_colour(i, colour))
             }
             Some(InspectAction::ClearVias) => wire.is_some_and(|i| self.draft.clear_vias(i)),
             None => false,

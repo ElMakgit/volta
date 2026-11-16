@@ -482,6 +482,48 @@ pub struct Screens {
     pub count: usize,
 }
 
+/// Everything the user named outright. A ready-made lesson or a template is
+/// a starting point, not an excuse to drop parts the sentence asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NamedDevices {
+    pub screens: Option<Screens>,
+    pub buzzer: usize,
+    pub relay: usize,
+    pub led: usize,
+    pub motor: usize,
+    pub button: usize,
+    pub hourly: bool,
+}
+
+fn count_of(text: &str, words: &[&str]) -> usize {
+    if !words.iter().any(|w| text.contains(w)) {
+        return 0;
+    }
+    for (word, n) in [
+        ("четыре", 4usize), ("четырёх", 4), ("4", 4), ("три", 3), ("трёх", 3), ("3", 3),
+        ("два", 2), ("две", 2), ("двух", 2), ("2", 2),
+    ] {
+        if text.split_whitespace().any(|t| t == word) {
+            return n;
+        }
+    }
+    1
+}
+
+pub fn named_devices(raw: &str) -> NamedDevices {
+    let text = crate::words::normalize(raw);
+    NamedDevices {
+        screens: screens_in(raw),
+        buzzer: count_of(&text, &["пьезо", "пищал", "зуммер", "сирен", "buzzer", "gong"]),
+        relay: count_of(&text, &["реле", "relay"]),
+        led: count_of(&text, &["светодиод", "led", "индик"]) ,
+        motor: count_of(&text, &["двигател", "мотор", "motor", "вентилятор", "насос"]),
+        button: count_of(&text, &["кнопк", "button", "переключател"]),
+        hourly: text.contains("каждый час") || text.contains("раз в час")
+            || text.contains("hourly") || text.contains("every hour"),
+    }
+}
+
 pub fn screens_in(raw: &str) -> Option<Screens> {
     let text = crate::words::normalize(raw);
     let named = ["диспле", "экран", "табло", "lcd", "oled", "display", "128x64", "128 64", "16x2", "2004"];
@@ -654,7 +696,18 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // A sensor plus a verb is a composition, not merely the lesson that
     // teaches the sensor: "датчик газа, который мигает" becomes a circuit.
     let condition = spoken_condition(raw);
-    let recipe = crate::compose::detect(raw, load, named_load, lesson, action, condition);
+    // "пьезопищалка" in a clock task is a buzzer, not a sound sensor. Never
+    // turn an RTC build into a microphone readout because of that word.
+    let clock_tick = text.contains("часы реальн")
+        || text.contains("ds3231")
+        || text.contains("ds1307")
+        || text.contains("rtc");
+    let beeper = text.contains("пищал") || text.contains("buzzer") || text.contains("зуммер");
+    let recipe = if clock_tick && beeper {
+        None
+    } else {
+        crate::compose::detect(raw, load, named_load, lesson, action, condition)
+    };
     let mut refusal = None;
     if let Some(r) = recipe {
         if !crate::compose::fits(r) {
