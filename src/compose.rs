@@ -402,6 +402,7 @@ pub fn plan(c: Composition, lang: Lang) -> Option<Plan> {
         headline: Some(headline),
         choices,
         recommended: 0,
+        why: None,
     })
 }
 

@@ -1755,6 +1755,10 @@ impl App {
                 None => self.t(title_key).to_string(),
             };
             ui.label(RichText::new(heading).size(15.0).strong().color(fg));
+            if let Some(why) = &plan.why {
+                ui.add_space(3.0);
+                ui.label(RichText::new(why).size(10.5).color(muted));
+            }
             ui.add_space(6.0);
 
             let mut pick = None;

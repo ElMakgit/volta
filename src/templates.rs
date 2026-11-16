@@ -76,6 +76,8 @@ pub struct Plan {
     pub headline: Option<String>,
     pub choices: Vec<Choice>,
     pub recommended: usize,
+    /// Why this plan was chosen, shown under the variants.
+    pub why: Option<String>,
 }
 
 impl Plan {
@@ -222,12 +224,46 @@ fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
     )
 }
 
+/// A short, visible reason for the chosen plan, built from the same roles the
+/// parser used, so the UI never claims more than it understood.
+fn explain(raw: &str, lang: Lang) -> Option<String> {
+    let s = crate::semantics::analyse(raw);
+    if s.confidence == 0.0 {
+        return None;
+    }
+    let ru = lang == Lang::Ru;
+    let source = s.source.unwrap_or_else(|| if ru { "не назван".into() } else { "unnamed".into() });
+    let sinks = if s.sinks.is_empty() {
+        if ru { "нет" } else { "none" }.to_string()
+    } else {
+        s.sinks.join(", ")
+    };
+    let extra = crate::parse::named_devices(raw);
+    let mut parts = Vec::new();
+    if extra.screens.is_some() { parts.push(if ru { "экран" } else { "display" }); }
+    if extra.buzzer > 0 { parts.push(if ru { "пищалка" } else { "buzzer" }); }
+    if extra.relay > 0 { parts.push(if ru { "реле" } else { "relay" }); }
+    let add = if parts.is_empty() { String::new() } else {
+        format!("; {}: {}", if ru { "добавлено" } else { "added" }, parts.join(", "))
+    };
+    let when = match s.period_ms {
+        Some(ms) => format!("; {} {} мс", if ru { "период" } else { "period" }, ms),
+        None => String::new(),
+    };
+    let conf = format!("; {} {:.0}%", if ru { "уверенность" } else { "confidence" }, s.confidence * 100.0);
+    Some(format!("{}: {} → {}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, conf))
+}
+
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
     if let Some(recipe) = intent.recipe {
-        return crate::compose::plan(recipe, lang);
+        let mut p = crate::compose::plan(recipe, lang)?;
+        p.why = explain(&intent.raw, lang);
+        return Some(p);
     }
     if let Some(i) = intent.lesson {
-        return Some(display_lesson_plan(i, crate::parse::screens_in(&intent.raw), lang));
+        let mut p = display_lesson_plan(i, crate::parse::named_devices(&intent.raw).screens, lang);
+        p.why = explain(&intent.raw, lang);
+        return Some(p);
     }
     let tid = route(intent.load, intent.input)?;
     let (title, choices, recommended) = match tid {
@@ -900,6 +936,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         headline: None,
         choices,
         recommended,
+        why: None,
     })
 }
 
@@ -952,6 +989,7 @@ fn display_lesson_plan(i: usize, screens: Option<crate::parse::Screens>, lang: L
         )),
         choices,
         recommended: 0,
+        why: None,
     }
 }
 
@@ -993,6 +1031,7 @@ fn lesson_plan(i: usize, lang: Lang) -> Plan {
             level: l.level,
         }],
         recommended: 0,
+        why: None,
     }
 }
 
@@ -1256,7 +1295,7 @@ fn clock_display_code(lang: Lang, screens: crate::parse::Screens, choice: usize)
     } else {
         includes.push_str("#include <LiquidCrystal_I2C.h>\n");
     }
-    let mut objects = String::from("RTC_DS3231 rtc;\nuint32_t last = 0;\n");
+    let mut objects = String::from("RTC_DS3231 rtc;\nconst uint32_t PERIOD_MS = 1000;\nuint32_t last = 0;\n");
     let mut setup = String::from("  Wire.begin();\n  Serial.begin(9600);\n  if (!rtc.begin()) Serial.println(F(\"no RTC\"));\n");
     let mut show = String::new();
     for n in 0..screens.count {
@@ -1283,7 +1322,7 @@ fn clock_display_code(lang: Lang, screens: crate::parse::Screens, choice: usize)
         "// DS3231 clock with the date and time on one or more I2C displays."
     };
     format!(
-        "{comment}\n{includes}{objects}\nvoid setup() {{\n{setup}}}\n\nvoid loop() {{\n  if (millis() - last >= 1000) {{\n    last = millis();\n    DateTime now = rtc.now();\n    char buf[16];\n    sprintf(buf, \"%02d:%02d  %02d.%02d\", now.hour(), now.minute(), now.day(), now.month());\n{show}  }}\n}}\n"
+        "{comment}\n{includes}{objects}\nvoid setup() {{\n{setup}}}\n\nvoid loop() {{\n  if (millis() - last >= PERIOD_MS) {{\n    last = millis();\n    DateTime now = rtc.now();\n    char buf[16];\n    sprintf(buf, \"%02d:%02d  %02d.%02d\", now.hour(), now.minute(), now.day(), now.month());\n{show}  }}\n}}\n"
     )
 }
 
@@ -2123,31 +2162,22 @@ void loop() {
     )
 }
 
-fn first_free_pin(c: &Circuit, uno: usize, used: &std::collections::BTreeSet<String>) -> Option<String> {
-    for name in ["D8", "D7", "D6", "D5", "D4", "D3", "D2", "A0"] {
-        let pin = c.pin(uno, name);
-        if !used.contains(&name.to_string()) && c.pins[pin].pos.x > 0.0 {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
 /// Add every device the sentence named but the plan did not include. This
 /// runs on both lessons and templates, so "пьезопищалка + экран" is honoured
 /// wherever the wording also matches a ready-made task.
-fn augment_devices(c: &mut Circuit, code: &mut String, named: crate::parse::NamedDevices, lang: Lang) {
+fn augment_devices(
+    c: &mut Circuit,
+    code: &mut String,
+    named: crate::parse::NamedDevices,
+    lang: Lang,
+    ledger: &mut crate::resources::Resources,
+) {
     let Some(uno) = c.arduino else { return };
-    let used: std::collections::BTreeSet<String> = c
-        .wires()
-        .flat_map(|w| [w.a, w.b])
-        .filter_map(|e| match e {
-            End::Pin(p) => Some(c.pins[p].name.to_string()),
-            _ => None,
-        })
-        .collect();
     for n in 0..named.buzzer {
-        let Some(pin) = first_free_pin(c, uno, &used) else { break };
+        let Some(pin) = ledger.claim_pin(&["D8", "D7", "D6", "D5", "D4", "D3", "D2", "A0"]) else { break };
+        if !ledger.claim_current(15) {
+            break;
+        }
         let at = Pt::new(2.0 + n as f32 * 18.0, 104.0);
         let specs: Vec<PinSpec> = bench_pins(Kind::Buzzer, "пьезо")
             .iter()
@@ -2163,12 +2193,12 @@ fn augment_devices(c: &mut Circuit, code: &mut String, named: crate::parse::Name
         let ground = c.pin(part, "-");
         c.wire(End::Pin(signal), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
         c.wire(End::Pin(ground), End::Pin(c.pin(uno, "GND2")), NetClass::Gnd);
-        if n == 0 {
-            inject_buzzer(code, &pin, named.hourly, lang);
-        }
     }
     for n in 0..named.relay {
-        let Some(pin) = first_free_pin(c, uno, &used) else { break };
+        let Some(pin) = ledger.claim_pin(&["D8", "D7", "D6", "D5", "D4", "D3", "D2", "A0"]) else { break };
+        if !ledger.claim_current(30) {
+            break;
+        }
         let at = Pt::new(2.0 + n as f32 * 40.0, 112.0);
         let specs: Vec<PinSpec> = bench_pins(Kind::Relay, "SRD-05VDC")
             .iter()
@@ -2186,26 +2216,14 @@ fn augment_devices(c: &mut Circuit, code: &mut String, named: crate::parse::Name
     }
 }
 
-fn inject_buzzer(code: &mut String, pin: &str, hourly: bool, lang: Lang) {
-    if code.contains(&format!("BUZZ_PIN = {pin}")) {
-        return;
+/// Apply the numbers the user actually said to a generated sketch.
+fn apply_spoken_numbers(code: &mut String, raw: &str) {
+    let sem = crate::semantics::analyse(raw);
+    if let Some(presses) = sem.after_presses {
+        *code = code.replace("STEPS = 6", &format!("STEPS = {}", presses.min(255)));
     }
-    let decl = format!("const uint8_t BUZZ_PIN = {};\nuint32_t lastBeep = 0;\nuint8_t lastHour = 255;\n", pin.trim_start_matches('D'));
-    if let Some(pos) = code.find("void setup()") {
-        code.insert_str(pos, &decl);
-    }
-    if let Some(pos) = code.find("void setup() {") {
-        code.insert_str(pos + "void setup() {".len(), "\n  pinMode(BUZZ_PIN, OUTPUT);");
-    }
-    let tick = if hourly {
-        "  if (now.hour() != lastHour) { lastHour = now.hour(); tone(BUZZ_PIN, 1800, 80); }\n".to_string()
-    } else if lang == Lang::Ru {
-        "  if (millis() - lastBeep >= 3600000UL) { lastBeep = millis(); tone(BUZZ_PIN, 1800, 80); }\n".to_string()
-    } else {
-        "  if (millis() - lastBeep >= 3600000UL) { lastBeep = millis(); tone(BUZZ_PIN, 1800, 80); }\n".to_string()
-    };
-    if let Some(pos) = code.rfind('}') {
-        code.insert_str(pos, &tick);
+    if let Some(ms) = sem.period_ms {
+        *code = code.replace("PERIOD_MS = 1000", &format!("PERIOD_MS = {ms}"));
     }
 }
 
@@ -2215,13 +2233,15 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         return crate::compose::build(recipe, choice, lang);
     }
     if let Some(i) = intent.lesson {
-        let plan = lesson_plan(i, lang);
         let screens = crate::parse::named_devices(&intent.raw).screens;
         let plan = display_lesson_plan(i, screens, lang);
         let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
         let (mut circuit, mut code, summary, mut notes) = lesson_build(lang, i, screens, choice);
         let named = crate::parse::named_devices(&intent.raw);
-        augment_devices(&mut circuit, &mut code, named, lang);
+        let mut ledger = crate::resources::Resources::new(&circuit);
+        augment_devices(&mut circuit, &mut code, named, lang, &mut ledger);
+        crate::codegen::augment_from_circuit(&circuit, &mut code, named.hourly, lang);
+        apply_spoken_numbers(&mut code, &intent.raw);
         notes.push(L::new(
             "Явно названные в задаче детали добавлены к схеме урока.",
             "Parts named in the sentence were added to the lesson circuit.",
@@ -2246,7 +2266,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             "Presses are counted on the falling edge with 30 ms debounce; holding adds no steps.",
         ));
     }
-    let (circuit, code, summary, extra) = match tid {
+    let (circuit, mut code, summary, extra) = match tid {
         Tid::MotorSteps => motor_steps(lang, choice),
         Tid::MotorPot => motor_pot(lang, choice),
         Tid::MotorTest => motor_test(lang, choice),
@@ -2267,6 +2287,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::Composed => return crate::compose::build(intent.recipe?, choice, lang),
         Tid::Lesson(_) => return None,
     };
+    apply_spoken_numbers(&mut code, &intent.raw);
     notes.extend(extra);
     Some(Built {
         tid,
@@ -4229,6 +4250,20 @@ mod tests {
 
     /// A ladder from nonsense to precise multi-device tasks: every rung must
     /// answer without panicking, and the precise ones must add what they name.
+    #[test]
+    fn spoken_numbers_reach_the_sketch() {
+        use crate::text::Lang;
+        let presses = crate::parse::parse("увеличить скорость после 3 нажатий кнопкой на MOSFET");
+        let built = build(&presses.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.code.contains("STEPS = 3"), "{}", built.code);
+
+        let period = crate::parse::parse(
+            "часы DS3231 с выводом времени на экран раз в 5 секунд",
+        );
+        let built = build(&period.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.code.contains("PERIOD_MS = 5000"), "{}", built.code);
+    }
+
     #[test]
     fn auto_assembly_from_dumb_to_precise() {
         use crate::text::Lang;

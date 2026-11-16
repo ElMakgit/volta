@@ -7,6 +7,7 @@
 #[cfg(feature = "book-tasks")]
 mod book_tasks;
 mod checks;
+mod codegen;
 mod compose;
 mod config;
 mod icons;
@@ -20,7 +21,10 @@ mod paths;
 mod pdf;
 mod png;
 mod project;
+mod registry;
+mod resources;
 mod scene;
+mod semantics;
 mod spec;
 mod style;
 mod svg;
