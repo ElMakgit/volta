@@ -378,8 +378,8 @@ fn cmd_list() {
         (
             text::L::new("композиции", "compositions"),
             text::L::new(
-                "13 датчиков → светодиод, пищалка или реле; порог из фразы",
-                "13 sensors → LED, buzzer or relay; the threshold from the sentence",
+                "16 датчиков → светодиод, пищалка или реле; порог из фразы",
+                "16 sensors → LED, buzzer or relay; the threshold from the sentence",
             ),
         ),
         (

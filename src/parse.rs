@@ -510,7 +510,7 @@ pub fn parse(raw: &str) -> Parse {
     // A sensor plus a verb is a composition, not merely the lesson that
     // teaches the sensor: "датчик газа, который мигает" becomes a circuit.
     let condition = spoken_condition(raw);
-    let recipe = crate::compose::detect(raw, load, lesson, action, condition);
+    let recipe = crate::compose::detect(raw, load, named_load, lesson, action, condition);
     let mut refusal = None;
     if let Some(r) = recipe {
         if !crate::compose::fits(r) {

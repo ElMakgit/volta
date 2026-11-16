@@ -15,6 +15,7 @@ use crate::text::{tr, Lang, L};
 pub fn detect(
     raw: &str,
     load: Load,
+    named_load: bool,
     lesson: Option<usize>,
     action: Option<Action>,
     condition: Option<Condition>,
@@ -34,7 +35,10 @@ pub fn detect(
         action,
         Some(Action::Blink | Action::Alarm | Action::Toggle)
     );
-    if !asks_action && !explicit_sink {
+    // A named output plus a spoken threshold is a request too: "цвет выше
+    // 300, светодиод" has no verb, but it is plainly a lamp on a condition.
+    let asks_condition = named_load && condition.is_some();
+    if !asks_action && !explicit_sink && !asks_condition {
         return None;
     }
     // A sensor named with an everyday word ("температура", "давление") is
@@ -419,19 +423,19 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
     let (extra, action) = match (r.sink, r.behavior) {
         (SinkId::Led, Behavior::Blink) => (
             "bool lit = false;\n",
-            "  if (active) {\n    lit = !lit;\n    digitalWrite(OUT, lit ? HIGH : LOW);\n  } else {\n    lit = false;\n    digitalWrite(OUT, LOW);\n  }\n",
+            "  if (active) {\n    lit = !lit;\n    digitalWrite(SINK_PIN, lit ? HIGH : LOW);\n  } else {\n    lit = false;\n    digitalWrite(SINK_PIN, LOW);\n  }\n",
         ),
         (SinkId::Led, _) => (
             "",
-            "  digitalWrite(OUT, active ? HIGH : LOW);\n",
+            "  digitalWrite(SINK_PIN, active ? HIGH : LOW);\n",
         ),
         (SinkId::Buzzer, _) => (
             "",
-            "  if (active) {\n    tone(OUT, 1200);\n  } else {\n    noTone(OUT);\n  }\n",
+            "  if (active) {\n    tone(SINK_PIN, 1200);\n  } else {\n    noTone(SINK_PIN);\n  }\n",
         ),
         (SinkId::Relay, _) => (
             "",
-            "  digitalWrite(OUT, active ? LOW : HIGH);\n",
+            "  digitalWrite(SINK_PIN, active ? LOW : HIGH);\n",
         ),
     };
     let title = format!(
@@ -442,12 +446,12 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
     let mut s = String::from(
         r#"// <<C0>>
 <<INCLUDES>><<GLOBALS>>
-const uint8_t OUT = <<OUTNUM>>;
+const uint8_t SINK_PIN = <<OUTNUM>>;
 const uint16_t PERIOD_MS = <<PERIOD>>;
 uint32_t last = 0;
 <<EXTRA>>
 void setup() {
-<<SETUP>>  pinMode(OUT, OUTPUT);
+<<SETUP>>  pinMode(SINK_PIN, OUTPUT);
   Serial.begin(9600);
 }
 
@@ -629,7 +633,7 @@ mod tests {
                 .unwrap_or(false)
         };
         assert!(uses("D9"));
-        assert!(!built.code.contains("const uint8_t OUT = 9;"));
+        assert!(!built.code.contains("const uint8_t SINK_PIN = 9;"));
     }
 
     /// The sentence threshold is used, not the default.

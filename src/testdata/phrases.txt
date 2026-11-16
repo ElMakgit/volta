@@ -370,6 +370,12 @@ motion turns on the led | compose:Motion/Led/Solid
 humidity above 60 relay | compose:Humidity/Relay/Switch
 pressure below 740 relay | compose:Pressure/Relay/Switch
 sound above 500 blinks | compose:Sound/Led/Blink
+наклон больше 0,5 пищалка | compose:Tilt/Buzzer/Beep
+вес выше 100 реле | compose:Weight/Relay/Switch
+датчик цвета мигает | compose:Color/Led/Blink
+красный цвет выше 300 светодиод | compose:Color/Led/Blink
+weight above 100 relay | compose:Weight/Relay/Switch
+colour above 300 led | compose:Color/Led/Blink
 
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse
