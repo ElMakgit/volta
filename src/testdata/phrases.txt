@@ -340,6 +340,37 @@ mq-2 включает светодиод при газе | lesson:13
 датчик газа и светодиод | lesson:13
 датчик света который мигает | lesson:9
 
+# ---------- композиции: источник · условие · приёмник ----------
+датчик газа мигает | compose:Gas/Led/Blink
+датчик газа мигает когда газ выше 700 | compose:Gas/Led/Blink
+газовый датчик мигает лампой | compose:Gas/Led/Blink
+датчик газа пищит | compose:Gas/Buzzer/Beep
+газ выше 400 реле | compose:Gas/Relay/Switch
+датчик света мигает | compose:Light/Led/Blink
+фоторезистор включает светодиод | compose:Light/Led/Solid
+термистор выше 40 пищалка | compose:Temperature/Buzzer/Beep
+температура ниже 18 реле | compose:Temperature/Relay/Switch
+влажность выше 60 реле | compose:Humidity/Relay/Switch
+давление ниже 740 реле | compose:Pressure/Relay/Switch
+датчик движения включает светодиод | compose:Motion/Led/Solid
+есть движение включи светодиод | compose:Motion/Led/Solid
+расстояние меньше 20 пищалка | compose:Range/Buzzer/Beep
+дальномер меньше 20 см пищит | compose:Range/Buzzer/Beep
+датчик звука пищит | compose:Sound/Buzzer/Beep
+датчик линии включает реле | compose:Line/Relay/Switch
+датчик холла включает светодиод | compose:Hall/Led/Solid
+датчик радиации выше 10 реле | compose:Radiation/Relay/Switch
+ток выше 1,5 ампер реле | compose:Current/Relay/Switch
+спирт выше 400 пищит | compose:Alcohol/Buzzer/Beep
+temperature above 40 buzzer | compose:Temperature/Buzzer/Beep
+light sensor that blinks | compose:Light/Led/Blink
+gas above 400 relay | compose:Gas/Relay/Switch
+distance below 20 buzzer | compose:Range/Buzzer/Beep
+motion turns on the led | compose:Motion/Led/Solid
+humidity above 60 relay | compose:Humidity/Relay/Switch
+pressure below 740 relay | compose:Pressure/Relay/Switch
+sound above 500 blinks | compose:Sound/Led/Blink
+
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse
 напиши стихи | refuse

@@ -77,7 +77,62 @@ pub struct Intent {
     pub lesson: Option<usize>,
     /// The verb of the task, when one was recognised.
     pub action: Option<Action>,
+    /// A threshold the sentence named: "выше 700", "ниже 20".
+    pub condition: Option<crate::spec::Condition>,
+    /// A sensor, a condition and a sink: the sentence asks for a built
+    /// circuit rather than for the lesson that teaches the sensor.
+    pub recipe: Option<crate::spec::Composition>,
     pub raw: String,
+}
+
+/// The threshold a sentence names: "выше 700", "меньше 20 см", "ниже 1,5 А".
+/// Only a number right after the comparison word counts, so an unrelated
+/// number elsewhere in the sentence is not mistaken for a threshold.
+fn spoken_condition(raw: &str) -> Option<crate::spec::Condition> {
+    use crate::spec::Condition;
+    let text = raw.to_lowercase().replace('ё', "е");
+    let mut words: Vec<String> = Vec::new();
+    let mut acc = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '.' || ch == ',' || ch == '-' {
+            acc.push(ch);
+        } else if !acc.is_empty() {
+            words.push(std::mem::take(&mut acc));
+        }
+    }
+    if !acc.is_empty() {
+        words.push(acc);
+    }
+    let directions: [(&str, bool); 9] = [
+        ("выше", true),
+        ("больше", true),
+        ("свыше", true),
+        ("ниже", false),
+        ("меньше", false),
+        ("above", true),
+        ("over", true),
+        ("below", false),
+        ("under", false),
+    ];
+    for (i, word) in words.iter().enumerate() {
+        let Some((_, above)) = directions.iter().find(|(d, _)| word.starts_with(d)) else {
+            continue;
+        };
+        // Numbers stay within the next couple of words, so "выше порога 700"
+        // still reads as a threshold.
+        for next in words.iter().skip(i + 1).take(2) {
+            let value = next.trim_end_matches(['.', '-']);
+            let value = value.replace(',', ".");
+            if let Ok(n) = value.parse::<f32>() {
+                return Some(if *above {
+                    Condition::Above(n)
+                } else {
+                    Condition::Below(n)
+                });
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -248,13 +303,14 @@ const DISPLAY: Group = Group {
 };
 const ALARM: Group = Group {
     words: &[
-        "сигнал", "тревог", "оповещ", "предупред", "alarm", "alert", "warn",
+        "сигнал", "тревог", "оповещ", "предупред", "пищ", "alarm", "alert", "warn",
     ],
     label: L::new("сигнал", "alarm"),
 };
 const TOGGLE: Group = Group {
     words: &[
-        "включ", "выключ", "переключ", "toggle", "on off", "switch on",
+        "включ", "выключ", "переключ", "toggle", "on off", "switch on", "turn on", "turn off",
+        "turns on", "turns off", "enable", "disable",
     ],
     label: L::new("включение и выключение", "on and off"),
 };
@@ -451,13 +507,36 @@ pub fn parse(raw: &str) -> Parse {
     if let Some(a) = action {
         understood.push(a.label());
     }
+    // A sensor plus a verb is a composition, not merely the lesson that
+    // teaches the sensor: "датчик газа, который мигает" becomes a circuit.
+    let condition = spoken_condition(raw);
+    let recipe = crate::compose::detect(raw, load, lesson, action, condition);
+    let mut refusal = None;
+    if let Some(r) = recipe {
+        if !crate::compose::fits(r) {
+            refusal = Some(L::new(
+                "У этого датчика не осталось свободного выхода для приёмника: все его пины заняты. Выбери другой приёмник или другой способ чтения.",
+                "This sensor leaves no free pin for the output: every pin it uses is taken. Pick another output or another way of reading it.",
+            ));
+        }
+    }
+    if let Some(c) = condition {
+        understood.push(c.label());
+    }
+    // A composition is read back as its recipe: source · condition · action.
+    // That is more useful than the lesson title and the bare verb.
+    if let Some(r) = recipe {
+        understood = crate::compose::recipe_words(r);
+    }
 
     // A sentence that names only an input still builds when the plan really
     // uses that input: a button switches the LED, a photoresistor makes the
     // night light. A knob that the plan would ignore is not a plan.
     let input_matters =
         input.is_some() && semantic != crate::templates::route(load, None);
-    let unsupported = if lesson.is_some() {
+    let unsupported = if let Some(r) = refusal {
+        Some(r)
+    } else if lesson.is_some() {
         None
     } else if !named_load && !input_matters {
         Some(L::new(
@@ -488,6 +567,8 @@ pub fn parse(raw: &str) -> Parse {
         presses,
         lesson: None,
         action,
+        condition,
+        recipe,
         raw: raw.to_string(),
     };
     let mut alternatives = Vec::new();
@@ -546,6 +627,8 @@ pub fn parse(raw: &str) -> Parse {
             presses,
             lesson,
             action,
+            condition,
+            recipe,
             raw: raw.to_string(),
         },
         matched,
@@ -725,6 +808,12 @@ mod tests {
                             "line {at}: {phrase:?} went to {:?}",
                             p.intent.lesson
                         );
+                    } else if let Some(spec) = want.strip_prefix("compose:") {
+                        let r = p.intent.recipe.unwrap_or_else(|| {
+                            panic!("line {at}: {phrase:?} did not compose, understood {:?}", p.understood)
+                        });
+                        let got = format!("{:?}/{:?}/{:?}", r.source, r.sink, r.behavior);
+                        assert_eq!(got, spec, "line {at}: {phrase:?} composed as {got}");
                     } else if let Some(load) = want.strip_prefix("load:") {
                         let (l, i) = match load.split_once('+') {
                             Some((l, i)) => (l, Some(i)),

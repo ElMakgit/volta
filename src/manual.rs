@@ -1102,6 +1102,8 @@ mod tests {
             lesson: None,
             action: None,
             raw: String::new(),
+            condition: None,
+            recipe: None,
         };
         let built = crate::templates::build(&intent, 0, crate::text::Lang::Ru).unwrap();
         let mut d = Draft::new();

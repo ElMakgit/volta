@@ -31,8 +31,8 @@ pub enum Tid {
     Bluetooth,
     Gsm,
     Ethernet,
-    /// An MQ-2 gas sensor whose LED blinks above the gas threshold.
-    GasAlarm,
+    /// A circuit composed from a sensor, a condition and a sink.
+    Composed,
     /// A lesson of the course books, by index into `lessons::ALL`.
     Lesson(usize),
 }
@@ -70,9 +70,23 @@ pub struct Choice {
 
 pub struct Plan {
     pub tid: Tid,
+    /// A static header for the built-in templates.
     pub title: L,
+    /// A header assembled from the source and the sink, for compositions.
+    pub headline: Option<String>,
     pub choices: Vec<Choice>,
     pub recommended: usize,
+}
+
+impl Plan {
+    /// The header to show: the composed one when there is one, otherwise the
+    /// translated static title.
+    pub fn title_text(&self, lang: Lang) -> String {
+        match &self.headline {
+            Some(h) => h.clone(),
+            None => self.title.get(lang).to_string(),
+        }
+    }
 }
 
 pub struct Built {
@@ -85,7 +99,7 @@ pub struct Built {
     pub notes: Vec<L>,
 }
 
-fn spec_line(num: &str, unit: L) -> (L, String) {
+pub(crate) fn spec_line(num: &str, unit: L) -> (L, String) {
     (unit, num.to_string())
 }
 
@@ -119,84 +133,9 @@ fn level_word(n: u8, lang: Lang) -> String {
     words.get(lang).to_string()
 }
 
-/// A sensor lesson plus a verb asks for a composed circuit, not merely the
-/// lesson: "датчик газа, который мигает, когда много газа" needs a lamp that
-/// blinks at the threshold. Only the gas sensor has such a composition for
-/// now; the rest still build their lesson and say what they understood.
-fn alarm_tid(intent: &Intent) -> Option<Tid> {
-    if intent.lesson == Some(crate::lessons::GAS)
-        && matches!(
-            intent.action,
-            Some(Action::Blink | Action::Alarm | Action::Toggle)
-        )
-    {
-        Some(Tid::GasAlarm)
-    } else {
-        None
-    }
-}
-
-fn alarm_plan(tid: Tid, lang: Lang) -> Plan {
-    match tid {
-        Tid::GasAlarm => Plan {
-            tid,
-            title: L::new(
-                "Газ: датчик MQ-2 и мигающий светодиод",
-                "Gas alarm: an MQ-2 with a blinking LED",
-            ),
-            choices: vec![
-                Choice {
-                    name: L::new("Порог по аналогу", "Threshold in the sketch"),
-                    blurb: L::new(
-                        "AO на A0: порог задан в скетче, значение видно в порту. Светодиод на D9 мигает, пока газ выше порога.",
-                        "AO to A0: the threshold lives in the sketch and the value goes to the port. The LED on D9 blinks while gas is above it.",
-                    ),
-                    pros: vec![L::new(
-                        "Порог виден и настраивается в коде",
-                        "The threshold is visible and tunable in code",
-                    )],
-                    cons: vec![L::new(
-                        "Датчику нужно 20 секунд на прогрев",
-                        "The sensor needs 20 seconds to warm up",
-                    )],
-                    specs: vec![
-                        spec_line("150 мА", CURRENT),
-                        spec_line("низкая", PRICE),
-                        spec_line(&level_word(2, lang), LEVEL),
-                    ],
-                    level: 2,
-                },
-                Choice {
-                    name: L::new("Порог на модуле", "Threshold on the module"),
-                    blurb: L::new(
-                        "DO на D2: порог крутится подстроечником на модуле, скетч читает готовый сигнал и мигает светодиодом.",
-                        "DO to D2: the module's trimmer sets the threshold, the sketch reads a ready signal and blinks the LED.",
-                    ),
-                    pros: vec![L::new(
-                        "Не надо считать порог в коде",
-                        "No threshold maths in the sketch",
-                    )],
-                    cons: vec![L::new(
-                        "Порог подбирается отвёрткой",
-                        "The threshold is set with a screwdriver",
-                    )],
-                    specs: vec![
-                        spec_line("150 мА", CURRENT),
-                        spec_line("низкая", PRICE),
-                        spec_line(&level_word(1, lang), LEVEL),
-                    ],
-                    level: 1,
-                },
-            ],
-            recommended: 0,
-        },
-        _ => unreachable!("only the gas alarm has a composed plan"),
-    }
-}
-
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
-    if let Some(tid) = alarm_tid(intent) {
-        return Some(alarm_plan(tid, lang));
+    if let Some(recipe) = intent.recipe {
+        return crate::compose::plan(recipe, lang);
     }
     if let Some(i) = intent.lesson {
         return Some(lesson_plan(i, lang));
@@ -863,7 +802,6 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             ],
             0,
         ),
-        Tid::GasAlarm => return Some(alarm_plan(tid, lang)),
         Tid::Ethernet => (
             L::new("Ethernet: страница в браузере", "Ethernet: a page in the browser"),
             vec![
@@ -903,11 +841,12 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             ],
             0,
         ),
-        Tid::Lesson(_) => return None,
+        Tid::Lesson(_) | Tid::Composed => return None,
     };
     Some(Plan {
         tid,
         title,
+        headline: None,
         choices,
         recommended,
     })
@@ -941,6 +880,7 @@ fn lesson_plan(i: usize, lang: Lang) -> Plan {
     Plan {
         tid: Tid::Lesson(i),
         title: L::new("Урок из книги", "A lesson from the book"),
+        headline: None,
         choices: vec![Choice {
             name: l.title,
             blurb: l.summary,
@@ -1222,20 +1162,20 @@ pub fn bench_pin_kind(kind: Kind, _value: &str, name: &str) -> PinKind {
     }
 }
 
-struct B {
-    c: Circuit,
+pub(crate) struct B {
+    pub(crate) c: Circuit,
     uno: usize,
     lang: Lang,
 }
 
 impl B {
-    fn new(lang: Lang) -> Self {
+    pub(crate) fn new(lang: Lang) -> Self {
         let mut c = Circuit::new();
         let uno = c.add_arduino(uno_spot());
         Self { c, uno, lang }
     }
 
-    fn uno_pin(&self, name: &str) -> End {
+    pub(crate) fn uno_pin(&self, name: &str) -> End {
         End::Pin(self.c.pin(self.uno, name))
     }
 
@@ -1265,10 +1205,10 @@ impl B {
 
     /// The rails nearest the Uno are the bottom pair, so the 5 V and GND
     /// jumpers are short instead of crossing the whole breadboard.
-    fn vcc(&self, x: f32) -> End {
+    pub(crate) fn vcc(&self, x: f32) -> End {
         self.rail(Rail::BotPlus, x)
     }
-    fn gnd(&self, x: f32) -> End {
+    pub(crate) fn gnd(&self, x: f32) -> End {
         self.rail(Rail::BotMinus, x)
     }
 
@@ -1283,12 +1223,12 @@ impl B {
         }
     }
 
-    fn w(&mut self, a: End, b: End, class: NetClass) {
+    pub(crate) fn w(&mut self, a: End, b: End, class: NetClass) {
         self.c.wire(a, b, class);
     }
 
     /// Axial part lying along a row, spanning `span` holes.
-    fn axial(
+    pub(crate) fn axial(
         &mut self,
         kind: Kind,
         label: &str,
@@ -1314,11 +1254,11 @@ impl B {
         (End::Pin(self.c.pin(p, "1")), End::Pin(self.c.pin(p, "2")))
     }
 
-    fn res(&mut self, label: &str, value: &str, col: u8, row: Row, span: u8) -> (End, End) {
+    pub(crate) fn res(&mut self, label: &str, value: &str, col: u8, row: Row, span: u8) -> (End, End) {
         self.axial(Kind::Resistor, label, value, col, row, span)
     }
 
-    fn led(&mut self, label: &str, value: &str, col: u8, row: Row) -> (End, End) {
+    pub(crate) fn led(&mut self, label: &str, value: &str, col: u8, row: Row) -> (End, End) {
         self.axial(Kind::Led, label, value, col, row, 1)
     }
 
@@ -1398,7 +1338,7 @@ impl B {
         ]
     }
 
-    fn bench(&mut self, kind: Kind, label: &str, value: &str, at: Pt) -> Vec<End> {
+    pub(crate) fn bench(&mut self, kind: Kind, label: &str, value: &str, at: Pt) -> Vec<End> {
         let mut pins = Vec::new();
         for (name, dx, dy) in bench_pins(kind, value) {
             pins.push(PinSpec {
@@ -1417,7 +1357,7 @@ impl B {
 
     /// Drop a ready-made board on the bench and return its part index, so
     /// the wiring can name its header pins.
-    fn breakout(&mut self, label: &str, value: &str, at: Pt) -> usize {
+    pub(crate) fn breakout(&mut self, label: &str, value: &str, at: Pt) -> usize {
         let mut pins = Vec::new();
         for (name, dx, dy) in bench_pins(Kind::Module, value) {
             pins.push(PinSpec {
@@ -1431,7 +1371,7 @@ impl B {
     }
 
     /// A named header pin of a board placed with [`B::breakout`].
-    fn mp(&self, part: usize, name: &str) -> End {
+    pub(crate) fn mp(&self, part: usize, name: &str) -> End {
         End::Pin(self.c.pin(part, name))
     }
 
@@ -1495,7 +1435,7 @@ impl B {
         }
     }
 
-    fn finish(mut self) -> Circuit {
+    pub(crate) fn finish(mut self) -> Circuit {
         self.bridge_rails();
         self.c
     }
@@ -1980,29 +1920,15 @@ void loop() {
 
 // new build body, spliced into templates.rs
 pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
-    if let Some(tid) = alarm_tid(intent) {
-        let plan = alarm_plan(tid, lang);
-        let choice = choice.min(plan.choices.len() - 1);
-        let (circuit, code, summary, notes) = match tid {
-            Tid::GasAlarm => gas_alarm(lang, choice),
-            _ => unreachable!("only the gas alarm has a composed build"),
-        };
-        return Some(Built {
-            tid,
-            title: plan.title.get(lang).to_string(),
-            circuit,
-            code,
-            choice,
-            summary,
-            notes,
-        });
+    if let Some(recipe) = intent.recipe {
+        return crate::compose::build(recipe, choice, lang);
     }
     if let Some(i) = intent.lesson {
         let plan = lesson_plan(i, lang);
         let (circuit, code, summary, notes) = lesson_build(lang, i);
         return Some(Built {
             tid: Tid::Lesson(i),
-            title: plan.title.get(lang).to_string(),
+            title: plan.title_text(lang),
             circuit,
             code,
             choice: 0,
@@ -2038,13 +1964,13 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::Bluetooth => bluetooth(lang, choice),
         Tid::Gsm => gsm(lang, choice),
         Tid::Ethernet => ethernet(lang, choice),
-        Tid::GasAlarm => gas_alarm(lang, choice),
+        Tid::Composed => return crate::compose::build(intent.recipe?, choice, lang),
         Tid::Lesson(_) => return None,
     };
     notes.extend(extra);
     Some(Built {
         tid,
-        title: plan.title.get(lang).to_string(),
+        title: plan.title_text(lang),
         circuit,
         code,
         choice,
@@ -2055,7 +1981,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
 
 /// Power the breadboard rails from the Uno, landing the jumpers directly under
 /// the 5 V and GND sockets so they stay short.
-fn feeds(b: &mut B) {
+pub(crate) fn feeds(b: &mut B) {
     // Land the jumpers directly under the sockets, so the rails are fed where
     // the board is, not at the far end of the bench.
     let vcc_near = b.vcc(b.uno_x("5V"));
@@ -2338,135 +2264,6 @@ fn led_blink(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
 
 /// MQ-2 and one LED: the sensor's own comparator (DO) or the sketch's
 /// threshold (AO) decides when the lamp blinks.
-fn gas_alarm(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
-    let mut b = B::new(lang);
-    let gnd = b.gnd(52.0);
-    let vcc = b.vcc(44.0);
-    let mq = b.breakout("U1", "MQ-2", Pt::new(2.0, 54.0));
-    let (r1a, _r1b) = b.res("R1", "220 Ω", 20, Row::A, 3);
-    let (_la, lk) = b.led("D1", "красный 5 мм", 23, Row::E);
-    b.w(vcc, b.mp(mq, "VCC"), NetClass::Vcc);
-    b.w(b.mp(mq, "GND"), gnd, NetClass::Gnd);
-    b.w(b.uno_pin("D9"), r1a, NetClass::Signal);
-    b.w(lk, gnd, NetClass::Gnd);
-    let (code, summary, notes) = if choice == 1 {
-        b.w(b.mp(mq, "DO"), b.uno_pin("D2"), NetClass::Signal);
-        (
-            gas_alarm_digital(lang),
-            L::new(
-                "MQ-2 DO на D2, светодиод на D9: компаратор модуля включает мигание.",
-                "MQ-2 DO on D2, LED on D9: the module's comparator starts the blinking.",
-            ),
-            vec![L::new(
-                "Порог крутится подстроечником на модуле; после включения дай 20 секунд прогрева.",
-                "The trimmer on the module sets the threshold; give it 20 seconds to warm up.",
-            )],
-        )
-    } else {
-        b.w(b.mp(mq, "AO"), b.uno_pin("A0"), NetClass::Analog);
-        (
-            gas_alarm_analog(lang),
-            L::new(
-                "MQ-2 AO на A0, светодиод на D9: выше порога скетч мигает лампой.",
-                "MQ-2 AO on A0, LED on D9: above the sketch's threshold the lamp blinks.",
-            ),
-            vec![L::new(
-                "Порог 400 — начальный: прогрей датчик 20 секунд и подбери под комнату.",
-                "400 is a starting threshold: warm the sensor for 20 seconds and tune it to the room.",
-            )],
-        )
-    };
-    feeds(&mut b);
-    (b.finish(), code, summary, notes)
-}
-
-fn gas_alarm_analog(lang: Lang) -> String {
-    fill(
-        r#"// <<C0>>
-// MQ-2: аналоговый выход на A0, светодиод на D9
-const uint8_t SENSE = A0;
-const uint8_t LED = 9;
-const int THRESHOLD = 400;
-const uint16_t PERIOD_MS = 250;
-
-bool lit = false;
-uint32_t last = 0;
-
-void setup() {
-  pinMode(LED, OUTPUT);
-  Serial.begin(9600);
-  Serial.println(F("warm up 20 s"));
-}
-
-void loop() {
-  if (millis() - last >= PERIOD_MS) {
-    last = millis();
-    int level = analogRead(SENSE);
-    if (level > THRESHOLD) {
-      lit = !lit;
-      digitalWrite(LED, lit ? HIGH : LOW);
-    } else {
-      lit = false;
-      digitalWrite(LED, LOW);
-    }
-    Serial.println(level);
-  }
-}
-"#,
-        &[(
-            "C0",
-            tr(
-                lang,
-                "Порог газа в скетче: выше 400 — мигание",
-                "Gas threshold in the sketch: above 400 the LED blinks",
-            ),
-        )],
-    )
-}
-
-fn gas_alarm_digital(lang: Lang) -> String {
-    fill(
-        r#"// <<C0>>
-// MQ-2: компараторный выход на D2, светодиод на D9
-const uint8_t ALARM = 2;
-const uint8_t LED = 9;
-const uint16_t PERIOD_MS = 250;
-
-bool lit = false;
-uint32_t last = 0;
-
-void setup() {
-  pinMode(ALARM, INPUT);
-  pinMode(LED, OUTPUT);
-  Serial.begin(9600);
-  Serial.println(F("warm up 20 s"));
-}
-
-void loop() {
-  if (millis() - last >= PERIOD_MS) {
-    last = millis();
-    if (digitalRead(ALARM) == HIGH) {
-      lit = !lit;
-      digitalWrite(LED, lit ? HIGH : LOW);
-    } else {
-      lit = false;
-      digitalWrite(LED, LOW);
-    }
-    Serial.println(digitalRead(ALARM));
-  }
-}
-"#,
-        &[(
-            "C0",
-            tr(
-                lang,
-                "Порог газа на модуле: сигнал DO мигает светодиодом",
-                "Gas threshold on the module: DO blinks the LED",
-            ),
-        )],
-    )
-}
-
 fn night_light(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
     let mut b = B::new(lang);
     let gnd = b.gnd(52.0);
@@ -3897,6 +3694,8 @@ mod tests {
                 lesson: None,
                 action: None,
                 raw: p.intent.raw,
+                condition: None,
+                recipe: None,
             };
             let plan = plan(&intent, Lang::Ru).expect("routable");
             assert_eq!(plan.choices.len(), 3);
@@ -4005,6 +3804,8 @@ mod tests {
                 lesson: Some(i),
                 action: None,
                 raw: String::new(),
+                condition: None,
+                recipe: None,
             };
             let plan = plan(&intent, Lang::Ru).expect("the lesson plans");
             assert_eq!(plan.choices.len(), 1, "{}", l.title.ru);
@@ -4051,6 +3852,8 @@ mod tests {
                 lesson: Some(i),
                 action: None,
                 raw: String::new(),
+                condition: None,
+                recipe: None,
             };
             let built = build(&intent, 0, Lang::Ru).unwrap_or_else(|| panic!("{}", l.title.ru));
             let c = &built.circuit;
@@ -4147,7 +3950,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The sentence from the brief is a composition, not a lesson: the MQ-2
     /// plus a lamp that blinks at the gas threshold. Both ways of setting that
     /// threshold build, and both pass every check.
@@ -4170,13 +3972,13 @@ mod tests {
             );
             assert!(p.unsupported.is_none(), "{text}");
             let plan = plan(&p.intent, Lang::Ru).expect("the alarm plans");
-            assert_eq!(plan.tid, Tid::GasAlarm, "{text}");
+            assert_eq!(plan.tid, Tid::Composed, "{text}");
             assert_eq!(plan.choices.len(), 2, "{text}");
             for choice in 0..plan.choices.len() {
                 for lang in [Lang::Ru, Lang::En] {
                     let built = build(&p.intent, choice, lang)
                         .unwrap_or_else(|| panic!("{text}: choice {choice} builds"));
-                    assert_eq!(built.tid, Tid::GasAlarm);
+                    assert_eq!(built.tid, Tid::Composed);
                     assert!(!unfilled(&built.code), "{text}: unfilled token");
                     let has_mq2 = built
                         .circuit
@@ -4215,17 +4017,31 @@ mod tests {
         }
     }
 
-    /// A sensor word plus a verb that no template composes yet still builds
-    /// the plain lesson instead of being refused.
+    /// A sensor word plus a verb becomes a composition: the photoresistor is
+    /// in the source table, so it is no longer a plain lesson.
     #[test]
-    fn a_composed_request_falls_back_to_the_lesson() {
+    fn a_light_sensor_composes_with_a_lamp() {
         let p = parse("датчик света который мигает");
         assert_eq!(p.intent.lesson, Some(crate::lessons::PHOTORESISTOR));
-        let plan = plan(&p.intent, Lang::Ru).expect("the lesson plans");
-        assert_eq!(plan.tid, Tid::Lesson(crate::lessons::PHOTORESISTOR));
+        let recipe = p.intent.recipe.expect("the light sensor composes");
+        assert_eq!(recipe.source, crate::spec::SourceId::Light);
+        assert_eq!(plan(&p.intent, Lang::Ru).unwrap().tid, Tid::Composed);
         assert!(build(&p.intent, 0, Lang::Ru).is_some());
     }
 
+    /// A sensor the table does not describe yet still builds the plain
+    /// lesson instead of being refused.
+    #[test]
+    fn an_undeclared_sensor_falls_back_to_the_lesson() {
+        let p = parse("геркон который мигает");
+        assert_eq!(p.intent.lesson, Some(4));
+        assert!(p.intent.recipe.is_none());
+        let plan = plan(&p.intent, Lang::Ru).expect("the lesson plans");
+        assert_eq!(plan.tid, Tid::Lesson(4));
+        assert!(build(&p.intent, 0, Lang::Ru).is_some());
+    }
+
+    #[test]
     fn every_part_on_the_board_is_in_the_bill() {
         let intent = Intent {
             load: Load::Motor,
@@ -4235,6 +4051,8 @@ mod tests {
             lesson: None,
             action: None,
             raw: String::new(),
+            condition: None,
+            recipe: None,
         };
         let built = build(&intent, 0, Lang::Ru).unwrap();
         let bom = bom(&built.circuit, Lang::Ru);

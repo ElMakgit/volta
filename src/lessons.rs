@@ -473,7 +473,7 @@ void loop() {
         book: 1,
         number: 15,
         title: L::new("Фоторезистор", "A photoresistor"),
-        keys: &["занятие 15", "фоторезистор"],
+        keys: &["занятие 15", "фоторезистор", "темн"],
         boards: NO_BOARDS,
         wires: NO_WIRES,
         extras: &[Extra::Ldr { pin: "A0" }, Extra::Led { pin: "D9", colour: "жёлтый 5 мм" }],

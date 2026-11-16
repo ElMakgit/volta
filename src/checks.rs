@@ -791,6 +791,8 @@ mod tests {
                     lesson: None,
                     action: None,
                     raw: String::new(),
+                    condition: None,
+                    recipe: None,
                 };
                 out.push(crate::templates::build(&intent, choice, Lang::Ru).unwrap());
             }
@@ -810,6 +812,8 @@ mod tests {
             lesson: None,
             action: None,
             raw: String::new(),
+            condition: None,
+            recipe: None,
         };
         let built = crate::templates::build(&intent, 0, Lang::Ru).unwrap();
         let report = run_circuit(&built.circuit, Lang::Ru, None);
@@ -830,6 +834,8 @@ mod tests {
             lesson: None,
             action: None,
             raw: String::new(),
+            condition: None,
+            recipe: None,
         };
         let built = crate::templates::build(&gsm, 0, Lang::Ru).unwrap();
         let report = run_circuit(&built.circuit, Lang::Ru, None);

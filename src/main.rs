@@ -5,6 +5,7 @@
 //! agent can plan and render circuits too.
 
 mod checks;
+mod compose;
 mod config;
 mod icons;
 mod lessons;
@@ -14,6 +15,7 @@ mod modules;
 mod parse;
 mod png;
 mod scene;
+mod spec;
 mod style;
 mod svg;
 mod templates;
@@ -183,13 +185,13 @@ fn cmd_plan(args: &[String]) {
             "{}",
             serde_json::json!({
                 "ok": true,
-                "title": plan.title.get(lang),
+                "title": plan.title_text(lang),
                 "understood": parsed.understood.iter().map(|l| l.get(lang)).collect::<Vec<_>>(),
                 "choices": choices,
             })
         );
     } else {
-        println!("{}", plan.title.get(lang));
+        println!("{}", plan.title_text(lang));
         println!();
         for (i, c) in plan.choices.iter().enumerate() {
             let mark = if i == plan.recommended { "*" } else { " " };
@@ -372,6 +374,13 @@ fn cmd_list() {
         (
             text::L::new("Ethernet", "Ethernet"),
             text::L::new("W5100 и ENC28J60, веб", "W5100 and ENC28J60, web"),
+        ),
+        (
+            text::L::new("композиции", "compositions"),
+            text::L::new(
+                "13 датчиков → светодиод, пищалка или реле; порог из фразы",
+                "13 sensors → LED, buzzer or relay; the threshold from the sentence",
+            ),
         ),
         (
             text::L::new("уроки из книг", "lessons from the books"),

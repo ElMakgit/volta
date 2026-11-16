@@ -906,7 +906,11 @@ impl App {
                 2 => "plan.title.two",
                 _ => "plan.title",
             };
-            ui.label(RichText::new(self.t(title_key)).size(15.0).strong().color(fg));
+            let heading = match &plan.headline {
+                Some(h) => h.clone(),
+                None => self.t(title_key).to_string(),
+            };
+            ui.label(RichText::new(heading).size(15.0).strong().color(fg));
             ui.add_space(6.0);
 
             let mut pick = None;
