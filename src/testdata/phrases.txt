@@ -394,6 +394,8 @@ gas above 400 rgb | compose:Gas/Rgb/Color
 газ выше 400 реле с гистерезисом 50 | compose:Gas/Relay/Switch
 температура ниже 20 серво с гистерезисом 3 | compose:Temperature/Servo/Turn
 gas above 400 relay hysteresis 50 | compose:Gas/Relay/Switch
+температура выше 20 и ниже 30 реле | compose:Temperature/Relay/Switch
+temperature above 20 and below 30 relay | compose:Temperature/Relay/Switch
 
 # ---------- понятный отказ вместо выдуманной схемы ----------
 погода | refuse

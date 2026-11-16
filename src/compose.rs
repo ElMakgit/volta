@@ -302,6 +302,12 @@ fn choice(r: &Resolved, lang: Lang) -> Choice {
                     unit
                 )
             }
+            Condition::Between { low, high } => format!(
+                "{}…{} {}",
+                number(low, decimals),
+                number(high, decimals),
+                unit
+            ),
             Condition::Active => unit.to_string(),
         };
         (
@@ -419,6 +425,10 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
             Condition::AboveBand { .. } | Condition::BelowBand { .. } => L::new(
                 "Гистерезис не даёт дребезжать у порога: вход на одном значении, выход на другом.",
                 "Hysteresis stops chatter at the threshold: it comes on at one value and off at another.",
+            ),
+            Condition::Between { .. } => L::new(
+                "Оба условия проверяются на одном чтении: срабатывание только внутри диапазона.",
+                "Both conditions read the same sample: it fires only inside the range.",
             ),
             Condition::Active => L::new(
                 "Условие — уровень с модуля: подстроечник задаёт его на месте.",
@@ -653,6 +663,14 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
                     "  if (!active && value < {}) active = true;\n  if (active && value > {}) active = false;\n",
                     number(on, decimals),
                     number(off, decimals)
+                ),
+            ),
+            Condition::Between { low, high } => (
+                String::new(),
+                format!(
+                    "  bool active = value > {} && value < {};\n",
+                    number(low, decimals),
+                    number(high, decimals)
                 ),
             ),
         };
@@ -1113,6 +1131,21 @@ mod tests {
         let built = build(recipe, 0, Lang::Ru).unwrap();
         assert!(built.code.contains("value < 20"));
         assert!(built.code.contains("value > 23"));
+    }
+
+    /// Two thresholds joined by "и" are two conditions on one reading: the
+    /// relay has to sit inside the window.
+    #[test]
+    fn two_conditions_make_a_window() {
+        let p = parse("температура выше 20 и ниже 30 реле");
+        let recipe = p.intent.recipe.expect("composes");
+        assert_eq!(
+            recipe.condition,
+            Some(Condition::Between { low: 20.0, high: 30.0 })
+        );
+        let built = build(recipe, 0, Lang::Ru).unwrap();
+        assert!(built.code.contains("value > 20.0 && value < 30.0"));
+        assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
     }
 
     /// A request to print in the serial port is not a request for a screen.

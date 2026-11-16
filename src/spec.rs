@@ -61,6 +61,8 @@ pub enum Condition {
     AboveBand { on: f32, off: f32 },
     /// The same from the other side: comes on below `on`, clears above `off`.
     BelowBand { on: f32, off: f32 },
+    /// Two conditions on one reading: the value has to sit inside the window.
+    Between { low: f32, high: f32 },
 }
 
 impl Condition {
@@ -75,6 +77,7 @@ impl Condition {
             Condition::BelowBand { .. } => {
                 L::new("ниже порога с возвратом", "below the threshold, with a return")
             }
+            Condition::Between { .. } => L::new("в диапазоне", "inside the range"),
         }
     }
 }

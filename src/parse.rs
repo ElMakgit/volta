@@ -122,27 +122,58 @@ fn spoken_condition(raw: &str) -> Option<crate::spec::Condition> {
             value.parse::<f32>().ok()
         })
     };
+    // The first threshold of each kind, so "выше 20 и ниже 30" keeps both.
+    let mut above_at: Option<(usize, f32)> = None;
+    let mut below_at: Option<(usize, f32)> = None;
     for (i, word) in words.iter().enumerate() {
         let Some((_, above)) = directions.iter().find(|(d, _)| word.starts_with(d)) else {
             continue;
         };
-        if let Some(n) = number_after(i) {
-            // "с гистерезисом 50" names the width of the dead band, so the
-            // sink turns on at the spoken threshold and off a band later.
-            let band = words
-                .iter()
-                .position(|w| w.starts_with("гистерезис") || w.starts_with("hysteresis"))
-                .and_then(number_after)
-                .filter(|b| *b > 0.0 && (!*above || *b < n));
-            return Some(match (*above, band) {
-                (true, Some(b)) => Condition::AboveBand { on: n, off: n - b },
-                (false, Some(b)) => Condition::BelowBand { on: n, off: n + b },
-                (true, None) => Condition::Above(n),
-                (false, None) => Condition::Below(n),
+        let Some(n) = number_after(i) else { continue };
+        let slot = if *above { &mut above_at } else { &mut below_at };
+        if slot.is_none() {
+            *slot = Some((i, n));
+        }
+    }
+    // Two conditions on one reading, joined by "и": a window. A sentence
+    // without the conjunction keeps its first threshold as before.
+    let joined = words
+        .iter()
+        .any(|w| w == "и" || w == "and" || w == "между" || w == "between");
+    if joined {
+        if let (Some((_, a)), Some((_, b))) = (above_at, below_at) {
+            return Some(Condition::Between {
+                low: a.min(b),
+                high: a.max(b),
             });
         }
     }
-    None
+    // The earlier threshold is the one the plan leads with.
+    let (above, n) = match (above_at, below_at) {
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                (true, a.1)
+            } else {
+                (false, b.1)
+            }
+        }
+        (Some(a), None) => (true, a.1),
+        (None, Some(b)) => (false, b.1),
+        (None, None) => return None,
+    };
+    // "с гистерезисом 50" names the width of the dead band, so the sink
+    // turns on at the spoken threshold and off a band later.
+    let band = words
+        .iter()
+        .position(|w| w.starts_with("гистерезис") || w.starts_with("hysteresis"))
+        .and_then(number_after)
+        .filter(|b| *b > 0.0 && (!above || *b < n));
+    Some(match (above, band) {
+        (true, Some(b)) => Condition::AboveBand { on: n, off: n - b },
+        (false, Some(b)) => Condition::BelowBand { on: n, off: n + b },
+        (true, None) => Condition::Above(n),
+        (false, None) => Condition::Below(n),
+    })
 }
 
 #[derive(Clone, Debug)]
