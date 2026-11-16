@@ -1,8 +1,8 @@
-//! The tasks printed in the four books, each paired with the lesson that answers it.
+//! The task texts of the course, each paired with the solution that answers it.
 //!
-//! The books are the base of the course: a task copied from them word for word
-//! must land on its own solution without guessing from a few keywords. Anything
-//! phrased differently still goes through the ordinary parser and templates.
+//! A task copied word for word must land on its own solution without guessing
+//! from a few keywords. Anything phrased differently still goes through the
+//! ordinary parser and templates.
 
 use std::sync::OnceLock;
 

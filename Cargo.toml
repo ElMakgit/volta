@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# The exact wording of the course-book tasks is a local-only table: it is
-# omitted from the public source, so this feature is off by default there.
+# Exact task texts are shipped with the source. The feature can be turned off
+# for a minimal build that recognises only topics and keywords.
 default = ["book-tasks"]
 book-tasks = []
 

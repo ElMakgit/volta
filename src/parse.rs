@@ -470,9 +470,8 @@ pub fn parse(raw: &str) -> Parse {
     parse_inner(raw, true)
 }
 
-/// The four course books are the base: a task copied from them word for
-/// word is answered by the lesson that teaches it. This table is kept out of
-/// the public build, so the feature is enabled only for a local build.
+/// A task copied word for word is answered by its ready-made solution
+/// instead of being guessed from a few keywords.
 #[cfg(feature = "book-tasks")]
 fn exact_book_task(raw: &str) -> Option<Parse> {
     match crate::book_tasks::solution_for(raw) {
