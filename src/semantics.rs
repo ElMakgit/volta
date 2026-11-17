@@ -59,18 +59,18 @@ fn mentions_any(text: &str, words: &[&str]) -> bool {
     })
 }
 
-fn number_after(text: &str, cue: &str) -> Option<u32> {
-    let at = text.find(cue)?;
-    text[at + cue.len()..]
-        .split_whitespace()
-        .take(3)
-        .find_map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok())
+/// The words right after a cue phrase, for the number reader.
+fn after_cue<'a>(text: &'a str, cue: &str) -> Vec<&'a str> {
+    match text.find(cue) {
+        Some(at) => text[at + cue.len()..].split_whitespace().take(6).collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Read the roles of a request. Unknown words do not guess a device: they
 /// lower the confidence so the caller can ask a clarifying question.
 pub fn analyse(raw: &str) -> Semantic {
-    let text = normalize(raw);
+    let text = normalize(&crate::numbers::fix_decimal_commas(raw));
     if text.is_empty() {
         return Semantic::default();
     }
@@ -93,19 +93,15 @@ pub fn analyse(raw: &str) -> Semantic {
     } else {
         None
     };
-    let period_ms = if text.contains("каждый час") || text.contains("раз в час") || text.contains("hourly") {
-        Some(3_600_000)
-    } else {
-        ["раз в", "каждые", "every"].iter().find_map(|cue| {
-            let n = number_after(&text, cue)?;
-            let unit = if text.contains("минут") || text.contains("minute") { 60_000 }
-                else if text.contains("секунд") || text.contains("second") { 1000 }
-                else { 1000 };
-            Some(n.saturating_mul(unit))
-        })
-    };
+    let period_ms = ["раз в", "каждые", "каждый", "каждую", "every"]
+        .iter()
+        .find_map(|cue| crate::numbers::duration_after(&text, cue))
+        .map(|ms| ms.min(u32::MAX as u64) as u32);
     let after_presses = if text.contains("нажат") || text.contains("press") || text.contains("нажм") {
-        ["после", "через", "after"].iter().find_map(|cue| number_after(&text, cue))
+        ["после", "через", "after"]
+            .iter()
+            .find_map(|cue| crate::numbers::first_value(&after_cue(&text, cue)))
+            .map(|(value, _)| value.round() as u32)
     } else {
         None
     };
@@ -142,6 +138,15 @@ mod tests {
         assert_eq!(hourly.period_ms, Some(3_600_000));
         assert!(hourly.sinks.iter().any(|x| x == "buzzer"));
         assert!(hourly.sinks.iter().any(|x| x == "display"));
+    }
+
+    #[test]
+    fn numbers_written_in_words_are_read_too() {
+        assert_eq!(analyse("полив раз в полчаса").period_ms, Some(1_800_000));
+        assert_eq!(analyse("каждые пять минут").period_ms, Some(300_000));
+        assert_eq!(analyse("отчёт раз в два часа").period_ms, Some(7_200_000));
+        assert_eq!(analyse("после трёх нажатий зажечь светодиод").after_presses, Some(3));
+        assert_eq!(analyse("мигать раз в 0,5 секунды").period_ms, Some(500));
     }
 
     #[test]

@@ -155,15 +155,15 @@ pub(crate) fn wants_access(raw: &str) -> bool {
 /// The number of cards a table keeps: the task names it ("на 49 карт"),
 /// otherwise the EEPROM of an Uno takes 49 four-byte UIDs with room to spare.
 fn card_slots(raw: &str) -> Option<usize> {
-    let text = crate::words::normalize(raw);
+    let text = crate::words::normalize(&crate::numbers::fix_decimal_commas(raw));
     let cut = text.find("карт")?;
-    let mut last = None;
-    for word in text[..cut].split(|ch: char| !ch.is_ascii_digit()) {
-        if let Ok(n) = word.parse::<usize>() {
-            last = Some(n);
-        }
-    }
-    last.filter(|n| (1..=200).contains(n))
+    let before: Vec<&str> = text[..cut].split_whitespace().collect();
+    // The number closest to the word "карт" is the one that matters;
+    // reading the words backwards also accepts "на сорок девять карт".
+    let nearest: Vec<&str> = before.iter().rev().copied().take(6).collect();
+    crate::numbers::leading_value(&nearest)
+        .map(|(value, _)| value.round() as usize)
+        .filter(|n| (1..=200).contains(n))
 }
 
 fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {

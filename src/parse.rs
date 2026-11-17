@@ -117,10 +117,8 @@ fn spoken_condition(raw: &str) -> Option<crate::spec::Condition> {
     // Numbers stay within the next couple of words, so "выше порога 700"
     // still reads as a threshold.
     let number_after = |i: usize| -> Option<f32> {
-        words.iter().skip(i + 1).take(2).find_map(|next| {
-            let value = next.trim_end_matches(['.', '-']).replace(',', ".");
-            value.parse::<f32>().ok()
-        })
+        let rest: Vec<&str> = words.iter().skip(i + 1).take(4).map(String::as_str).collect();
+        crate::numbers::first_value(&rest).map(|(value, _)| value)
     };
     // The first threshold of each kind, so "выше 20 и ниже 30" keeps both.
     let mut above_at: Option<(usize, f32)> = None;
@@ -902,6 +900,19 @@ mod tests {
         assert!(p.intent.transistor);
         assert!(p.intent.presses);
         assert!(p.unsupported.is_none(), "{:?}", p.unsupported);
+    }
+
+    #[test]
+    fn a_threshold_written_in_words_still_builds() {
+        let p = parse("температура выше тридцати — включи вентилятор");
+        let condition = p.intent.condition.as_ref().expect("threshold was lost");
+        assert!(matches!(condition, crate::spec::Condition::Above(v) if (*v - 30.0).abs() < 0.01));
+        let plan = crate::templates::plan(&p.intent, crate::text::Lang::Ru).expect("no plan");
+        assert!(
+            plan.title_text(crate::text::Lang::Ru).contains("Термометр"),
+            "{}",
+            plan.title_text(crate::text::Lang::Ru)
+        );
     }
 
     #[test]
