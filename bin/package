@@ -1,0 +1,66 @@
+#!/usr/bin/env sh
+# Build both release archives and their checksums.
+#
+#   bin/package             Linux and Windows
+#   bin/package --linux     Linux only
+#
+# The Linux archive holds the binary, README, licence, launcher entry and
+# icon. The Windows archive is produced by bin/build-windows.sh.
+set -eu
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+cd "$here"
+
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+if [ -z "$version" ]; then
+    echo "bin/package: no version in Cargo.toml" >&2
+    exit 1
+fi
+
+out="target/release"
+mkdir -p "$out"
+
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+root="$stage/volta-$version-linux"
+mkdir -p "$root"
+
+cargo build --offline --locked --release
+
+install -m 755 target/release/volta "$root/volta"
+install -m 644 README.md LICENSE "$root/"
+install -m 644 pkgbuild/volta.desktop pkgbuild/volta.svg "$root/"
+cat > "$root/КАК_ЗАПУСТИТЬ.txt" <<EOF
+volta $version
+
+Распакуйте архив и запустите ./volta.
+
+Ярлык в меню приложений:
+  install -Dm644 volta.desktop ~/.local/share/applications/volta.desktop
+  install -Dm644 volta.svg \\
+    ~/.local/share/icons/hicolor/scalable/apps/volta.svg
+  update-desktop-database ~/.local/share/applications 2>/dev/null || true
+
+Схема, скетч и проверки работают офлайн. Подробности — в README.md.
+EOF
+
+tar -C "$stage" -czf "$out/volta-linux-x86_64.tar.gz" "volta-$version-linux"
+
+if [ "${1:-}" != "--linux" ]; then
+    bin/build-windows.sh
+    cp target/windows/volta-windows-x86_64.zip "$out/"
+fi
+
+(
+    cd "$out"
+    sha256sum volta-linux-x86_64.tar.gz > SHA256SUMS
+    if [ -f volta-windows-x86_64.zip ]; then
+        sha256sum volta-windows-x86_64.zip >> SHA256SUMS
+    fi
+)
+
+printf 'Linux:   %s\n' "$out/volta-linux-x86_64.tar.gz"
+if [ -f "$out/volta-windows-x86_64.zip" ]; then
+    printf 'Windows: %s\n' "$out/volta-windows-x86_64.zip"
+fi
+printf 'Sums:    %s\n' "$out/SHA256SUMS"

@@ -68,13 +68,14 @@ cp "target/$target/release/volta.exe" "$out/volta.exe"
 if [ -f docs/windows.md ]; then
     cp docs/windows.md "$out/README-windows.md"
 fi
+cp LICENSE "$out/LICENSE"
 if command -v zip >/dev/null 2>&1; then
-    files="volta.exe"
+    files="volta.exe LICENSE"
     if [ -f "$out/README-windows.md" ]; then
-        files="volta.exe README-windows.md"
+        files="volta.exe README-windows.md LICENSE"
     fi
     # shellcheck disable=SC2086
-    (cd "$out" && zip -q -9 -j volta-windows-x86_64.zip $files)
+    (cd "$out" && rm -f volta-windows-x86_64.zip && zip -q -9 -j volta-windows-x86_64.zip $files)
     echo "Windows build: $here/$out/volta-windows-x86_64.zip"
 else
     echo "Windows build: $here/$out/volta.exe (zip not installed, not packaged)"
