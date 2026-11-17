@@ -5,7 +5,7 @@
 //! changes the wiring, the code, and what the checks can promise.
 
 use crate::model::*;
-use crate::parse::{Action, Input, Intent, Load};
+use crate::parse::{Action, Input, Intent, Load, ScreenKind};
 use crate::text::{tr, Lang, L};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,15 +141,28 @@ fn level_word(n: u8, lang: Lang) -> String {
 /// EEPROM counter lesson, which counts button presses.
 pub(crate) fn wants_access(raw: &str) -> bool {
     let text = crate::words::normalize(raw);
-    let door = text.contains("доступ")
-        || text.contains("пропуск")
-        || text.contains("турникет")
-        || text.contains("замок")
-        || text.contains("access");
+    let door = ["доступ", "доспуп", "пропуск", "турникет", "замок", "скуд", "access", "домофон"]
+        .iter()
+        .any(|key| crate::words::mentions(&text, key));
+    let cards = crate::words::mentions(&text, "карт") || text.contains("метк");
+    let reader = text.contains("rfid") || text.contains("rc522") || text.contains("считывател");
+    let screen = text.contains("диспле")
+        || text.contains("экран")
+        || text.contains("oled")
+        || text.contains("lcd");
+    let memory = crate::words::mentions(&text, "памят");
+    // The exact kind of memory is what a card table needs. A bare "память"
+    // also names an SD card or a text note, so on its own it counts only
+    // together with a door.
     let store = text.contains("eeprom")
-        || text.contains("энергонезависим")
-        || text.contains("памят");
-    door && store
+        || crate::words::mentions(&text, "энергонезависим")
+        || crate::words::mentions(&text, "энергозависим")
+        || text.contains("база карт")
+        || text.contains("таблица карт");
+    if store {
+        return door || cards || reader;
+    }
+    (memory && door) || (memory && reader && screen)
 }
 
 /// The number of cards a table keeps: the task names it ("на 49 карт"),
@@ -163,7 +176,30 @@ fn card_slots(raw: &str) -> Option<usize> {
     let nearest: Vec<&str> = before.iter().rev().copied().take(6).collect();
     crate::numbers::leading_value(&nearest)
         .map(|(value, _)| value.round() as usize)
-        .filter(|n| (1..=200).contains(n))
+        .filter(|n| *n > 0)
+}
+
+/// What the access scene must carry. The sentence decides the table size,
+/// the screen and whether a refused card raises a siren; the scene then
+/// builds exactly those parts instead of a fixed picture.
+pub(crate) struct AccessSpec {
+    pub slots: usize,
+    pub asked: Option<usize>,
+    pub screen: crate::parse::ScreenKind,
+    pub siren: bool,
+}
+
+pub(crate) fn access_spec(raw: &str) -> AccessSpec {
+    let asked = card_slots(raw);
+    AccessSpec {
+        // An Uno's EEPROM keeps 255 four-byte UIDs and COUNT is uint8_t.
+        slots: asked.unwrap_or(49).min(255),
+        asked,
+        screen: crate::parse::screens_in(raw)
+            .map(|s| s.kind)
+            .unwrap_or(crate::parse::ScreenKind::Any),
+        siren: crate::parse::named_devices(raw).buzzer > 0,
+    }
 }
 
 fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
@@ -204,12 +240,12 @@ fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
         quick(
             lang,
             L::new(
-                "Замок, карты в EEPROM, OLED 128×64",
-                "Lock, cards in EEPROM, a 128×64 OLED",
+                "Замок, карты в EEPROM, экран",
+                "Lock, cards in EEPROM, a screen",
             ),
             L::new(
-                "Кнопка пишет карту в таблицу EEPROM, знакомая карта открывает замок, экран показывает запись и доступ.",
-                "A button saves a card into an EEPROM table, a known card opens the lock, and the screen shows the saving and the access.",
+                "Кнопка пишет карту в таблицу EEPROM, знакомая карта открывает замок, экран показывает запись и доступ. Названный экран и сирена попадают в схему.",
+                "A button saves a card into an EEPROM table, a known card opens the lock, and the screen shows the saving and the access. A named screen or siren is wired in.",
             ),
             "115 мА",
             "высокая",
@@ -268,8 +304,21 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
         Some(ms) => format!("; {} {} мс", if ru { "период" } else { "period" }, ms),
         None => String::new(),
     };
+    // A table that does not fit is clamped, not silently shrunk: an Uno keeps
+    // 255 four-byte UIDs in 1024 bytes of EEPROM.
+    let limit = match card_slots(raw) {
+        Some(n) if wants_access(raw) && n > 255 => format!(
+            "; {}",
+            if ru {
+                format!("в EEPROM Uno помещается 255 карт, запрошено {n}")
+            } else {
+                format!("an Uno EEPROM holds 255 cards, {n} requested")
+            }
+        ),
+        _ => String::new(),
+    };
     let conf = format!("; {} {:.0}%", if ru { "уверенность" } else { "confidence" }, s.confidence * 100.0);
-    Some(format!("{prefix}{}: {} → {}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, conf))
+    Some(format!("{prefix}{}: {} → {}{}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, limit, conf))
 }
 
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
@@ -2296,7 +2345,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::ServoSweep => servo_sweep(lang, choice),
         Tid::ServoPot => servo_sweep(lang, if choice == 1 { 1 } else { 2 }),
         Tid::BuzzerTone => buzzer_tone(lang, choice),
-        Tid::Rfid => rfid(lang, choice, card_slots(&intent.raw).unwrap_or(49)),
+        Tid::Rfid => rfid(lang, choice, &intent.raw),
         Tid::Radio433 => radio433(lang, choice),
         Tid::RadioNrf => radio_nrf(lang, choice),
         Tid::Bluetooth => bluetooth(lang, choice),
@@ -3242,7 +3291,7 @@ fn stepper(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
 
 // ---------------------------------------------------------------- lessons 5-10
 
-fn rfid(lang: Lang, choice: usize, slots: usize) -> (Circuit, String, L, Vec<L>) {
+fn rfid(lang: Lang, choice: usize, raw: &str) -> (Circuit, String, L, Vec<L>) {
     let mut b = B::new(lang);
     let rc = b.breakout("U2", "RC522", Pt::new(2.0, 54.0));
     let gnd = b.gnd(74.0);
@@ -3287,39 +3336,77 @@ fn rfid(lang: Lang, choice: usize, slots: usize) -> (Circuit, String, L, Vec<L>)
             )
         }
         3 => {
-            let oled = b.breakout("DS1", "OLED 0.96", Pt::new(2.0, 122.0));
-            b.w(b.uno_pin("5V"), b.mp(oled, "VCC"), NetClass::Vcc);
-            b.w(b.mp(oled, "GND"), b.gnd(78.0), NetClass::Gnd);
-            b.w(b.uno_pin("A4"), b.mp(oled, "SDA"), NetClass::Signal);
-            b.w(b.uno_pin("A5"), b.mp(oled, "SCL"), NetClass::Signal);
-            let rl = b.bench(Kind::Relay, "K1", "SRD-05VDC", Pt::new(44.0, 122.0));
+            let spec = access_spec(raw);
+            let module = match spec.screen {
+                ScreenKind::Lcd => "LCD1602",
+                ScreenKind::Lcd2004 => "LCD2004",
+                _ => "OLED 0.96",
+            };
+            let display = b.breakout("DS1", module, Pt::new(2.0, 122.0));
+            b.w(b.uno_pin("5V"), b.mp(display, "VCC"), NetClass::Vcc);
+            b.w(b.mp(display, "GND"), b.gnd(78.0), NetClass::Gnd);
+            b.w(b.uno_pin("A4"), b.mp(display, "SDA"), NetClass::Signal);
+            b.w(b.uno_pin("A5"), b.mp(display, "SCL"), NetClass::Signal);
+            // A wide LCD2004 needs the relay and the siren to move right.
+            let relay_x = match spec.screen {
+                ScreenKind::Lcd2004 => 104.0,
+                ScreenKind::Lcd => 66.0,
+                _ => 44.0,
+            };
+            let rl = b.bench(Kind::Relay, "K1", "SRD-05VDC", Pt::new(relay_x, 122.0));
             b.w(b.uno_pin("D8"), rl[0], NetClass::Signal);
             b.w(rl[1], b.vcc(82.0), NetClass::Vcc);
             b.w(rl[2], gnd, NetClass::Gnd);
             let btn = b.button("B1", 16, Row::E);
             b.w(b.uno_pin("D2"), btn[3], NetClass::Signal);
             b.w(btn[0], gnd, NetClass::Gnd);
+            if spec.siren {
+                let bz = b.bench(Kind::Buzzer, "BZ1", "пьезо", Pt::new(relay_x + 30.0, 122.0));
+                b.w(b.uno_pin("D7"), bz[1], NetClass::Signal);
+                b.w(bz[0], gnd, NetClass::Gnd);
+            }
+            let mut notes = vec![
+                L::new(
+                    "EEPROM Uno — 1024 байта: заголовок 2 байта и по 4 байта на UID карты.",
+                    "An Uno's EEPROM is 1024 bytes: a 2-byte header and 4 bytes per card UID.",
+                ),
+                L::new(
+                    "Пишутся только карты на 4 байта (MIFARE Classic); метки на 7 байт не сохраняются.",
+                    "Only 4-byte UIDs (MIFARE Classic) are saved; 7-byte tags are refused.",
+                ),
+                L::new(
+                    "Модуль реле активен низким уровнем: экран и замок питаются от 5 В платы.",
+                    "The relay module is active low; the screen and the lock run from the board's 5 V.",
+                ),
+            ];
+            if spec.siren {
+                notes.push(L::new(
+                    "Сирена на D7 звучит, когда карта не найдена в таблице.",
+                    "The siren on D7 sounds when the card is not in the table.",
+                ));
+            }
+            match spec.screen {
+                ScreenKind::Lcd => notes.push(L::new(
+                    "LCD1602 по I2C (A4/A5) показывает статус и число карт; считыватель остаётся на SPI.",
+                    "The I2C LCD1602 (A4/A5) shows the status and the card count; the reader stays on SPI.",
+                )),
+                ScreenKind::Lcd2004 => notes.push(L::new(
+                    "LCD2004 по I2C (A4/A5) показывает статус, число карт и UID; считыватель остаётся на SPI.",
+                    "The I2C LCD2004 (A4/A5) shows the status, the card count and the UID; the reader stays on SPI.",
+                )),
+                _ => notes.push(L::new(
+                    "OLED 128×64 по I2C (A4/A5) показывает статус, число карт и UID.",
+                    "The I2C OLED 128×64 (A4/A5) shows the status, the card count and the UID.",
+                )),
+            }
             (
                 b.finish(),
-                access_sketch(lang, slots),
+                access_sketch(lang, &spec),
                 L::new(
                     "Таблица карт живёт в EEPROM, кнопка пишет карту, замок открывается знакомой картой.",
                     "The card table lives in EEPROM, a button saves a card, and a known card opens the lock.",
                 ),
-                vec![
-                    L::new(
-                        "EEPROM Uno — 1024 байта: заголовок 2 байта и по 4 байта на UID карты.",
-                        "An Uno's EEPROM is 1024 bytes: a 2-byte header and 4 bytes per card UID.",
-                    ),
-                    L::new(
-                        "Пишутся только карты на 4 байта (MIFARE Classic); метки на 7 байт не сохраняются.",
-                        "Only 4-byte UIDs (MIFARE Classic) are saved; 7-byte tags are refused.",
-                    ),
-                    L::new(
-                        "Модуль реле активен низким уровнем: экран и замок питаются от 5 В платы.",
-                        "The relay module is active low; the screen and the lock run from the board's 5 V.",
-                    ),
-                ],
+                notes,
             )
         }
         _ => (
@@ -3801,22 +3888,91 @@ void loop() {
     )
 }
 
-fn access_sketch(lang: Lang, slots: usize) -> String {
+fn access_sketch(lang: Lang, spec: &AccessSpec) -> String {
+    let (display_includes, display_object, display_setup, show_body) = match spec.screen {
+        ScreenKind::Lcd => (
+            "#include <LiquidCrystal_I2C.h>\n",
+            "LiquidCrystal_I2C lcd(0x27, 16, 2);\n",
+            "  Wire.begin();\n  lcd.init();\n  lcd.backlight();\n",
+            concat!(
+                "  lcd.clear();\n",
+                "  lcd.setCursor(0, 0);\n",
+                "  lcd.print(line);\n",
+                "  lcd.setCursor(0, 1);\n",
+                "  lcd.print(F(\"cards \"));\n",
+                "  lcd.print(stored());\n",
+                "  lcd.print('/');\n",
+                "  lcd.print(MAX_CARDS);\n",
+            ),
+        ),
+        ScreenKind::Lcd2004 => (
+            "#include <LiquidCrystal_I2C.h>\n",
+            "LiquidCrystal_I2C lcd(0x27, 20, 4);\n",
+            "  Wire.begin();\n  lcd.init();\n  lcd.backlight();\n",
+            concat!(
+                "  lcd.clear();\n",
+                "  lcd.setCursor(0, 0);\n",
+                "  lcd.print(line);\n",
+                "  lcd.setCursor(0, 1);\n",
+                "  lcd.print(F(\"cards \"));\n",
+                "  lcd.print(stored());\n",
+                "  lcd.print('/');\n",
+                "  lcd.print(MAX_CARDS);\n",
+                "  if (uid) {\n",
+                "    lcd.setCursor(0, 2);\n",
+                "    for (uint8_t i = 0; i < UID_LEN; i++) {\n",
+                "      if (uid[i] < 0x10) lcd.print('0');\n",
+                "      lcd.print(uid[i], HEX);\n",
+                "      lcd.print(' ');\n",
+                "    }\n",
+                "  }\n",
+            ),
+        ),
+        _ => (
+            "#include <Adafruit_GFX.h>\n#include <Adafruit_SSD1306.h>\n",
+            "Adafruit_SSD1306 oled(128, 64, &Wire, -1);\n",
+            "  Wire.begin();\n  oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n  oled.setTextSize(1);\n  oled.setTextColor(SSD1306_WHITE);\n",
+            concat!(
+                "  oled.clearDisplay();\n",
+                "  oled.setCursor(0, 0);\n",
+                "  oled.println(line);\n",
+                "  oled.print(F(\"cards \"));\n",
+                "  oled.print(stored());\n",
+                "  oled.print('/');\n",
+                "  oled.println(MAX_CARDS);\n",
+                "  if (uid) {\n",
+                "    for (uint8_t i = 0; i < UID_LEN; i++) {\n",
+                "      if (uid[i] < 0x10) oled.print('0');\n",
+                "      oled.print(uid[i], HEX);\n",
+                "      oled.print(' ');\n",
+                "    }\n",
+                "    oled.println();\n",
+                "  }\n",
+                "  oled.display();\n",
+            ),
+        ),
+    };
+    let siren_decl = if spec.siren { "const uint8_t BUZZ = 7;\n" } else { "" };
+    let siren_setup = if spec.siren { "  pinMode(BUZZ, OUTPUT);\n" } else { "" };
+    let siren_deny = if spec.siren { "    tone(BUZZ, 1200, 300);\n" } else { "" };
+    let header = match spec.screen {
+        ScreenKind::Lcd => "// D2 — кнопка записи, D8 — реле замка, SPI — RC522, I2C — LCD1602",
+        ScreenKind::Lcd2004 => "// D2 — кнопка записи, D8 — реле замка, SPI — RC522, I2C — LCD2004",
+        _ => "// D2 — кнопка записи, D8 — реле замка, SPI — RC522, I2C — OLED 128x64",
+    };
     fill(
         r#"// <<C0>>
-// D2 — кнопка записи, D8 — реле замка, SPI — RC522, I2C — OLED 128x64
+<<HEADER>>
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <EEPROM.h>
+<<DISPLAY_INCLUDES>>#include <EEPROM.h>
 
 const uint8_t SS_PIN = 10;
 const uint8_t RST_PIN = 9;
 const uint8_t BTN = 2;
 const uint8_t LOCK = 8;
-const uint8_t MAX_CARDS = <<SLOTS>>;
+<<SIREN_DECL>>const uint8_t MAX_CARDS = <<SLOTS>>;
 const uint8_t MAGIC = 0xA5;
 const uint8_t COUNT = 1;              // число карт в таблице
 const uint8_t TABLE = 2;              // начало таблицы UID
@@ -3825,8 +3981,7 @@ const uint16_t OPEN_MS = 5000;
 const uint16_t GAP_MS = 300;
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-Adafruit_SSD1306 oled(128, 64, &Wire, -1);
-uint32_t openedAt = 0;
+<<DISPLAY_OBJECT>>uint32_t openedAt = 0;
 uint32_t seenAt = 0;
 
 uint8_t stored() {
@@ -3854,36 +4009,16 @@ void saveCard(uint8_t slot, const byte *uid) {
 }
 
 void show(const char *line, const byte *uid) {
-  oled.clearDisplay();
-  oled.setCursor(0, 0);
-  oled.println(line);
-  oled.print(F("cards "));
-  oled.print(stored());
-  oled.print('/');
-  oled.println(MAX_CARDS);
-  if (uid) {
-    for (uint8_t i = 0; i < UID_LEN; i++) {
-      if (uid[i] < 0x10) oled.print('0');
-      oled.print(uid[i], HEX);
-      oled.print(' ');
-    }
-    oled.println();
-  }
-  oled.display();
-}
+<<SHOW>>}
 
 void setup() {
   pinMode(LOCK, OUTPUT);
   digitalWrite(LOCK, HIGH);           // модуль реле активен низким
   pinMode(BTN, INPUT_PULLUP);
-  Serial.begin(9600);
+<<SIREN_SETUP>>  Serial.begin(9600);
   SPI.begin();
   mfrc522.PCD_Init();
-  Wire.begin();
-  oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-  if (EEPROM.read(0) != MAGIC) {
+<<DISPLAY_SETUP>>  if (EEPROM.read(0) != MAGIC) {
     EEPROM.update(0, MAGIC);
     EEPROM.update(COUNT, 0);
   }
@@ -3915,7 +4050,7 @@ void loop() {
     openedAt = millis();
     show("ACCESS OPEN", mfrc522.uid.uidByte);
   } else {
-    show("ACCESS DENIED", mfrc522.uid.uidByte);
+<<SIREN_DENY>>    show("ACCESS DENIED", mfrc522.uid.uidByte);
   }
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
@@ -3923,7 +4058,15 @@ void loop() {
 "#,
         &[
             ("C0", tr(lang, "Контроль доступа: таблица карт в EEPROM", "Access control: the card table in EEPROM")),
-            ("SLOTS", &slots.to_string()),
+            ("HEADER", header),
+            ("DISPLAY_INCLUDES", display_includes),
+            ("DISPLAY_OBJECT", display_object),
+            ("DISPLAY_SETUP", display_setup),
+            ("SHOW", show_body),
+            ("SIREN_DECL", siren_decl),
+            ("SIREN_SETUP", siren_setup),
+            ("SIREN_DENY", siren_deny),
+            ("SLOTS", &spec.slots.to_string()),
         ],
     )
 }
@@ -4399,6 +4542,74 @@ mod tests {
         assert!(values.iter().any(|v| v.contains("OLED")), "{values:?}");
         assert!(values.iter().any(|v| *v == "RC522"), "{values:?}");
         assert!(!built.code.contains("delay("), "loop must not block");
+    }
+
+    /// The door scene is recognised through typos and through the reader
+    /// alone, but a plain "EEPROM" task without a door stays a counter.
+    #[test]
+    fn the_access_scene_is_recognised_by_its_meaning() {
+        for text in [
+            "контроль доступа на 49 карт в EEPROM",
+            "доспуп по картам в энергонезовисимую память",
+            "пропуск на 20 карт, таблица карт в памяти",
+            "турникет с базой карт в EEPROM",
+            "RFID RC522 с экраном и базой карт в EEPROM",
+            "замок на скуд, карты в EEPROM",
+        ] {
+            assert!(wants_access(text), "{text}");
+        }
+        for text in [
+            "счётчик нажатий с записью в EEPROM",
+            "выведи все данные из памяти EEPROM",
+            "считыватель RFID RC522, UID в порт",
+            "Карта памяти SD",
+        ] {
+            assert!(!wants_access(text), "{text}");
+        }
+    }
+
+    /// A screen named by the task replaces the default OLED, so the scene
+    /// shows the part the user asked for instead of a fixed picture.
+    #[test]
+    fn a_named_screen_goes_into_the_access_scene() {
+        let text = "контроль доступа на 50 карт в энергозависимую память EEPROM с LCD1602";
+        let p = parse(text);
+        assert_eq!(p.intent.load, Load::Rfid);
+        assert!(p.intent.lesson.is_none(), "the display lesson must not win");
+        let plan = plan(&p.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.recommended, 3);
+        let built = build(&p.intent, 3, Lang::Ru).expect("builds");
+        assert!(built.code.contains("#include <LiquidCrystal_I2C.h>"), "no LCD");
+        assert!(!built.code.contains("Adafruit_SSD1306"), "the OLED stayed");
+        assert!(built.code.contains("MAX_CARDS = 50"), "wrong table size");
+        let values: Vec<&str> = built.circuit.parts().map(|p| p.value.as_str()).collect();
+        assert!(values.iter().any(|v| *v == "LCD1602"), "{values:?}");
+        assert!(values.iter().any(|v| *v == "SRD-05VDC"), "{values:?}");
+    }
+
+    /// A siren named in the sentence is wired and sounds on a refused card.
+    #[test]
+    fn a_named_siren_sounds_on_a_refused_card() {
+        let text = "контроль доступа на 49 карт в EEPROM с экраном, чужая карта сирена";
+        let p = parse(text);
+        let built = build(&p.intent, 3, Lang::Ru).expect("builds");
+        assert!(built.code.contains("const uint8_t BUZZ = 7;"), "no siren pin");
+        assert!(built.code.contains("tone(BUZZ, 1200, 300);"), "no siren call");
+        let values: Vec<&str> = built.circuit.parts().map(|p| p.value.as_str()).collect();
+        assert!(values.iter().any(|v| *v == "пьезо"), "{values:?}");
+    }
+
+    /// The EEPROM of an Uno holds 255 four-byte UIDs, so a bigger request is
+    /// clamped and the plan says why instead of pretending to fit.
+    #[test]
+    fn a_table_bigger_than_the_eeprom_is_clamped_and_explained() {
+        let text = "контроль доступа на 300 карт в EEPROM с экраном";
+        let p = parse(text);
+        let plan = plan(&p.intent, Lang::Ru).expect("plans");
+        let why = plan.why.clone().expect("no explanation");
+        assert!(why.contains("255") && why.contains("300"), "{why}");
+        let built = build(&p.intent, 3, Lang::Ru).expect("builds");
+        assert!(built.code.contains("MAX_CARDS = 255"), "not clamped");
     }
 
     /// Every lesson from the course book has to plan and build without a

@@ -695,6 +695,11 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     {
         lesson = None;
     }
+    // A card table with a screen is the access scene: a display the sentence
+    // names must not turn the whole task into the display lesson.
+    if load == Load::Rfid && crate::templates::wants_access(raw) {
+        lesson = None;
+    }
     // "Пусть лампочка плавно гаснет" is the PWM lesson: same parts as the
     // blink, but the code fades instead of switching.
     if lesson.is_none()
