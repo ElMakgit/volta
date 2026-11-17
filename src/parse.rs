@@ -916,6 +916,14 @@ mod tests {
     }
 
     #[test]
+    fn an_inflected_phrase_key_is_heard() {
+        let p = parse("по датчику света включай лампу вечером");
+        assert_eq!(p.intent.load, Load::Led);
+        assert_eq!(p.intent.input, Some(Input::Ldr));
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported);
+    }
+
+    #[test]
     fn recognises_english_dimming() {
         let p = parse("Blink an LED, and let a button toggle it");
         assert_eq!(p.intent.load, Load::Led);

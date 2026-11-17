@@ -186,28 +186,44 @@ pub fn mentions(text: &str, key: &str) -> bool {
     if text.contains(&key) {
         return true;
     }
-    // A key with a space, a digit or a hyphen is a whole phrase or a part
-    // number (`max7219`, `hc-05`, `2 двигател`). Editing it by one letter
-    // would let "двигателя" match "2 двигател", so such keys are exact.
-    if !key.chars().all(|c| c.is_alphabetic()) {
+    // A key with a digit or a hyphen is a whole phrase or a part number
+    // (`max7219`, `hc-05`, `2 двигател`). Editing it by one letter would let
+    // "двигателя" match "2 двигател", so such keys are exact.
+    let words: Vec<&str> = key.split_whitespace().collect();
+    if !words.iter().all(|w| w.chars().all(|c| c.is_alphabetic())) {
         return false;
     }
-    let key_stem = stem(&key);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    // A phrase key ("датчик свет") is matched word by word: every word is
+    // folded to its stem, so "по датчику света" still finds "датчик свет".
+    if words.len() > 1 {
+        return tokens
+            .windows(words.len())
+            .any(|window| window.iter().zip(&words).all(|(t, k)| word_matches(t, k)));
+    }
+    let Some(key) = words.first().copied() else {
+        return false;
+    };
+    tokens.iter().any(|token| word_matches(token, key))
+}
+
+/// One word of a key against one word of the sentence: same stem, or one
+/// typo on a real word.
+fn word_matches(token: &str, key: &str) -> bool {
+    let token_stem = stem(token);
+    let key_stem = stem(key);
+    if alike(&token_stem, &key_stem) || alike(&token_stem, key) {
+        return true;
+    }
+    // One typo is allowed on a real word of at least six letters and two on
+    // a long one. Shorter stems differ by a letter for unrelated reasons
+    // ("пульт" and "пельтье"), and a typo there is a false hit.
     let key_len = key_stem.chars().count();
-    for token in text.split_whitespace() {
-        let token_stem = stem(token);
-        if alike(&token_stem, &key_stem) || alike(&token_stem, &key) {
+    let len = token.chars().count();
+    if key_len >= 6 && len >= 5 {
+        let cap = if len >= 9 && key_len >= 9 { 2 } else { 1 };
+        if distance(&token_stem, &key_stem) <= cap {
             return true;
-        }
-        // One typo is allowed on a real word of at least six letters and two
-        // on a long one. Shorter stems differ by a letter for unrelated
-        // reasons ("пульт" and "пельтье"), and a typo there is a false hit.
-        let len = token.chars().count();
-        if key_len >= 6 && len >= 5 {
-            let cap = if len >= 9 && key_len >= 9 { 2 } else { 1 };
-            if distance(&token_stem, &key_stem) <= cap {
-                return true;
-            }
         }
     }
     false
@@ -222,6 +238,15 @@ mod tests {
         assert_eq!(normalize("  Мотор, Ёмкость!  "), "мотор емкость");
         assert_eq!(normalize("cветодиод"), "светодиод");
         assert_eq!(normalize("HC-05"), "hc-05");
+    }
+
+    #[test]
+    fn phrases_match_through_cases() {
+        assert!(mentions("по датчику света включай лампу", "датчик свет"));
+        assert!(mentions("мощной нагрузке", "мощной нагрузки"));
+        assert!(mentions("цветным светодиодом", "цветн светодиод"));
+        assert!(!mentions("второго светодиода", "первый светодиод"));
+        assert!(!mentions("свет датчик", "датчик свет"));
     }
 
     #[test]
