@@ -128,6 +128,11 @@ fn draw_text(
 
 /// Rasterise a scene into a PNG. `width_px` fixes the horizontal resolution;
 /// the height follows the scene aspect so nothing is stretched.
+///
+/// The scene has already moved its primitives to its own origin (see
+/// `Scene::translate`), so their coordinates are scene millimetres. Using
+/// `scene.origin` here as well would shift the picture a second time and crop
+/// its right and bottom edges.
 pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
     let scale = width_px as f32 / scene.w.max(1e-3);
     let height = (scene.h * scale).round().max(1.0) as u32;
@@ -138,14 +143,14 @@ pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
             Prim::Rect { r, fill, stroke, .. } => {
                 rect(
                     &mut img,
-                    (r.x - scene.origin.x) * scale,
-                    (r.y - scene.origin.y) * scale,
+                    r.x * scale,
+                    r.y * scale,
                     r.w * scale,
                     r.h * scale,
                     px(*fill),
                 );
                 if let Some((colour, w)) = stroke {
-                    let (x, y) = ((r.x - scene.origin.x) * scale, (r.y - scene.origin.y) * scale);
+                    let (x, y) = (r.x * scale, r.y * scale);
                     let (wpx, hpx) = (r.w * scale, r.h * scale);
                     let s = px(*colour);
                     segment(&mut img, x, y, x + wpx, y, *w * scale, s);
@@ -155,7 +160,7 @@ pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
                 }
             }
             Prim::Circle { c, r, fill, stroke } => {
-                let (cx, cy) = ((c.x - scene.origin.x) * scale, (c.y - scene.origin.y) * scale);
+                let (cx, cy) = (c.x * scale, c.y * scale);
                 disc(&mut img, cx, cy, *r * scale, px(*fill));
                 if let Some((colour, w)) = stroke {
                     let steps = (2.0 * std::f32::consts::PI * *r * scale / 1.0).ceil().max(8.0) as usize;
@@ -180,10 +185,10 @@ pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
                     let Some(q) = it.peek() else { break };
                     segment(
                         &mut img,
-                        (p.x - scene.origin.x) * scale,
-                        (p.y - scene.origin.y) * scale,
-                        (q.x - scene.origin.x) * scale,
-                        (q.y - scene.origin.y) * scale,
+                        p.x * scale,
+                        p.y * scale,
+                        q.x * scale,
+                        q.y * scale,
                         *w * scale,
                         px(*color),
                     );
@@ -192,10 +197,10 @@ pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
                     let (a, b) = (pts.first().unwrap(), pts.last().unwrap());
                     segment(
                         &mut img,
-                        (a.x - scene.origin.x) * scale,
-                        (a.y - scene.origin.y) * scale,
-                        (b.x - scene.origin.x) * scale,
-                        (b.y - scene.origin.y) * scale,
+                        a.x * scale,
+                        a.y * scale,
+                        b.x * scale,
+                        b.y * scale,
                         *w * scale,
                         px(*color),
                     );
@@ -208,8 +213,8 @@ pub fn image_from_scene(scene: &Scene, width_px: u32) -> RgbaImage {
                 draw_text(
                     &mut img,
                     text,
-                    (p.x - scene.origin.x) * scale,
-                    (p.y - scene.origin.y) * scale,
+                    p.x * scale,
+                    p.y * scale,
                     *size * scale,
                     *bold,
                     *anchor,
@@ -267,5 +272,27 @@ mod tests {
         assert!(data.starts_with(&[0x89, b'P', b'N', b'G']));
         assert!(data.len() > 100);
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Primitives already sit at the scene origin, so a non-zero origin must
+    /// not shift them again: that used to crop the right and bottom edges.
+    #[test]
+    fn a_non_zero_origin_does_not_shift_the_picture() {
+        let scene = Scene {
+            prims: vec![Prim::Rect {
+                r: Rect::new(1.0, 1.0, 2.0, 2.0),
+                radius: 0.0,
+                fill: Rgba::rgb(200, 10, 20),
+                stroke: None,
+            }],
+            owners: vec![],
+            bg: Rgba::rgb(240, 240, 240),
+            w: 10.0,
+            h: 10.0,
+            origin: Pt::new(100.0, -50.0),
+        };
+        let img = image_from_scene(&scene, 100);
+        assert_eq!(*img.get_pixel(15, 15), px(Rgba::rgb(200, 10, 20)));
+        assert_eq!(*img.get_pixel(95, 95), px(Rgba::rgb(240, 240, 240)));
     }
 }

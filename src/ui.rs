@@ -289,6 +289,8 @@ impl Drag {
 
 pub struct App {
     lang: Lang,
+    /// The user picked a language, so the desktop's tag must not override it.
+    lang_pinned: bool,
     tr: Tr,
     theme: Theme,
     mode: Mode,
@@ -332,6 +334,10 @@ pub struct App {
     about: bool,
     about_tex: Option<egui::TextureHandle>,
     quit_ask: bool,
+    /// The user confirmed the quit question. The window manager's close
+    /// request arrives again after that, and must be allowed through instead
+    /// of being cancelled for unsaved work a second time.
+    closing: bool,
     status: String,
     status_bad: bool,
     error: Option<String>,
@@ -366,10 +372,12 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         let theme = Theme::load();
-        let lang = Lang::from_tag(&crate::theme::language_tag());
+        let lang = crate::config::lang();
+        let lang_pinned = crate::config::load_lang().is_some();
         let draft = Draft::new();
         Self {
             lang,
+            lang_pinned,
             tr: Tr::new(lang),
             theme,
             mode: Mode::Ai,
@@ -403,6 +411,7 @@ impl App {
             about: false,
             about_tex: None,
             quit_ask: false,
+            closing: false,
             status: String::new(),
             status_bad: false,
             error: None,
@@ -517,6 +526,24 @@ impl App {
 
     fn t(&self, key: &str) -> String {
         self.tr.t(key)
+    }
+
+    /// Switch the whole interface: labels, plan, checks and sketch. A manual
+    /// pick is written to the config so the next start keeps it and the theme
+    /// poll has nothing to undo.
+    fn set_lang(&mut self, lang: Lang, remember: bool) {
+        self.lang = lang;
+        self.tr = Tr::new(lang);
+        if remember {
+            crate::config::save_lang(lang.code());
+            self.lang_pinned = true;
+        }
+        // Every generated sentence carries its language, so the plan and the
+        // circuit built from it are rebuilt rather than just repainted.
+        if self.parsed.is_some() {
+            self.plan_now();
+        }
+        self.refresh_manual();
     }
 
     /// Switching the routing is a preference, not a circuit edit, so the
@@ -1144,10 +1171,11 @@ impl App {
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
-        if self.dirty() {
-            self.quit_ask = true;
-        } else {
+        if self.closing || !self.dirty() {
+            self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.quit_ask = true;
         }
     }
 
@@ -1312,13 +1340,30 @@ impl App {
         if q && !typing && !ctrl {
             self.request_close(ctx);
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ask {
-            if self.dirty() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.quit_ask = true;
-            }
+        if ctx.input(|i| i.viewport().close_requested())
+            && cancels_close(self.dirty(), self.quit_ask, self.closing)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_ask = true;
         }
     }
+}
+
+/// A close request is cancelled only to ask about unsaved work, and only
+/// once: after "Выйти" the answer is known, so the window may actually go.
+fn cancels_close(dirty: bool, quit_ask: bool, closing: bool) -> bool {
+    dirty && !quit_ask && !closing
+}
+
+/// The language the running window should switch to, or `None` if it should
+/// stay as it is. A language picked by hand is never overridden: the theme
+/// poll runs every frame or two and used to reset the choice immediately.
+fn desktop_lang(pinned: bool, tag: &str, current: Lang) -> Option<Lang> {
+    if pinned {
+        return None;
+    }
+    let lang = Lang::from_tag(tag);
+    (lang != current).then_some(lang)
 }
 
 impl eframe::App for App {
@@ -1331,14 +1376,9 @@ impl eframe::App for App {
                 Mode::Manual => self.refresh_manual(),
             }
         }
-        let lang = Lang::from_tag(&crate::theme::language_tag());
-        if lang != self.lang {
-            self.lang = lang;
-            self.tr = Tr::new(lang);
-            if self.parsed.is_some() {
-                self.plan_now();
-            }
-            self.refresh_manual();
+        if let Some(lang) = desktop_lang(self.lang_pinned, &crate::theme::language_tag(), self.lang)
+        {
+            self.set_lang(lang, false);
         }
         ctx.request_repaint_after(Duration::from_secs(2));
         self.keys(ctx);
@@ -1420,13 +1460,11 @@ impl eframe::App for App {
                             .on_hover_text(self.t("help.language"))
                             .clicked()
                         {
-                            self.lang = match self.lang {
-                                crate::text::Lang::Ru => crate::text::Lang::En,
-                                crate::text::Lang::En => crate::text::Lang::Ru,
+                            let next = match self.lang {
+                                Lang::Ru => Lang::En,
+                                Lang::En => Lang::Ru,
                             };
-                            self.tr = crate::text::Tr::new(self.lang);
-                            self.refresh_ai();
-                            self.refresh_manual();
+                            self.set_lang(next, true);
                         }
                         if ui
                             .button(RichText::new("◐").size(12.0).color(muted))
@@ -3920,6 +3958,13 @@ impl App {
         }
         let title = self.t("about.title");
         let line = self.t("about.line");
+        // The version comes from Cargo.toml, so the window can never claim a
+        // build other than the one it was compiled from.
+        let version = format!(
+            "{} {}",
+            self.t("about.version"),
+            env!("CARGO_PKG_VERSION")
+        );
         let close = self.t("about.close");
         let tex = self.about_tex.clone();
         let mut open = true;
@@ -3947,6 +3992,7 @@ impl App {
                 }
                 ui.add_space(10.0);
                 ui.label(RichText::new("ElMak").size(20.0).strong().color(fg));
+                ui.label(RichText::new(&version).size(12.0).color(muted));
                 ui.label(RichText::new(line).size(12.0).color(muted));
                 ui.add_space(12.0);
                 if ui
@@ -4121,7 +4167,11 @@ impl App {
                             .add(Button::new(RichText::new(self.t("quit.yes"))))
                             .clicked()
                         {
+                            // The close request comes back next frame while
+                            // the circuit is still unsaved; `closing` tells
+                            // the handler this time is the real one.
                             self.quit_ask = false;
+                            self.closing = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
@@ -4612,6 +4662,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The quit question is asked once. A confirmed quit sets `closing`, and
+    /// the close request that follows must not be cancelled as unsaved work.
+    #[test]
+    fn a_confirmed_quit_is_not_cancelled_again() {
+        assert!(cancels_close(true, false, false), "first close asks");
+        assert!(!cancels_close(true, true, false), "the question is open");
+        assert!(!cancels_close(true, false, true), "the quit is confirmed");
+        assert!(!cancels_close(false, false, false), "nothing to ask");
+    }
+
+    /// A language picked by hand must survive the theme poll, which reads the
+    /// desktop tag every couple of seconds.
+    #[test]
+    fn a_picked_language_is_not_rolled_back() {
+        assert_eq!(desktop_lang(false, "ru", Lang::En), Some(Lang::Ru));
+        assert_eq!(desktop_lang(false, "ru", Lang::Ru), None);
+        assert_eq!(desktop_lang(false, "en", Lang::Ru), Some(Lang::En));
+        // The pick wins even when the desktop says otherwise.
+        assert_eq!(desktop_lang(true, "ru", Lang::En), None);
+        assert_eq!(desktop_lang(true, "en", Lang::Ru), None);
     }
 
     /// The mapping has to respect the scene's shift; that is what put clicks a

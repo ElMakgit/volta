@@ -91,7 +91,7 @@ fn flags(args: &[String]) -> Flags {
         task: String::new(),
         choice: 0,
         out: png::default_dir(),
-        lang: text::Lang::from_tag(&theme::language_tag()),
+        lang: crate::config::lang(),
         labels: false,
         wires: crate::config::load_wire_style(),
         json: false,
@@ -328,7 +328,7 @@ fn cmd_render(args: &[String]) {
 }
 
 fn cmd_list() {
-    let lang = text::Lang::from_tag(&theme::language_tag());
+    let lang = crate::config::lang();
     let rows = [
         (
             text::L::new("двигатель + кнопка", "motor + button"),

@@ -111,6 +111,39 @@ pub fn save_export_kind_at(path: &Path, key: &str) -> std::io::Result<()> {
     put(path, "export_kind", serde_json::Value::from(key))
 }
 
+/// The language the user picked by hand, if any. `None` means the app has
+/// never been switched and should follow the desktop's own language.
+pub fn load_lang() -> Option<String> {
+    load_lang_at(&config_path())
+}
+
+pub fn load_lang_at(path: &Path) -> Option<String> {
+    read(path)
+        .get("lang")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+pub fn save_lang(tag: &str) {
+    let _ = save_lang_at(&config_path(), tag);
+}
+
+pub fn save_lang_at(path: &Path, tag: &str) -> std::io::Result<()> {
+    put(path, "lang", serde_json::Value::from(tag))
+}
+
+/// The language the app starts in: the user's own pick, or the desktop's tag
+/// until they make one. A manual choice has to win, otherwise the theme poll
+/// would switch the interface back on every frame.
+pub fn lang() -> crate::text::Lang {
+    lang_from(&load_lang(), &crate::theme::language_tag())
+}
+
+/// Split out so the priority rule can be tested without a config file.
+pub fn lang_from(picked: &Option<String>, desktop: &str) -> crate::text::Lang {
+    crate::text::Lang::from_tag(picked.as_deref().unwrap_or(desktop))
+}
+
 /// The task left unfinished last time. An empty task is no draft at all.
 pub fn load_draft() -> Option<(String, bool)> {
     load_draft_at(&config_path())
@@ -250,6 +283,24 @@ mod tests {
         let path = scratch("blank-draft");
         save_draft_at(&path, "   ", false).unwrap();
         assert!(load_draft_at(&path).is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A language picked by hand outranks the desktop tag, and it survives a
+    /// restart. Without a pick the desktop decides.
+    #[test]
+    fn a_picked_language_wins_over_the_desktop() {
+        use crate::text::Lang;
+        let path = scratch("lang");
+        assert!(load_lang_at(&path).is_none());
+        assert_eq!(lang_from(&None, "ru"), Lang::Ru);
+        assert_eq!(lang_from(&None, "en_GB"), Lang::En);
+        save_lang_at(&path, "en").unwrap();
+        assert_eq!(load_lang_at(&path).as_deref(), Some("en"));
+        assert_eq!(lang_from(&load_lang_at(&path), "ru"), Lang::En);
+        // One key does not forget the others.
+        save_wire_style_at(&path, WireStyle::Arc).unwrap();
+        assert_eq!(load_lang_at(&path).as_deref(), Some("en"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

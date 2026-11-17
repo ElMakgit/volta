@@ -2014,6 +2014,31 @@ mod tests {
         }
     }
 
+    /// Text scenes put wide boards side by side, so they are a separate
+    /// layout and need their own frame check.
+    #[test]
+    fn text_scenes_fit_their_frame() {
+        for text in [
+            "текст на экране",
+            "текст на двух экранах",
+            "текст на трёх экранах",
+            "текст на четырёх экранах",
+            "текст на двух LCD2004",
+            "две надписи на двух OLED",
+        ] {
+            let parsed = crate::parse::parse(text);
+            let plan = templates::plan(&parsed.intent, Lang::Ru)
+                .unwrap_or_else(|| panic!("{text}: does not plan"));
+            for choice in 0..plan.choices.len() {
+                let built = templates::build(&parsed.intent, choice, Lang::Ru)
+                    .unwrap_or_else(|| panic!("{text} #{choice}: does not build"));
+                for labels in [false, true] {
+                    fits_frame(&format!("{text} #{choice}"), &built.circuit, labels);
+                }
+            }
+        }
+    }
+
     /// Third and fourth turns are still exports, so they must not crop either.
     /// Turning the board, and turning every loose part, both go through the
     /// same painter.

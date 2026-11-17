@@ -178,6 +178,7 @@
   "about.title": "Об авторе",
   "about.hint": "Об авторе",
   "about.line": "volta · Rust/egui · офлайн",
+  "about.version": "Версия",
   "about.close": "Закрыть",
   "inspect.title": "Свойства детали",
   "inspect.wire": "Свойства провода",

@@ -569,7 +569,10 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                     .iter()
                     .position(|p| std::ptr::eq(p, led))
                     .unwrap_or(0);
-                over.push((led_idx, format!("{} — {:.0} мА", led.label, i * 1000.0)));
+                over.push((
+                    led_idx,
+                    format!("{} — {:.0} {}", led.label, i * 1000.0, tr(lang, "мА", "mA")),
+                ));
             }
         }
     }

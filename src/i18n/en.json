@@ -178,6 +178,7 @@
   "about.title": "About",
   "about.hint": "About the author",
   "about.line": "volta · Rust/egui · offline",
+  "about.version": "Version",
   "about.close": "Close",
   "inspect.title": "Part properties",
   "inspect.wire": "Wire properties",
