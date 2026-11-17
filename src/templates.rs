@@ -5,7 +5,7 @@
 //! changes the wiring, the code, and what the checks can promise.
 
 use crate::model::*;
-use crate::parse::{Action, Input, Intent, Load, ScreenKind};
+use crate::parse::{Input, Intent, Load, ScreenKind};
 use crate::text::{tr, Lang, L};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -304,7 +304,12 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
         format!("; {}: {}", if ru { "добавлено" } else { "added" }, parts.join(", "))
     };
     let when = match s.period_ms {
-        Some(ms) => format!("; {} {} мс", if ru { "период" } else { "period" }, ms),
+        Some(ms) => format!(
+            "; {} {} {}",
+            if ru { "период" } else { "period" },
+            ms,
+            if ru { "мс" } else { "ms" }
+        ),
         None => String::new(),
     };
     // A table that does not fit is clamped, not silently shrunk: an Uno keeps
@@ -1122,7 +1127,12 @@ fn text_screen_plan(raw: &str, screens: crate::parse::Screens, lang: Lang) -> Pl
     Plan {
         tid: Tid::TextScreens,
         title: L::new("Текст на экране", "Text on a display"),
-        headline: Some(format!("{subject} на {place}")),
+        headline: Some(format!(
+            "{} {} {}",
+            subject,
+            if ru { "на" } else { "on" },
+            place
+        )),
         choices,
         recommended: 0,
         why: Some(why),
@@ -1193,6 +1203,37 @@ fn display_lesson_plan(i: usize, screens: Option<crate::parse::Screens>, lang: L
     }
 }
 
+/// The left edge of a display row, the gap between boards, and the gap
+/// between rows.
+const SCREEN_LEFT: f32 = 2.0;
+const SCREEN_GAP: f32 = 6.0;
+const SCREEN_ROW_GAP: f32 = 8.0;
+
+/// Where the displays of one scene go: below everything already on the bench,
+/// never on top of each other or of the controller. A wide board such as the
+/// 98 mm LCD2004 gets the room it needs, so a row may grow past the Uno
+/// instead of hiding half of the next board.
+fn screen_spots(count: usize, module: &str, top: f32) -> Vec<Pt> {
+    let (w, h) = crate::modules::find(module)
+        .map(|m| (m.w, m.h))
+        .unwrap_or((60.0, 26.0));
+    let right = (crate::model::UNO_X + crate::model::UNO_SIZE.0)
+        .max(SCREEN_LEFT + 2.0 * (w + SCREEN_GAP));
+    let mut out = Vec::with_capacity(count);
+    let (mut x, mut y, mut row_h) = (SCREEN_LEFT, top, 0.0f32);
+    for _ in 0..count {
+        if x > SCREEN_LEFT && x + w > right {
+            x = SCREEN_LEFT;
+            y += row_h + SCREEN_ROW_GAP;
+            row_h = 0.0;
+        }
+        out.push(Pt::new(x, y));
+        x += w + SCREEN_GAP;
+        row_h = row_h.max(h);
+    }
+    out
+}
+
 /// The whole circuit for "text on displays": the screens on the I2C bus, the
 /// power rails, and a sketch that prints the same message on each board.
 fn text_screen_build(
@@ -1204,15 +1245,10 @@ fn text_screen_build(
     let module = modules[choice.min(modules.len() - 1)];
     let mut b = B::new(lang);
     let mut label = 2u8;
-    for n in 0..screens.count {
+    let top = b.c.bbox().bottom() + 8.0;
+    for at in screen_spots(screens.count, module.name, top) {
         let name = format!("U{label}");
         label += 1;
-        // Two 60 mm boards per row: side by side reads better than a tall
-        // column, and 64 mm leaves a small gap between them.
-        let at = Pt::new(
-            2.0 + (n % 2) as f32 * 64.0,
-            54.0 + (n / 2) as f32 * 32.0,
-        );
         let disp = b.breakout(&name, module.name, at);
         if let Some(m) = crate::modules::find(module.name) {
             for (pin, dx, _) in m.pins.iter().copied() {
@@ -1567,10 +1603,11 @@ fn lesson_build(
     if let Some(wish) = screens {
         let modules = display_modules(wish);
         let module = modules[choice.min(modules.len() - 1)].1;
-        for n in 0..wish.count {
+        let top = b.c.bbox().bottom() + 8.0;
+        let h = crate::modules::find(module).map(|m| m.h).unwrap_or(30.0);
+        for at in screen_spots(wish.count, module, top) {
             let name = format!("U{}", label);
             label += 1;
-            let at = Pt::new(2.0 + n as f32 * 36.0, bench_y + 36.0);
             let disp = b.breakout(&name, module, at);
             if let Some(m) = crate::modules::find(module) {
                 for (pin, dx, _) in m.pins.iter().copied() {
@@ -1585,7 +1622,7 @@ fn lesson_build(
                     }
                 }
             }
-            placed.push((at, 30.0));
+            placed.push((at, h));
         }
     }
 
@@ -2502,58 +2539,286 @@ void loop() {
     )
 }
 
+/// Parts the base circuit did not have, in the order they were added, with
+/// the Uno pins they control. The code generator works from this list, so a
+/// part a template already drew keeps its own, hand-written code instead of
+/// getting a second copy.
+pub(crate) struct AddedPart {
+    pub part: usize,
+    pub pins: Vec<u8>,
+}
+
+pub(crate) struct Added {
+    pub parts: Vec<AddedPart>,
+}
+
+fn pin_num(name: &str) -> u8 {
+    name.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0)
+}
+
+/// A shelf below the finished circuit: extras never land on existing parts,
+/// and the picture keeps a readable frame.
+struct ExtraRow {
+    x: f32,
+    y: f32,
+    h: f32,
+}
+
+impl ExtraRow {
+    fn below(c: &Circuit) -> Self {
+        let b = c.bbox();
+        Self { x: b.x.max(2.0), y: b.bottom() + 12.0, h: 0.0 }
+    }
+
+    fn take(&mut self, w: f32, h: f32) -> Pt {
+        if self.x + w > 158.0 {
+            self.x = 2.0;
+            self.y += self.h + 12.0;
+            self.h = 0.0;
+        }
+        let at = Pt::new(self.x, self.y);
+        self.x += w + 12.0;
+        self.h = self.h.max(h);
+        at
+    }
+}
+
+fn free_label(c: &Circuit, prefix: &str) -> String {
+    for n in 1u32.. {
+        let label = format!("{prefix}{n}");
+        if !c.parts().any(|p| p.label == label) {
+            return label;
+        }
+    }
+    unreachable!()
+}
+
+fn bench_part(c: &mut Circuit, kind: Kind, label: &str, value: &str, at: Pt) -> usize {
+    let specs: Vec<PinSpec> = bench_pins(kind, value)
+        .iter()
+        .map(|(name, dx, dy)| PinSpec {
+            name,
+            pos: Pt::new(at.x + dx, at.y + dy),
+            hole: Hole::OffBoard,
+            kind: bench_pin_kind(kind, value, name),
+        })
+        .collect();
+    // A tactile switch has two contacts, each made of two legs. Without the
+    // internal links the mount check rightly calls the unused legs dangling.
+    let internal = if kind == Kind::Button {
+        vec![("1", "2"), ("3", "4")]
+    } else {
+        Vec::new()
+    };
+    c.add_part(kind, label, value, at, specs, internal)
+}
+
+fn count_kinds(c: &Circuit, kinds: &[Kind]) -> usize {
+    c.parts().filter(|p| kinds.contains(&p.kind)).count()
+}
+
+/// A loose diode with the terminal names the checks know: `A` for the anode,
+/// `K` for the cathode. `bench_pins` numbers its two legs 1 and 2 for the
+/// generic axial parts, which is not enough to judge the flyback polarity.
+fn bench_diode(c: &mut Circuit, label: &str, value: &str, at: Pt) -> (usize, usize, usize) {
+    let a = at;
+    let k = Pt::new(at.x + 10.0, at.y);
+    let part = c.add_part(
+        Kind::Diode,
+        label,
+        value,
+        a.mid(k),
+        vec![
+            PinSpec { name: "A", pos: a, hole: Hole::OffBoard, kind: PinKind::Passive },
+            PinSpec { name: "K", pos: k, hole: Hole::OffBoard, kind: PinKind::Passive },
+        ],
+        vec![],
+    );
+    (part, c.pin(part, "A"), c.pin(part, "K"))
+}
+
 /// Add every device the sentence named but the plan did not include. This
-/// runs on both lessons and templates, so "пьезопищалка + экран" is honoured
-/// wherever the wording also matches a ready-made task.
+/// runs on lessons, templates and composed circuits alike, so "пьезопищалка
+/// + экран" and "RFID + светодиод" are honoured wherever the wording also
+/// matches a ready-made task. A kind that is already on the bench is not
+/// added twice: the template's own circuit is the better drawing of it.
 fn augment_devices(
     c: &mut Circuit,
-    code: &mut String,
     named: crate::parse::NamedDevices,
-    lang: Lang,
     ledger: &mut crate::resources::Resources,
-) {
-    let Some(uno) = c.arduino else { return };
-    for n in 0..named.buzzer {
-        let Some(pin) = ledger.claim_pin(&["D8", "D7", "D6", "D5", "D4", "D3", "D2", "A0"]) else { break };
+) -> Added {
+    let mut added = Added { parts: Vec::new() };
+    let Some(uno) = c.arduino else { return added };
+    let gnd = c.pin(uno, "GND2");
+    let vcc = c.pin(uno, "5V");
+    let mut row = ExtraRow::below(c);
+
+    // Extras drive outputs, so they ask for digital pins only: `A0` is an
+    // analog input number in a sketch, and pin 0 there would be D0.
+    let signals = [
+        "D8", "D7", "D6", "D5", "D4", "D3", "D2", "D9", "D10", "D11", "D12", "D13",
+    ];
+    // `analogWrite` only exists on the timer pins; the servo library and a
+    // plain LED work on any digital pin.
+    let pwm = ["D9", "D10", "D3", "D5", "D6", "D11"];
+    let servo_pins = [
+        "D9", "D10", "D3", "D5", "D6", "D11", "D2", "D4", "D7", "D8", "D12", "D13",
+    ];
+
+    for _ in 0..named.buzzer.saturating_sub(count_kinds(c, &[Kind::Buzzer, Kind::Speaker])) {
+        let Some(pin) = ledger.claim_pin(&signals) else { break };
         if !ledger.claim_current(15) {
             break;
         }
-        let at = Pt::new(2.0 + n as f32 * 18.0, 104.0);
-        let specs: Vec<PinSpec> = bench_pins(Kind::Buzzer, "пьезо")
-            .iter()
-            .map(|(name, dx, dy)| PinSpec {
-                name,
-                pos: Pt::new(at.x + dx, at.y + dy),
-                hole: Hole::OffBoard,
-                kind: crate::templates::bench_pin_kind(Kind::Buzzer, "пьезо", name),
-            })
-            .collect();
-        let part = c.add_part(Kind::Buzzer, &format!("BZ{}", n + 1), "пьезо", at, specs, vec![]);
+        let at = row.take(20.0, 18.0);
+        let label = free_label(c, "BZ");
+        let part = bench_part(c, Kind::Buzzer, &label, "пьезо", at);
         let signal = c.pin(part, "+");
         let ground = c.pin(part, "-");
         c.wire(End::Pin(signal), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
-        c.wire(End::Pin(ground), End::Pin(c.pin(uno, "GND2")), NetClass::Gnd);
+        c.wire(End::Pin(ground), End::Pin(gnd), NetClass::Gnd);
+        added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
     }
-    for n in 0..named.relay {
-        let Some(pin) = ledger.claim_pin(&["D8", "D7", "D6", "D5", "D4", "D3", "D2", "A0"]) else { break };
+
+    for _ in 0..named.relay.saturating_sub(count_kinds(c, &[Kind::Relay])) {
+        let Some(pin) = ledger.claim_pin(&signals) else { break };
         if !ledger.claim_current(30) {
             break;
         }
-        let at = Pt::new(2.0 + n as f32 * 40.0, 112.0);
-        let specs: Vec<PinSpec> = bench_pins(Kind::Relay, "SRD-05VDC")
-            .iter()
-            .map(|(name, dx, dy)| PinSpec {
-                name,
-                pos: Pt::new(at.x + dx, at.y + dy),
-                hole: Hole::OffBoard,
-                kind: crate::templates::bench_pin_kind(Kind::Relay, "SRD-05VDC", name),
-            })
-            .collect();
-        let part = c.add_part(Kind::Relay, &format!("K{}", n + 1), "SRD-05VDC", at, specs, vec![]);
-        c.wire(End::Pin(c.pin(part, "IN")), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
-        c.wire(End::Pin(c.pin(part, "VCC")), End::Pin(c.pin(uno, "5V")), NetClass::Vcc);
-        c.wire(End::Pin(c.pin(part, "GND")), End::Pin(c.pin(uno, "GND2")), NetClass::Gnd);
+        let at = row.take(44.0, 30.0);
+        let label = free_label(c, "K");
+        let part = bench_part(c, Kind::Relay, &label, "SRD-05VDC", at);
+        let inn = c.pin(part, "IN");
+        let vcc_pin = c.pin(part, "VCC");
+        let gnd_pin = c.pin(part, "GND");
+        c.wire(End::Pin(inn), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
+        c.wire(End::Pin(vcc_pin), End::Pin(vcc), NetClass::Vcc);
+        c.wire(End::Pin(gnd_pin), End::Pin(gnd), NetClass::Gnd);
+        added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
     }
+
+    for _ in 0..named.led.saturating_sub(count_kinds(c, &[Kind::Led])) {
+        let Some(pin) = ledger.claim_pin(&signals) else { break };
+        if !ledger.claim_current(15) {
+            break;
+        }
+        let at = row.take(30.0, 16.0);
+        let r_label = free_label(c, "R");
+        let d_label = free_label(c, "D");
+        let r = bench_part(c, Kind::Resistor, &r_label, "220 Ом", at);
+        let d = bench_part(c, Kind::Led, &d_label, "красный 5 мм", Pt::new(at.x + 14.0, at.y));
+        let ra = c.pin(r, "1");
+        let rb = c.pin(r, "2");
+        let a = c.pin(d, "1");
+        let k = c.pin(d, "2");
+        c.wire(End::Pin(c.pin(uno, &pin)), End::Pin(ra), NetClass::Signal);
+        c.wire(End::Pin(rb), End::Pin(a), NetClass::Signal);
+        c.wire(End::Pin(k), End::Pin(gnd), NetClass::Gnd);
+        added.parts.push(AddedPart { part: d, pins: vec![pin_num(&pin)] });
+    }
+
+    let rgb_present = c
+        .parts()
+        .filter(|p| p.kind == Kind::Led && p.value.to_lowercase().contains("rgb"))
+        .count();
+    for _ in 0..named.rgb.saturating_sub(rgb_present) {
+        let mut pins = Vec::new();
+        for _ in 0..3 {
+            let Some(pin) = ledger.claim_pin(&signals) else { break };
+            pins.push(pin);
+        }
+        if pins.len() < 3 || !ledger.claim_current(45) {
+            break;
+        }
+        let at = row.take(48.0, 20.0);
+        let mut ends = Vec::new();
+        for i in 0..3 {
+            let label = free_label(c, "R");
+            let r = bench_part(
+                c,
+                Kind::Resistor,
+                &label,
+                "220 Ом",
+                Pt::new(at.x + i as f32 * 13.0, at.y),
+            );
+            ends.push((c.pin(r, "1"), c.pin(r, "2")));
+        }
+        let d_label = free_label(c, "D");
+        let d = bench_part(c, Kind::Led, &d_label, "RGB общий катод", Pt::new(at.x, at.y + 12.0));
+        for (i, (ra, rb)) in ends.iter().enumerate() {
+            let colour = ["R", "G", "B"][i];
+            c.wire(End::Pin(c.pin(uno, &pins[i])), End::Pin(*ra), NetClass::Signal);
+            c.wire(End::Pin(*rb), End::Pin(c.pin(d, colour)), NetClass::Signal);
+        }
+        c.wire(End::Pin(c.pin(d, "-")), End::Pin(gnd), NetClass::Gnd);
+        added.parts.push(AddedPart {
+            part: d,
+            pins: pins.iter().map(|p| pin_num(p)).collect(),
+        });
+    }
+
+    for _ in 0..named.servo.saturating_sub(count_kinds(c, &[Kind::Servo])) {
+        let Some(pin) = ledger.claim_pin(&servo_pins) else { break };
+        if !ledger.claim_current(250) {
+            break;
+        }
+        let at = row.take(28.0, 28.0);
+        let label = free_label(c, "S");
+        let part = bench_part(c, Kind::Servo, &label, "SG90", at);
+        let s = c.pin(part, "S");
+        let plus = c.pin(part, "+");
+        let minus = c.pin(part, "-");
+        c.wire(End::Pin(s), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
+        c.wire(End::Pin(plus), End::Pin(vcc), NetClass::Vcc);
+        c.wire(End::Pin(minus), End::Pin(gnd), NetClass::Gnd);
+        added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
+    }
+
+    for _ in 0..named.motor.saturating_sub(count_kinds(c, &[Kind::Motor])) {
+        let Some(pin) = ledger.claim_pin(&pwm) else { break };
+        if !ledger.claim_current(250) {
+            break;
+        }
+        let at = row.take(50.0, 44.0);
+        let r1_label = free_label(c, "R");
+        let r1 = bench_part(c, Kind::Resistor, &r1_label, "220 Ом", Pt::new(at.x, at.y + 18.0));
+        let q_label = free_label(c, "Q");
+        let q = bench_part(c, Kind::Nmos, &q_label, "IRLZ44N", Pt::new(at.x + 14.0, at.y + 18.0));
+        let r2_label = free_label(c, "R");
+        let r2 = bench_part(c, Kind::Resistor, &r2_label, "10 кОм", Pt::new(at.x, at.y + 32.0));
+        let m_label = free_label(c, "M");
+        let m = bench_part(c, Kind::Motor, &m_label, "5 В DC", Pt::new(at.x + 26.0, at.y));
+        let d_label = free_label(c, "D");
+        let (_d, da, dk) =
+            bench_diode(c, &d_label, "1N4007", Pt::new(at.x + 26.0, at.y - 10.0));
+        let (g, s, dr) = (c.pin(q, "G"), c.pin(q, "S"), c.pin(q, "D"));
+        let (r1a, r1b) = (c.pin(r1, "1"), c.pin(r1, "2"));
+        let (r2a, r2b) = (c.pin(r2, "1"), c.pin(r2, "2"));
+        let (mp, mn) = (c.pin(m, "+"), c.pin(m, "-"));
+        c.wire(End::Pin(c.pin(uno, &pin)), End::Pin(r1a), NetClass::Signal);
+        c.wire(End::Pin(r1b), End::Pin(g), NetClass::Signal);
+        c.wire(End::Pin(r2a), End::Pin(g), NetClass::Signal);
+        c.wire(End::Pin(r2b), End::Pin(gnd), NetClass::Gnd);
+        c.wire(End::Pin(s), End::Pin(gnd), NetClass::Gnd);
+        c.wire(End::Pin(dr), End::Pin(mn), NetClass::Signal);
+        c.wire(End::Pin(mp), End::Pin(vcc), NetClass::Vcc);
+        // The flyback diode: anode on the switched side, cathode on +5 V.
+        c.wire(End::Pin(da), End::Pin(mn), NetClass::Signal);
+        c.wire(End::Pin(dk), End::Pin(mp), NetClass::Vcc);
+        added.parts.push(AddedPart { part: m, pins: vec![pin_num(&pin)] });
+    }
+
+    for _ in 0..named.button.saturating_sub(count_kinds(c, &[Kind::Button])) {
+        let Some(pin) = ledger.claim_pin(&signals) else { break };
+        let at = row.take(22.0, 20.0);
+        let label = free_label(c, "B");
+        let part = bench_part(c, Kind::Button, &label, "такт 6×6", at);
+        c.wire(End::Pin(c.pin(part, "4")), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
+        c.wire(End::Pin(c.pin(part, "1")), End::Pin(gnd), NetClass::Gnd);
+        added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
+    }
+
+    added
 }
 
 /// Apply the numbers the user actually said to a generated sketch.
@@ -2567,14 +2832,35 @@ fn apply_spoken_numbers(code: &mut String, raw: &str) {
     }
 }
 
+/// Honour the parts the sentence named but the base circuit does not have.
+/// Shared by lessons, templates and compositions, so every route adds them.
+fn augment_built(built: &mut Built, raw: &str, lang: Lang) {
+    let named = crate::parse::named_devices(raw);
+    let mut ledger = crate::resources::Resources::new(&built.circuit);
+    let added = augment_devices(&mut built.circuit, named, &mut ledger);
+    if added.parts.is_empty() {
+        return;
+    }
+    crate::codegen::augment_from_circuit(
+        &built.circuit,
+        &mut built.code,
+        named.hourly,
+        lang,
+        &added.parts,
+    );
+    built.notes.push(L::new(
+        "Явно названные в задаче детали добавлены к схеме.",
+        "Parts named in the sentence were added to the circuit.",
+    ));
+}
+
 // new build body, spliced into templates.rs
 pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     if let Some(screens) = intent.text_screens {
         let plan = text_screen_plan(&intent.raw, screens, lang);
         let choice = choice.min(plan.choices.len() - 1);
-        let (circuit, mut code, summary, notes) = text_screen_build(lang, screens, choice);
-        apply_spoken_numbers(&mut code, &intent.raw);
-        return Some(Built {
+        let (circuit, code, summary, notes) = text_screen_build(lang, screens, choice);
+        let mut built = Built {
             tid: Tid::TextScreens,
             title: plan.title_text(lang),
             circuit,
@@ -2582,26 +2868,23 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             choice,
             summary,
             notes,
-        });
+        };
+        augment_built(&mut built, &intent.raw, lang);
+        apply_spoken_numbers(&mut built.code, &intent.raw);
+        return Some(built);
     }
     if let Some(recipe) = intent.recipe {
-        return crate::compose::build(recipe, choice, lang);
+        let mut built = crate::compose::build(recipe, choice, lang)?;
+        augment_built(&mut built, &intent.raw, lang);
+        apply_spoken_numbers(&mut built.code, &intent.raw);
+        return Some(built);
     }
     if let Some(i) = intent.lesson {
         let screens = crate::parse::named_devices(&intent.raw).screens;
         let plan = display_lesson_plan(i, screens, lang);
         let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
-        let (mut circuit, mut code, summary, mut notes) = lesson_build(lang, i, screens, choice);
-        let named = crate::parse::named_devices(&intent.raw);
-        let mut ledger = crate::resources::Resources::new(&circuit);
-        augment_devices(&mut circuit, &mut code, named, lang, &mut ledger);
-        crate::codegen::augment_from_circuit(&circuit, &mut code, named.hourly, lang);
-        apply_spoken_numbers(&mut code, &intent.raw);
-        notes.push(L::new(
-            "Явно названные в задаче детали добавлены к схеме урока.",
-            "Parts named in the sentence were added to the lesson circuit.",
-        ));
-        return Some(Built {
+        let (circuit, code, summary, notes) = lesson_build(lang, i, screens, choice);
+        let mut built = Built {
             tid: Tid::Lesson(i),
             title: plan.title_text(lang),
             circuit,
@@ -2609,7 +2892,10 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             choice: 0,
             summary,
             notes,
-        });
+        };
+        augment_built(&mut built, &intent.raw, lang);
+        apply_spoken_numbers(&mut built.code, &intent.raw);
+        return Some(built);
     }
     let tid = route(intent.load, intent.input)?;
     let plan = plan(intent, lang)?;
@@ -2621,7 +2907,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             "Presses are counted on the falling edge with 30 ms debounce; holding adds no steps.",
         ));
     }
-    let (circuit, mut code, summary, extra) = match tid {
+    let (circuit, code, summary, extra) = match tid {
         Tid::MotorSteps => motor_steps(lang, choice),
         Tid::MotorPot => motor_pot(lang, choice),
         Tid::MotorTest => motor_test(lang, choice, &intent.raw),
@@ -2642,9 +2928,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::Composed => return crate::compose::build(intent.recipe?, choice, lang),
         Tid::Lesson(_) | Tid::TextScreens => return None,
     };
-    apply_spoken_numbers(&mut code, &intent.raw);
-    notes.extend(extra);
-    Some(Built {
+    let mut built = Built {
         tid,
         title: plan.title_text(lang),
         circuit,
@@ -2652,7 +2936,13 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         choice,
         summary,
         notes,
-    })
+    };
+    built.notes.extend(extra);
+    // Named parts the template did not draw are added here, so a sentence
+    // like "RFID + светодиод" keeps both halves.
+    augment_built(&mut built, &intent.raw, lang);
+    apply_spoken_numbers(&mut built.code, &intent.raw);
+    Some(built)
 }
 
 /// Power the breadboard rails from the Uno, landing the jumpers directly under
@@ -4713,7 +5003,7 @@ void loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::{parse, Input, Load};
+    use crate::parse::{parse, Action, Input, Load};
 
     #[test]
     fn a_clock_naming_a_display_gets_one_and_two_gets_two() {
@@ -4745,6 +5035,8 @@ mod tests {
         assert_eq!(parsed.intent.lesson, None);
         let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
         assert_eq!(plan.title_text(Lang::Ru), "Приветствие на двух экранах");
+        let english = crate::templates::plan(&parsed.intent, Lang::En).expect("plans in English");
+        assert_eq!(english.title_text(Lang::En), "Greeting on two displays");
         assert_eq!(plan.choices.len(), 3, "an unnamed display offers a choice");
 
         let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
@@ -4754,6 +5046,47 @@ mod tests {
         assert!(built.code.contains("LiquidCrystal_I2C screen1(0x26"));
         assert_eq!(built.code.matches("print(MESSAGE)").count(), 2);
         assert!(built.code.contains("void loop()"));
+    }
+
+    /// Every display model and every screen count must stay clear of the
+    /// board, the controller and the other displays. A fixed 64 mm step used
+    /// to put two 98 mm LCD2004 boards on top of each other.
+    #[test]
+    fn text_screens_never_overlap() {
+        use crate::model::Kind;
+        for text in [
+            "текст на экране",
+            "текст на двух экранах",
+            "текст на трёх экранах",
+            "текст на четырёх экранах",
+            "текст на двух LCD1602",
+            "текст на двух LCD2004",
+            "две надписи на двух OLED",
+        ] {
+            let parsed = crate::parse::parse(text);
+            let plan = plan(&parsed.intent, Lang::Ru)
+                .unwrap_or_else(|| panic!("{text}: does not plan"));
+            for choice in 0..plan.choices.len() {
+                let built = build(&parsed.intent, choice, Lang::Ru)
+                    .unwrap_or_else(|| panic!("{text} #{choice}: does not build"));
+                let c = &built.circuit;
+                let mut rects: Vec<(String, crate::model::Rect)> = c
+                    .parts
+                    .iter()
+                    .filter(|p| matches!(p.kind, Kind::Module | Kind::Arduino))
+                    .map(|p| (format!("{} {}", p.label, p.value), c.part_rect(p)))
+                    .collect();
+                rects.push(("breadboard".to_string(), c.board.rect()));
+                for (a, (na, ra)) in rects.iter().enumerate() {
+                    for (nb, rb) in &rects[a + 1..] {
+                        assert!(
+                            !ra.inflate(-0.5).intersects(rb.inflate(-0.5)),
+                            "{text} #{choice}: {na} overlaps {nb}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A ladder from nonsense to precise multi-device tasks: every rung must
@@ -5360,6 +5693,142 @@ mod tests {
         };
         let csv = component_csv(&[odd]);
         assert!(csv.contains("D1,1,\"светодиод, красный\""));
+    }
+
+    /// The sentence in the bug report: a servo named in words, and the same
+    /// servo named by its model. Both have to reach the schematic, and the
+    /// sketch has to use the servo library on the wired pin.
+    #[test]
+    fn a_named_servo_is_on_the_schematic_and_in_the_sketch() {
+        for text in [
+            "когда на датчике движения движение, открываем сервопривод",
+            "когда на датчике движения движение, открываем sg90",
+            "когда на датчике движения движение, поверни сервопривод",
+            "датчик движения и сервопривод",
+        ] {
+            let p = parse(text);
+            assert!(p.unsupported.is_none(), "{text}: unsupported");
+            let built = build(&p.intent, 0, Lang::Ru)
+                .unwrap_or_else(|| panic!("{text}: does not build"));
+            assert!(
+                built.circuit.parts().any(|p| p.kind == Kind::Servo),
+                "{text}: the servo is not on the schematic"
+            );
+            assert!(
+                built.code.contains("Servo.h") && built.code.contains(".attach("),
+                "{text}: the sketch does not drive a servo:\n{}",
+                built.code
+            );
+            assert!(built.code.contains(".write("), "{text}: no servo position");
+            let report = crate::checks::run(&built, Lang::Ru);
+            let fails: Vec<String> = report
+                .checks
+                .iter()
+                .filter(|c| c.sev == crate::checks::Sev::Fail)
+                .map(|c| format!("{}: {}", c.name.ru, c.detail))
+                .collect();
+            assert!(fails.is_empty(), "{text}: {}", fails.join("; "));
+        }
+    }
+
+    /// Every kind of part named in a sentence ends up in the circuit, even
+    /// when the sentence also matches a ready-made lesson or template.
+    #[test]
+    fn named_extras_reach_the_schematic() {
+        let cases: &[(&str, &[Kind])] = &[
+            ("RFID и светодиод", &[Kind::Module, Kind::Led]),
+            ("RFID и rgb светодиод", &[Kind::Module, Kind::Led]),
+            ("датчик температуры и пьезо", &[Kind::Module, Kind::Buzzer]),
+            ("датчик газа и rgb", &[Kind::Module, Kind::Led]),
+            (
+                "датчик газа и реле и мотор",
+                &[Kind::Module, Kind::Relay, Kind::Motor],
+            ),
+            ("датчик газа и кнопка", &[Kind::Module, Kind::Button]),
+            (
+                "мотор и кнопка и светодиод",
+                &[Kind::Motor, Kind::Button, Kind::Led],
+            ),
+            (
+                "датчик движения, сервопривод и светодиод",
+                &[Kind::Module, Kind::Servo, Kind::Led],
+            ),
+        ];
+        for (text, kinds) in cases {
+            let p = parse(text);
+            assert!(p.unsupported.is_none(), "{text}: unsupported");
+            let built = build(&p.intent, 0, Lang::Ru)
+                .unwrap_or_else(|| panic!("{text}: does not build"));
+            for kind in *kinds {
+                assert!(
+                    built.circuit.parts().any(|p| p.kind == *kind),
+                    "{text}: {:?} is missing from [{}]",
+                    kind,
+                    built
+                        .circuit
+                        .parts()
+                        .map(|p| format!("{} {}", p.label, p.value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            assert!(!unfilled(&built.code), "{text}: unfilled token");
+            let report = crate::checks::run(&built, Lang::Ru);
+            let fails: Vec<String> = report
+                .checks
+                .iter()
+                .filter(|c| c.sev == crate::checks::Sev::Fail)
+                .map(|c| format!("{}: {}", c.name.ru, c.detail))
+                .collect();
+            assert!(fails.is_empty(), "{text}: {}", fails.join("; "));
+        }
+    }
+
+    /// An extra output follows the lesson's own condition instead of blinking
+    /// on its own clock: the PIR lesson already computes `bool active`.
+    #[test]
+    fn an_extra_led_follows_the_lesson_condition() {
+        let p = parse("датчик движения, сервопривод и светодиод");
+        let built = build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.code.contains("bool active"), "{}", built.code);
+        assert!(
+            built
+                .code
+                .contains("digitalWrite(LED_PIN, active ? HIGH : LOW)"),
+            "the LED ignores the condition:\n{}",
+            built.code
+        );
+        assert!(built.code.contains("arm.write(active ? 90 : 0)"), "{}", built.code);
+    }
+
+    /// Extras are laid out on a shelf below the finished circuit, so adding a
+    /// part never draws it over the board or over another part.
+    #[test]
+    fn extra_parts_do_not_overlap_anything() {
+        for text in [
+            "RFID и светодиод",
+            "RFID и rgb светодиод",
+            "датчик газа и реле и мотор",
+            "датчик газа и кнопка",
+            "датчик движения, сервопривод и светодиод",
+        ] {
+            let p = parse(text);
+            let built = build(&p.intent, 0, Lang::Ru)
+                .unwrap_or_else(|| panic!("{text}: does not build"));
+            let c = &built.circuit;
+            let rects: Vec<(String, crate::model::Rect)> = c
+                .parts()
+                .map(|p| (format!("{} {}", p.label, p.value), c.part_rect(p)))
+                .collect();
+            for (a, (na, ra)) in rects.iter().enumerate() {
+                for (nb, rb) in &rects[a + 1..] {
+                    assert!(
+                        !ra.inflate(-0.5).intersects(rb.inflate(-0.5)),
+                        "{text}: {na} overlaps {nb}"
+                    );
+                }
+            }
+        }
     }
 }
 

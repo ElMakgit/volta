@@ -33,15 +33,40 @@ pub fn detect(
             || text.contains("lcd")
             || text.contains("oled")
             || text.contains("display"));
-    // A named relay, buzzer or screen is itself a request to act:
-    // "влажность выше 60, реле".
+    // A named relay, buzzer, screen, servo, motor or LED is itself a request
+    // to act: "влажность выше 60, реле", "датчик движения, сервопривод".
     let explicit_sink = text.contains("реле")
         || text.contains("relay")
         || text.contains("пищал")
+        || text.contains("пьезо")
         || text.contains("сирен")
         || text.contains("зуммер")
         || text.contains("buzzer")
         || text.contains("siren")
+        || text.contains("gong")
+        || text.contains("серво")
+        || text.contains("servo")
+        || text.contains("sg90")
+        || text.contains("sg-90")
+        || text.contains("mg90")
+        || text.contains("mg995")
+        || text.contains("mg996")
+        || text.contains("fs90")
+        || text.contains("мотор")
+        || text.contains("motor")
+        || text.contains("двигател")
+        || text.contains("вентилятор")
+        || text.contains("насос")
+        || text.contains("кулер")
+        || text.contains("светодиод")
+        || text.contains("led")
+        || text.contains("ламп")
+        || text.contains("подсвет")
+        || text.contains("ночник")
+        || text.contains("фонар")
+        || text.contains("гирлянд")
+        || text.contains("rgb")
+        || text.contains("цветной светодиод")
         || names_screen;
     let asks_action = matches!(
         action,
@@ -83,19 +108,30 @@ pub fn detect(
     let sink = if text.contains("реле") || text.contains("relay") {
         SinkId::Relay
     } else if text.contains("пищал")
+        || text.contains("пьезо")
         || text.contains("сирен")
         || text.contains("зуммер")
         || text.contains("buzzer")
         || text.contains("siren")
+        || text.contains("gong")
     {
         SinkId::Buzzer
-    } else if text.contains("серво") || text.contains("servo") {
+    } else if text.contains("серво")
+        || text.contains("servo")
+        || text.contains("sg90")
+        || text.contains("sg-90")
+        || text.contains("mg90")
+        || text.contains("mg995")
+        || text.contains("mg996")
+        || text.contains("fs90")
+    {
         SinkId::Servo
     } else if text.contains("мотор")
         || text.contains("motor")
         || text.contains("двигател")
         || text.contains("вентилятор")
         || text.contains("насос")
+        || text.contains("кулер")
     {
         SinkId::Motor
     } else if text.contains("rgb")

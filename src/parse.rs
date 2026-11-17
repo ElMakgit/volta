@@ -273,7 +273,11 @@ const LED: Group = Group {
     label: L::new("светодиод", "LED"),
 };
 const SERVO: Group = Group {
-    words: &["серво", "серва", "servo", "поворот", "угол", "стрелк", "заслонк", "машинк"],
+    words: &[
+        "серво", "серва", "servo", "поворот", "поверн", "угол", "стрелк", "заслонк",
+        "машинк", "sg90", "sg-90", "mg90", "mg995", "mg996", "fs90", "towerpro",
+        "привод заслонк",
+    ],
     label: L::new("сервопривод", "servo"),
 };
 const BUZZER: Group = Group {
@@ -353,8 +357,9 @@ const ALARM: Group = Group {
 };
 const TOGGLE: Group = Group {
     words: &[
-        "включ", "выключ", "переключ", "toggle", "on off", "switch on", "turn on", "turn off",
-        "turns on", "turns off", "enable", "disable",
+        "включ", "выключ", "переключ", "откры", "закры", "отвор", "затвор",
+        "toggle", "on off", "switch on", "turn on", "turn off",
+        "turns on", "turns off", "enable", "disable", "open", "close",
     ],
     label: L::new("включение и выключение", "on and off"),
 };
@@ -368,21 +373,57 @@ fn hits(text: &str, group: &Group) -> Vec<String> {
         .collect()
 }
 
+/// Token positions a keyword explains. Used to score a group without
+/// counting two near-identical keys for the same word twice: the LED group
+/// lists both the correct spelling and a common typo, and on the sentence
+/// "RFID и светодиод" that must not outweigh the RFID the user named first.
+fn match_indices(text: &str, key: &str) -> Vec<usize> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let n = crate::words::normalize(key).split_whitespace().count().max(1);
+    if n == 1 {
+        return tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| crate::words::mentions(t, key))
+            .map(|(i, _)| i)
+            .collect();
+    }
+    if tokens.len() < n {
+        return Vec::new();
+    }
+    (0..=tokens.len() - n)
+        .filter(|&i| crate::words::mentions(&tokens[i..i + n].join(" "), key))
+        .collect()
+}
+
 /// Every group that matched, best first: the group with more distinct words
 /// wins, and the order of the groups breaks a tie. The order puts a named
 /// board ahead of the generic word for the same thing, so "драйвер
 /// двигателей" is not read as a single motor.
 fn votes(text: &str, groups: &[&Group]) -> Vec<(usize, Vec<String>)> {
-    let mut found: Vec<(usize, Vec<String>)> = groups
+    let mut found: Vec<(usize, Vec<String>, usize)> = groups
         .iter()
         .enumerate()
         .filter_map(|(i, g)| {
             let h = hits(text, g);
-            (!h.is_empty()).then_some((i, h))
+            if h.is_empty() {
+                return None;
+            }
+            let mut claimed: Vec<usize> = Vec::new();
+            let mut fresh = 0usize;
+            for w in &h {
+                let at = match_indices(text, w);
+                if at.is_empty() || at.iter().all(|j| claimed.contains(j)) {
+                    continue;
+                }
+                claimed.extend(at);
+                fresh += 1;
+            }
+            Some((i, h, fresh.max(1)))
         })
         .collect();
-    found.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-    found
+    found.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    found.into_iter().map(|(i, h, _)| (i, h)).collect()
 }
 
 fn load_at(i: usize) -> Load {
@@ -399,6 +440,23 @@ fn load_at(i: usize) -> Load {
         9 => Load::Servo,
         10 => Load::Buzzer,
         _ => Load::Led,
+    }
+}
+
+fn load_group(load: Load) -> &'static Group {
+    match load {
+        Load::Motor => &MOTOR,
+        Load::Motors => &MOTORS,
+        Load::Stepper => &STEPPER,
+        Load::Servo => &SERVO,
+        Load::Led => &LED,
+        Load::Buzzer => &BUZZER,
+        Load::Rfid => &RFID,
+        Load::Radio433 => &RADIO433,
+        Load::RadioNrf => &RADIO_NRF,
+        Load::Bluetooth => &BLUETOOTH,
+        Load::Gsm => &GSM,
+        Load::Ethernet => &ETHERNET,
     }
 }
 
@@ -493,34 +551,79 @@ pub struct NamedDevices {
     pub buzzer: usize,
     pub relay: usize,
     pub led: usize,
+    pub rgb: usize,
     pub motor: usize,
+    pub servo: usize,
     pub button: usize,
     pub hourly: bool,
 }
 
-fn count_of(text: &str, words: &[&str]) -> usize {
-    if !words.iter().any(|w| text.contains(w)) {
-        return 0;
+fn number_word(word: &str) -> Option<usize> {
+    match word {
+        "четыре" | "четырёх" | "4" => Some(4),
+        "три" | "трёх" | "3" => Some(3),
+        "два" | "две" | "двух" | "2" => Some(2),
+        _ => None,
     }
-    for (word, n) in [
-        ("четыре", 4usize), ("четырёх", 4), ("4", 4), ("три", 3), ("трёх", 3), ("3", 3),
-        ("два", 2), ("две", 2), ("двух", 2), ("2", 2),
-    ] {
-        if text.split_whitespace().any(|t| t == word) {
-            return n;
+}
+
+/// Whether a token names a part. Used to stop a number from applying to the
+/// next part in the list: in "два светодиода, реле" the relay is one part,
+/// not two.
+fn names_a_part(token: &str) -> bool {
+    const PARTS: &[&str] = &[
+        "светодиод", "led", "реле", "relay", "пьезо", "пищал", "зуммер", "сирен",
+        "buzzer", "серво", "servo", "sg90", "мотор", "motor", "двигател",
+        "вентилятор", "насос", "кулер", "кнопк", "button", "rgb", "экран",
+        "диспле", "oled", "lcd",
+    ];
+    PARTS.iter().any(|w| crate::words::mentions(token, w))
+}
+
+fn count_of(text: &str, words: &[&str]) -> usize {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let Some(at) = tokens
+        .iter()
+        .position(|t| words.iter().any(|w| crate::words::mentions(t, w)))
+    else {
+        return 0;
+    };
+    // A numeral two words back still counts ("два красных светодиода"), but
+    // never across another named part.
+    for j in (at.saturating_sub(2)..at).rev() {
+        let Some(n) = number_word(tokens[j]) else { continue };
+        if tokens[j + 1..at].iter().any(|t| names_a_part(t)) {
+            break;
         }
+        return n;
     }
     1
 }
 
 pub fn named_devices(raw: &str) -> NamedDevices {
     let text = crate::words::normalize(raw);
+    let rgb = count_of(&text, &["rgb", "трёхцвет", "трехцвет", "цветной светодиод"]);
     NamedDevices {
         screens: screens_in(raw),
         buzzer: count_of(&text, &["пьезо", "пищал", "зуммер", "сирен", "buzzer", "gong"]),
         relay: count_of(&text, &["реле", "relay"]),
-        led: count_of(&text, &["светодиод", "led", "индик"]) ,
-        motor: count_of(&text, &["двигател", "мотор", "motor", "вентилятор", "насос"]),
+        // "RGB" is a light-emitting diode too, but it is one part with three
+        // channels: counting it twice would draw a second, needless LED.
+        led: if rgb > 0 { 0 } else { count_of(&text, &["светодиод", "led", "индик"]) },
+        rgb,
+        motor: count_of(
+            &text,
+            &["двигател", "мотор", "motor", "вентилятор", "насос", "кулер"],
+        ),
+        // "Поворот" alone is too vague: it also shows up in servo lessons'
+        // wording and in phrases about turning a knob.
+        servo: count_of(
+            &text,
+            &[
+                "серво", "servo", "sg90", "sg-90", "mg90", "mg995", "mg996", "fs90",
+                "towerpro",
+            ],
+        ),
         button: count_of(&text, &["кнопк", "button", "переключател"]),
         hourly: text.contains("каждый час") || text.contains("раз в час")
             || text.contains("hourly") || text.contains("every hour"),
@@ -693,10 +796,31 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         &MOTOR, &SERVO, &BUZZER, &LED,
     ];
     let load_votes = votes(&text, &load_groups);
-    let (load, load_hits) = match load_votes.first() {
+    let (mut load, mut load_hits) = match load_votes.first() {
         Some((i, h)) => (load_at(*i), h.clone()),
         None => (Load::Led, Vec::new()),
     };
+    // A named board is the subject of the sentence; an LED next to it is the
+    // indicator it drives. "RFID и светодиод" is an RFID task, not a blink,
+    // and the LED is then added to the RFID circuit instead of replacing it.
+    if load == Load::Led {
+        if let Some((i, h)) = load_votes.iter().find(|(i, _)| {
+            matches!(
+                load_at(*i),
+                Load::Rfid
+                    | Load::Radio433
+                    | Load::RadioNrf
+                    | Load::Bluetooth
+                    | Load::Gsm
+                    | Load::Ethernet
+                    | Load::Stepper
+                    | Load::Motors
+            )
+        }) {
+            load = load_at(*i);
+            load_hits = h.clone();
+        }
+    }
     let named_load = !load_hits.is_empty();
     matched.extend(load_hits);
     if named_load {
@@ -753,6 +877,32 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // Everyday words like "термометр" stand in for a part only when the
     // sentence names nothing else: "шуметь динамиком" must stay a buzzer.
     let mut lesson = crate::lessons::find_with(&text, !named_load && !transistor);
+    // The named board has to survive the lesson choice. "RFID и rgb
+    // светодиод" names a reader, and the RGB lesson does not: keeping the
+    // lesson would silently drop the reader from the task. An LED, a motor
+    // or a buzzer is different: the lesson may itself be about it, or it is
+    // simply the output the lesson's sensor drives.
+    let board_load = matches!(
+        load,
+        Load::Rfid
+            | Load::Radio433
+            | Load::RadioNrf
+            | Load::Bluetooth
+            | Load::Gsm
+            | Load::Ethernet
+            | Load::Stepper
+            | Load::Motors
+    );
+    if named_load && board_load {
+        if let Some(i) = lesson {
+            let l = &crate::lessons::ALL[i];
+            let lesson_text =
+                crate::words::normalize(&format!("{} {}", l.title.ru, l.keys.join(" ")));
+            if hits(&lesson_text, load_group(load)).is_empty() {
+                lesson = None;
+            }
+        }
+    }
     // EEPROM is a way to keep data, not the thing the circuit drives: in
     // "контроль доступа на 49 карт ... в EEPROM" the reader is named, so the
     // counter lesson (a button and EEPROM) must not win over the RFID lock.
@@ -1234,5 +1384,32 @@ mod tests {
             parse("текст на трёх экранах").intent.text_screens.map(|s| s.count),
             Some(3)
         );
+    }
+
+    /// Every named part has its own counter, so the circuit augmenter knows
+    /// exactly what the sentence asked for.
+    #[test]
+    fn named_devices_count_every_part() {
+        let n = named_devices(
+            "два светодиода, реле, пьезо, сервопривод sg90, мотор, кнопка",
+        );
+        assert_eq!(n.led, 2);
+        assert_eq!(n.relay, 1);
+        assert_eq!(n.buzzer, 1);
+        assert_eq!(n.servo, 1);
+        assert_eq!(n.motor, 1);
+        assert_eq!(n.button, 1);
+        assert_eq!(n.rgb, 0);
+
+        let rgb = named_devices("rgb светодиод");
+        assert_eq!(rgb.rgb, 1);
+        assert_eq!(rgb.led, 0, "an RGB LED is one part, not one plus three");
+
+        assert_eq!(named_devices("поверни на угол 90").servo, 0);
+        assert_eq!(named_devices("mg996").servo, 1);
+        assert_eq!(named_devices("вентилятор").motor, 1);
+        assert_eq!(named_devices("датчик движения и два светодиода").led, 2);
+        assert_eq!(named_devices("два светодиода, реле").relay, 1);
+        assert_eq!(named_devices("два красных светодиода").led, 2);
     }
 }
