@@ -1947,6 +1947,7 @@ mod tests {
                     raw: String::new(),
                     condition: None,
                     recipe: None,
+                    text_screens: None,
                 };
                 let built = templates::build(&intent, choice, Lang::Ru).unwrap();
                 out.push((format!("{} #{choice}", built.title), built.circuit));
@@ -2006,6 +2007,7 @@ mod tests {
                 raw: String::new(),
                 condition: None,
                 recipe: None,
+                text_screens: None,
             };
             let built = templates::build(&intent, 0, Lang::Ru).unwrap();
             fits_frame(l.title.ru, &built.circuit, true);

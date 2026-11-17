@@ -82,6 +82,9 @@ pub struct Intent {
     /// A sensor, a condition and a sink: the sentence asks for a built
     /// circuit rather than for the lesson that teaches the sensor.
     pub recipe: Option<crate::spec::Composition>,
+    /// The sentence asks for a text message on one or more displays and
+    /// names nothing else to drive. `screens.count` is the number of boards.
+    pub text_screens: Option<Screens>,
     pub raw: String,
 }
 
@@ -545,15 +548,58 @@ pub fn screens_in(raw: &str) -> Option<Screens> {
         .any(|w| text.split_whitespace().any(|t| t == *w))
     {
         2
-    } else if ["три", "трёх", "3", "three"]
+    } else if ["три", "трёх", "трех", "3", "three"]
         .iter()
         .any(|w| text.split_whitespace().any(|t| t == *w))
     {
         3
+    } else if ["четыре", "четырёх", "четырех", "4", "four"]
+        .iter()
+        .any(|w| text.split_whitespace().any(|t| t == *w))
+    {
+        4
     } else {
         1
     };
     Some(Screens { kind, count })
+}
+
+/// A sentence that asks to show a text message on a display and names no
+/// sensor, storage or radio. "Текст приветствия на двух экранах" is such a
+/// scene: the displays are the whole circuit, so the parser must not pull a
+/// motion sensor out of a similar-looking word.
+pub fn text_screen_task(raw: &str) -> Option<Screens> {
+    let screens = screens_in(raw)?;
+    let text = crate::words::normalize(raw);
+    let message = [
+        "приветств", "привет", "надпис", "сообщен", "greeting", "hello", "caption",
+    ]
+    .iter()
+    .any(|w| text.contains(w));
+    let show_verb = [
+        "вывест", "вывод", "показат", "показыв", "показать", "написа", "напечат", "show", "print",
+        "write",
+    ]
+    .iter()
+    .any(|w| text.contains(w));
+    let plain_text = ["текст", "text", "слов", "букв"].iter().any(|w| text.contains(w));
+    // "Текстовый дисплей LCD1602" is the lesson's own name, not a request to
+    // print a message: only a message word or a verb makes it a text task.
+    let model_name = ["текстовый дисплей", "символьный дисплей", "text display"]
+        .iter()
+        .any(|w| text.contains(w));
+    if !message && !(plain_text && (show_verb || !model_name)) {
+        return None;
+    }
+    let s = crate::semantics::analyse(raw);
+    if s.source.is_some() {
+        return None;
+    }
+    // A relay, a buzzer or a motor named next to the screen has its own plan.
+    if s.sinks.iter().any(|sink| sink != "display") {
+        return None;
+    }
+    Some(screens)
 }
 
 pub fn parse(raw: &str) -> Parse {
@@ -621,8 +667,19 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         if let Some(parsed) = exact_book_task(raw) {
             return parsed;
         }
+        // A short ask such as "две надписи на двух OLED" can look like a
+        // printed display task, but it is the text scene, not the lesson's
+        // demo. A copied task still wins above, and a fuzzy match to a
+        // sensor, radio or storage keeps its own circuit.
         if let Some(parsed) = fuzzy_book_task(raw) {
-            return parsed;
+            let own_text = text_screen_task(raw).is_some()
+                && parsed
+                    .intent
+                    .lesson
+                    .is_some_and(crate::lessons::is_text_display);
+            if !own_text {
+                return parsed;
+            }
         }
     }
     let text = search_text(raw);
@@ -684,6 +741,13 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         .find_map(|(a, g)| (!hits(&text, g).is_empty()).then_some(*a));
 
     let semantic = crate::templates::route(load, input);
+    // A sentence that only asks for text on displays needs no sensor or
+    // driver: the displays are the circuit.
+    let mut text_screens = if !named_load && !named_input && !transistor {
+        text_screen_task(raw)
+    } else {
+        None
+    };
     // A named lesson from the course books is more specific than the generic
     // templates: if the sentence names a board the books teach, build that.
     // Everyday words like "термометр" stand in for a part only when the
@@ -711,13 +775,30 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     {
         lesson = Some(crate::lessons::PWM);
     }
+    // Text on a display is its own scene even when the sentence also names
+    // the display type: the LCD lesson prints its own clock, not the text the
+    // task asked for. A lesson about SD, radio or a sensor keeps its circuit,
+    // and the display joins it as an extra part.
+    if text_screens.is_some() {
+        match lesson {
+            Some(i) if crate::lessons::is_text_display(i) => lesson = None,
+            Some(_) => text_screens = None,
+            None => {}
+        }
+        if text_screens.is_some() {
+            understood.push(L::new("текст на экране", "text on a display"));
+        }
+    }
     if let Some(i) = lesson {
         understood.push(crate::lessons::ALL[i].title);
     }
     // The verb comes after the thing it applies to: "датчик газа · мигание"
-    // reads better than the other way round.
+    // reads better than the other way round. A text scene already says
+    // "текст на экране", so the verb would only repeat it.
     if let Some(a) = action {
-        understood.push(a.label());
+        if text_screens.is_none() {
+            understood.push(a.label());
+        }
     }
     // A sensor plus a verb is a composition, not merely the lesson that
     // teaches the sensor: "датчик газа, который мигает" becomes a circuit.
@@ -759,7 +840,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         input.is_some() && semantic != crate::templates::route(load, None);
     let unsupported = if let Some(r) = refusal {
         Some(r)
-    } else if lesson.is_some() {
+    } else if lesson.is_some() || text_screens.is_some() {
         None
     } else if !named_load && !input_matters {
         Some(L::new(
@@ -792,6 +873,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         action,
         condition,
         recipe,
+        text_screens,
         raw: raw.to_string(),
     };
     let mut alternatives = Vec::new();
@@ -852,6 +934,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             action,
             condition,
             recipe,
+            text_screens,
             raw: raw.to_string(),
         },
         matched,
@@ -1137,5 +1220,19 @@ mod tests {
             assert!(p.unsupported.is_none(), "{text}: {:?}", p.unsupported);
         }
         assert_eq!(parse("ночник на фоторезисторе").intent.input, Some(Input::Ldr));
+    }
+
+    #[test]
+    fn text_on_two_displays_is_its_own_scene() {
+        let p = parse("текст приветствия на двух экранах");
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported);
+        assert_eq!(p.intent.lesson, None, "motion sensor won over the text");
+        let screens = p.intent.text_screens.expect("two screens");
+        assert_eq!(screens.count, 2);
+        assert_eq!(screens.kind, ScreenKind::Any);
+        assert_eq!(
+            parse("текст на трёх экранах").intent.text_screens.map(|s| s.count),
+            Some(3)
+        );
     }
 }

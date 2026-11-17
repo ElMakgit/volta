@@ -35,6 +35,8 @@ pub enum Tid {
     Composed,
     /// A lesson of the course books, by index into `lessons::ALL`.
     Lesson(usize),
+    /// A text message on one or more I2C displays.
+    TextScreens,
 }
 
 pub fn route(load: Load, input: Option<Input>) -> Option<Tid> {
@@ -329,6 +331,9 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
 }
 
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
+    if let Some(screens) = intent.text_screens {
+        return Some(text_screen_plan(&intent.raw, screens, lang));
+    }
     if let Some(recipe) = intent.recipe {
         let mut p = crate::compose::plan(recipe, lang)?;
         p.why = explain(&intent.raw, lang);
@@ -1002,7 +1007,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             ],
             0,
         ),
-        Tid::Lesson(_) | Tid::Composed => return None,
+        Tid::Lesson(_) | Tid::Composed | Tid::TextScreens => return None,
     };
     Some(Plan {
         tid,
@@ -1012,6 +1017,116 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         recommended,
         why: explain(&intent.raw, lang),
     })
+}
+
+/// A ready-made text display, described closely enough to emit a working
+/// sketch: the module name for the bench, and the geometry the library needs.
+#[derive(Clone, Copy)]
+struct TextModule {
+    name: &'static str,
+    cols: u8,
+    rows: u8,
+    oled: bool,
+}
+
+const TEXT_LCD1602: TextModule = TextModule { name: "LCD1602", cols: 16, rows: 2, oled: false };
+const TEXT_LCD2004: TextModule = TextModule { name: "LCD2004", cols: 20, rows: 4, oled: false };
+const TEXT_OLED: TextModule = TextModule { name: "OLED 0.96", cols: 128, rows: 64, oled: true };
+
+/// What the "text on displays" scene offers. An SSD1306 answers at only two
+/// addresses, so three or more screens are built on character LCDs instead.
+fn text_modules(screens: crate::parse::Screens) -> Vec<TextModule> {
+    use crate::parse::ScreenKind;
+    let mut out = match screens.kind {
+        ScreenKind::Oled => vec![TEXT_OLED],
+        ScreenKind::Lcd => vec![TEXT_LCD1602],
+        ScreenKind::Lcd2004 => vec![TEXT_LCD2004],
+        ScreenKind::Any => vec![TEXT_LCD1602, TEXT_LCD2004, TEXT_OLED],
+    };
+    if screens.count > 2 {
+        out.retain(|m| !m.oled);
+    }
+    if out.is_empty() {
+        out.push(TEXT_LCD1602);
+    }
+    out
+}
+
+/// The word "приветствие", "надпись" or "текст" from the sentence, so the
+/// header repeats what the user asked to show rather than a generic title.
+fn text_subject(raw: &str, lang: Lang) -> &'static str {
+    let text = crate::words::normalize(raw);
+    let ru = lang == Lang::Ru;
+    if text.contains("приветств") || text.contains("привет") || text.contains("greeting") {
+        if ru { "Приветствие" } else { "Greeting" }
+    } else if text.contains("надпис") || text.contains("caption") {
+        if ru { "Надпись" } else { "Caption" }
+    } else {
+        if ru { "Текст" } else { "Text" }
+    }
+}
+
+fn text_screen_plan(raw: &str, screens: crate::parse::Screens, lang: Lang) -> Plan {
+    let ru = lang == Lang::Ru;
+    let subject = text_subject(raw, lang);
+    let place = match (ru, screens.count) {
+        (true, 1) => "одном экране".to_string(),
+        (true, 2) => "двух экранах".to_string(),
+        (true, 3) => "трёх экранах".to_string(),
+        (true, 4) => "четырёх экранах".to_string(),
+        (true, n) => format!("{n} экранах"),
+        (false, 1) => "one display".to_string(),
+        (false, 2) => "two displays".to_string(),
+        (false, 3) => "three displays".to_string(),
+        (false, 4) => "four displays".to_string(),
+        (false, n) => format!("{n} displays"),
+    };
+    let choices = text_modules(screens)
+        .into_iter()
+        .map(|m| Choice {
+            name: L::new(m.name, m.name),
+            blurb: if m.oled {
+                L::new(
+                    "Графический OLED на шине I2C: две сигнальные линии, адрес 0x3C.",
+                    "A graphic OLED on I2C: two signal wires at address 0x3C.",
+                )
+            } else {
+                L::new(
+                    "Символьный LCD через переходник I2C: SDA на A4, SCL на A5.",
+                    "A character LCD through an I2C backpack: SDA on A4, SCL on A5.",
+                )
+            },
+            pros: Vec::new(),
+            cons: Vec::new(),
+            specs: vec![
+                spec_line(&screens.count.to_string(), L::new("Экранов", "Screens")),
+                spec_line("I2C · A4/A5", L::new("Шина", "Bus")),
+                spec_line(&level_word(2, lang), LEVEL),
+            ],
+            level: 2,
+        })
+        .collect();
+    let why = if ru {
+        format!(
+            "Прочитано: {}; экранов {}; шина I2C: A4, A5",
+            subject.to_lowercase(),
+            screens.count
+        )
+    } else {
+        format!(
+            "Read as: {}; screens {}; I2C bus: A4, A5",
+            subject.to_lowercase(),
+            screens.count
+        )
+    };
+    Plan {
+        tid: Tid::TextScreens,
+        title: L::new("Текст на экране", "Text on a display"),
+        headline: Some(format!("{subject} на {place}")),
+        choices,
+        recommended: 0,
+        why: Some(why),
+    }
 }
 
 /// The display types offered when a sentence names a screen but not its
@@ -1053,18 +1168,169 @@ fn display_lesson_plan(i: usize, screens: Option<crate::parse::Screens>, lang: L
             level,
         })
         .collect();
+    let headline = if lang == Lang::Ru {
+        match screens.count {
+            1 => "Экран на I2C".to_string(),
+            2 => "Два экрана на I2C".to_string(),
+            3 => "Три экрана на I2C".to_string(),
+            n => format!("{n} экранов на I2C"),
+        }
+    } else {
+        match screens.count {
+            1 => "One I2C display".to_string(),
+            2 => "Two I2C displays".to_string(),
+            3 => "Three I2C displays".to_string(),
+            n => format!("{n} I2C displays"),
+        }
+    };
     Plan {
         tid: base.tid,
         title: L::new("Экран для урока", "A display for the lesson"),
-        headline: Some(format!(
-            "{} {}",
-            screens.count,
-            if lang == Lang::Ru { "экранов на I2C" } else { "I2C displays" }
-        )),
+        headline: Some(headline),
         choices,
         recommended: 0,
         why: None,
     }
+}
+
+/// The whole circuit for "text on displays": the screens on the I2C bus, the
+/// power rails, and a sketch that prints the same message on each board.
+fn text_screen_build(
+    lang: Lang,
+    screens: crate::parse::Screens,
+    choice: usize,
+) -> (Circuit, String, L, Vec<L>) {
+    let modules = text_modules(screens);
+    let module = modules[choice.min(modules.len() - 1)];
+    let mut b = B::new(lang);
+    let mut label = 2u8;
+    for n in 0..screens.count {
+        let name = format!("U{label}");
+        label += 1;
+        // Two 60 mm boards per row: side by side reads better than a tall
+        // column, and 64 mm leaves a small gap between them.
+        let at = Pt::new(
+            2.0 + (n % 2) as f32 * 64.0,
+            54.0 + (n / 2) as f32 * 32.0,
+        );
+        let disp = b.breakout(&name, module.name, at);
+        if let Some(m) = crate::modules::find(module.name) {
+            for (pin, dx, _) in m.pins.iter().copied() {
+                match pin {
+                    "GND" => b.w(b.mp(disp, pin), b.gnd(at.x + dx), NetClass::Gnd),
+                    "VCC" | "+5V" | "3V3" | "+" => {
+                        b.w(b.mp(disp, pin), b.vcc(at.x + dx), NetClass::Vcc)
+                    }
+                    "SDA" => b.w(b.mp(disp, pin), b.uno_pin("A4"), NetClass::Signal),
+                    "SCL" => b.w(b.mp(disp, pin), b.uno_pin("A5"), NetClass::Signal),
+                    _ => {}
+                }
+            }
+        }
+    }
+    feeds(&mut b);
+    let code = text_display_code(lang, screens, module);
+    // "Сообщение" covers a greeting, a caption and plain text alike, so the
+    // summary stays true whichever word the task used.
+    let summary = if screens.count == 1 {
+        L::new(
+            "Сообщение выводится на экран по шине I2C.",
+            "The message is shown on the display over I2C.",
+        )
+    } else {
+        L::new(
+            "Сообщение выводится на каждый экран: у каждого свой адрес на общей шине I2C.",
+            "The message goes to every display: each has its own address on the shared I2C bus.",
+        )
+    };
+    let mut notes = Vec::new();
+    if screens.count > 1 {
+        notes.push(if module.oled {
+            L::new(
+                "SSD1306 отвечает на 0x3C и 0x3D: адрес задаёт перемычка SA0. Проверь оба адреса сканером I2C.",
+                "An SSD1306 answers at 0x3C and 0x3D; the SA0 jumper sets the address. Check both with an I2C scanner.",
+            )
+        } else {
+            L::new(
+                "Первый LCD отвечает на 0x27, второй — на 0x26: у второго замкнут A0. Проверь адреса сканером I2C.",
+                "The first LCD answers at 0x27 and the second at 0x26: the second has A0 bridged. Check both with an I2C scanner.",
+            )
+        });
+    } else {
+        notes.push(if module.oled {
+            L::new(
+                "Адрес SSD1306 — 0x3C или 0x3D; перемычка SA0 выбирает его.",
+                "An SSD1306 answers at 0x3C or 0x3D; the SA0 jumper chooses.",
+            )
+        } else {
+            L::new(
+                "Адрес переходника LCD — 0x27 или 0x3F; его покажет сканер I2C.",
+                "The LCD backpack answers at 0x27 or 0x3F; an I2C scanner tells which.",
+            )
+        });
+    }
+    notes.push(L::new(
+        "В знакогенераторе HD44780 и в шрифте Adafruit нет кириллицы, поэтому в скетче «Privet!». Русские буквы требуют своей таблицы символов.",
+        "Neither the HD44780 character ROM nor the Adafruit font has Cyrillic, so the sketch prints \"Privet!\". Russian letters need a custom character table.",
+    ));
+    (b.finish(), code, summary, notes)
+}
+
+/// A sketch that prints one message on every display. The address of each
+/// board is printed under the message on a character LCD, so a second board
+/// that answers at another address is easy to spot.
+fn text_display_code(
+    lang: Lang,
+    screens: crate::parse::Screens,
+    module: TextModule,
+) -> String {
+    let ru = lang == Lang::Ru;
+    let message = if ru { "Privet!" } else { "Hello!" };
+    let mut includes = String::from("#include <Wire.h>\n");
+    if module.oled {
+        includes.push_str("#include <Adafruit_GFX.h>\n#include <Adafruit_SSD1306.h>\n");
+    } else {
+        includes.push_str("#include <LiquidCrystal_I2C.h>\n");
+    }
+    let mut objects = String::new();
+    let mut setup = String::from("  Wire.begin();\n");
+    let mut show = String::new();
+    for n in 0..screens.count {
+        let addr = if module.oled {
+            0x3C + n as u8
+        } else {
+            0x27 - n as u8
+        };
+        if module.oled {
+            objects.push_str(&format!("Adafruit_SSD1306 screen{n}(128, 64, &Wire, -1);\n"));
+            setup.push_str(&format!(
+                "  screen{n}.begin(SSD1306_SWITCHCAPVCC, 0x{addr:02X});\n  screen{n}.clearDisplay();\n  screen{n}.setTextSize(2);\n  screen{n}.setTextColor(SSD1306_WHITE);\n"
+            ));
+            show.push_str(&format!(
+                "  screen{n}.setCursor(0, 24);\n  screen{n}.print(MESSAGE);\n  screen{n}.display();\n"
+            ));
+        } else {
+            objects.push_str(&format!(
+                "LiquidCrystal_I2C screen{n}(0x{addr:02X}, {}, {});\n",
+                module.cols, module.rows
+            ));
+            setup.push_str(&format!(
+                "  screen{n}.init();\n  screen{n}.backlight();\n"
+            ));
+            let second = if module.rows > 2 { 2 } else { 1 };
+            show.push_str(&format!(
+                "  screen{n}.setCursor(0, 0);\n  screen{n}.print(MESSAGE);\n  screen{n}.setCursor(0, {second});\n  screen{n}.print(F(\"0x{addr:02X}\"));\n"
+            ));
+        }
+    }
+    let comment = if ru {
+        "// Текст на экранах по I2C: SDA — A4, SCL — A5."
+    } else {
+        "// Text on I2C displays: SDA on A4, SCL on A5."
+    };
+    format!(
+        "{comment}\n{includes}{objects}\nconst char MESSAGE[] = \"{message}\";\n\nvoid setup() {{\n{setup}{show}}}\n\nvoid loop() {{\n}}\n"
+    )
 }
 
 /// A lesson is a single ready-made design, so the plan window shows one card:
@@ -2303,6 +2569,21 @@ fn apply_spoken_numbers(code: &mut String, raw: &str) {
 
 // new build body, spliced into templates.rs
 pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
+    if let Some(screens) = intent.text_screens {
+        let plan = text_screen_plan(&intent.raw, screens, lang);
+        let choice = choice.min(plan.choices.len() - 1);
+        let (circuit, mut code, summary, notes) = text_screen_build(lang, screens, choice);
+        apply_spoken_numbers(&mut code, &intent.raw);
+        return Some(Built {
+            tid: Tid::TextScreens,
+            title: plan.title_text(lang),
+            circuit,
+            code,
+            choice,
+            summary,
+            notes,
+        });
+    }
     if let Some(recipe) = intent.recipe {
         return crate::compose::build(recipe, choice, lang);
     }
@@ -2359,7 +2640,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::Gsm => gsm(lang, choice),
         Tid::Ethernet => ethernet(lang, choice),
         Tid::Composed => return crate::compose::build(intent.recipe?, choice, lang),
-        Tid::Lesson(_) => return None,
+        Tid::Lesson(_) | Tid::TextScreens => return None,
     };
     apply_spoken_numbers(&mut code, &intent.raw);
     notes.extend(extra);
@@ -4455,6 +4736,26 @@ mod tests {
         assert!(built.code.contains("screen0") && built.code.contains("screen1"));
     }
 
+    /// "Текст приветствия на двух экранах" is two displays showing a message,
+    /// not the motion sensor that a similar-looking word once matched.
+    #[test]
+    fn text_on_two_displays_builds_two_screens() {
+        use crate::text::Lang;
+        let parsed = crate::parse::parse("текст приветствия на двух экранах");
+        assert_eq!(parsed.intent.lesson, None);
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.title_text(Lang::Ru), "Приветствие на двух экранах");
+        assert_eq!(plan.choices.len(), 3, "an unnamed display offers a choice");
+
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let screens = built.circuit.parts().filter(|p| p.value == "LCD1602").count();
+        assert_eq!(screens, 2, "two screens means two boards");
+        assert!(built.code.contains("LiquidCrystal_I2C screen0(0x27"));
+        assert!(built.code.contains("LiquidCrystal_I2C screen1(0x26"));
+        assert_eq!(built.code.matches("print(MESSAGE)").count(), 2);
+        assert!(built.code.contains("void loop()"));
+    }
+
     /// A ladder from nonsense to precise multi-device tasks: every rung must
     /// answer without panicking, and the precise ones must add what they name.
     #[test]
@@ -4542,6 +4843,7 @@ mod tests {
                 raw: p.intent.raw,
                 condition: None,
                 recipe: None,
+                text_screens: None,
             };
             let plan = plan(&intent, Lang::Ru).expect("routable");
             assert_eq!(plan.choices.len(), 3);
@@ -4756,6 +5058,7 @@ mod tests {
                 raw: String::new(),
                 condition: None,
                 recipe: None,
+                text_screens: None,
             };
             let plan = plan(&intent, Lang::Ru).expect("the lesson plans");
             assert_eq!(plan.choices.len(), 1, "{}", l.title.ru);
@@ -4804,6 +5107,7 @@ mod tests {
                 raw: String::new(),
                 condition: None,
                 recipe: None,
+                text_screens: None,
             };
             let built = build(&intent, 0, Lang::Ru).unwrap_or_else(|| panic!("{}", l.title.ru));
             let c = &built.circuit;
@@ -5003,6 +5307,7 @@ mod tests {
             raw: String::new(),
             condition: None,
             recipe: None,
+            text_screens: None,
         };
         let built = build(&intent, 0, Lang::Ru).unwrap();
         let bom = bom(&built.circuit, Lang::Ru);

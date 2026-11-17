@@ -51,6 +51,14 @@ const SINKS: &[(&str, &[&str])] = &[
 
 fn mentions_any(text: &str, words: &[&str]) -> bool {
     words.iter().any(|key| {
+        let key = *key;
+        // A short Latin word is matched as a whole token: "oled" contains
+        // "led", but an OLED is not an LED sink.
+        if key.len() <= 4 && key.chars().all(|c| c.is_ascii_alphabetic()) {
+            return text
+                .split_whitespace()
+                .any(|word| word.trim_matches(|c: char| !c.is_alphanumeric()) == key);
+        }
         if text.contains(key) {
             return true;
         }
@@ -127,6 +135,12 @@ mod tests {
         assert!(s.sinks.iter().any(|x| x == "motor"));
         assert_eq!(s.condition.as_deref(), Some("threshold"));
         assert_eq!(s.period_ms, Some(5000));
+    }
+
+    #[test]
+    fn an_oled_is_a_display_not_an_led() {
+        let s = analyse("две надписи на двух oled");
+        assert_eq!(s.sinks, vec!["display".to_string()]);
     }
 
     #[test]

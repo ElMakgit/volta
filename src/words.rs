@@ -183,6 +183,14 @@ pub fn mentions(text: &str, key: &str) -> bool {
     // The key is normalised the same way as the sentence, so a lesson key
     // written as "16*2" still matches the sentence "16 2".
     let key = normalize(key);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    // A short Latin key is a whole token: "oled" contains "led", but an OLED
+    // is not an LED, and "gsm" must not match inside another word.
+    if key.chars().count() <= 4 && key.chars().all(|c| c.is_ascii_alphabetic()) {
+        return tokens
+            .iter()
+            .any(|t| t.trim_matches(|c: char| !c.is_alphanumeric()) == key);
+    }
     if text.contains(&key) {
         return true;
     }
@@ -193,7 +201,6 @@ pub fn mentions(text: &str, key: &str) -> bool {
     if !words.iter().all(|w| w.chars().all(|c| c.is_alphabetic())) {
         return false;
     }
-    let tokens: Vec<&str> = text.split_whitespace().collect();
     // A phrase key ("датчик свет") is matched word by word: every word is
     // folded to its stem, so "по датчику света" still finds "датчик свет".
     if words.len() > 1 {
@@ -215,13 +222,17 @@ fn word_matches(token: &str, key: &str) -> bool {
     if alike(&token_stem, &key_stem) || alike(&token_stem, key) {
         return true;
     }
-    // One typo is allowed on a real word of at least six letters and two on
-    // a long one. Shorter stems differ by a letter for unrelated reasons
-    // ("пульт" and "пельтье"), and a typo there is a false hit.
+    // One typo is allowed on a real word of at least six letters. A long
+    // word may have two, but only when the lengths differ: a skipped or
+    // doubled letter is a typo, while two substitutions in words of the same
+    // length are usually unrelated words ("приветствие" and "присутствие").
+    // Shorter stems differ by a letter for unrelated reasons ("пульт" and
+    // "пельтье"), and a typo there is a false hit.
     let key_len = key_stem.chars().count();
-    let len = token.chars().count();
-    if key_len >= 6 && len >= 5 {
-        let cap = if len >= 9 && key_len >= 9 { 2 } else { 1 };
+    let token_len = token_stem.chars().count();
+    if key_len >= 6 && token_len >= 5 {
+        let two = token_len >= 9 && key_len >= 9 && token_len != key_len;
+        let cap = if two { 2 } else { 1 };
         if distance(&token_stem, &key_stem) <= cap {
             return true;
         }
@@ -280,5 +291,12 @@ mod tests {
         assert!(!alike("ручн", "ручк"));
         assert!(alike("кнопк", "кнопок"));
         assert!(mentions("max7219 матрица", "max7219"));
+    }
+
+    #[test]
+    fn a_short_latin_key_is_a_whole_word() {
+        assert!(mentions("подключи oled экран", "oled"));
+        assert!(!mentions("подключи oled экран", "led"));
+        assert!(mentions("светодиод led", "led"));
     }
 }

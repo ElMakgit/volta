@@ -2131,6 +2131,17 @@ pub const RANGE: usize = 15;
 /// The digital sound sensor lesson.
 pub const SOUND: usize = 36;
 
+/// Whether the lesson is an I2C text display, so a task that asks for its own
+/// text can take over the display instead of building the lesson's demo.
+pub fn is_text_display(i: usize) -> bool {
+    ALL.get(i).is_some_and(|lesson| {
+        lesson
+            .boards
+            .iter()
+            .any(|b| b.name.starts_with("LCD") || b.name.starts_with("OLED"))
+    })
+}
+
 /// Pick the lesson a sentence is about. The most keyword hits wins; ties go
 /// to the longer keyword, which keeps a specific board ahead of a generic
 /// sensor word. Only when nothing matches at all do the everyday aliases

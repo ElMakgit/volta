@@ -2012,6 +2012,7 @@ mod tests {
             raw: String::new(),
             condition: None,
             recipe: None,
+            text_screens: None,
         };
         let built = crate::templates::build(&intent, 0, crate::text::Lang::Ru).unwrap();
         let mut d = Draft::new();
