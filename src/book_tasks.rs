@@ -712,6 +712,99 @@ fn loose(raw: &str) -> String {
         .collect()
 }
 
+/// How close a sentence must be to a printed task before its solution is
+/// reused. Below this the parser keeps guessing from keywords, which is
+/// honest: a reworded task may have dropped a requirement.
+const FUZZY_MIN: f32 = 0.65;
+/// Two tasks usually differ in a word or two ("вперёд и назад"), so the
+/// nearest one must be clearly ahead of the closest task that answers with a
+/// *different* solution. Near-duplicates of the same lesson are fine.
+const FUZZY_MARGIN: f32 = 0.10;
+/// A phrase shorter than this is served by the ordinary keyword parser:
+/// "датчик газа" must not resolve to a book task that also adds a siren.
+const FUZZY_WORDS: usize = 6;
+
+/// The stems a sentence is compared by: stop words and one-letter noise are
+/// dropped, and the Latin `x` of a size becomes Cyrillic, so "128x64" and
+/// "128х64" are the same token.
+fn stems_of(text: &str) -> Vec<String> {
+    crate::words::normalize(text)
+        .split_whitespace()
+        .map(|word| {
+            let folded = if word.chars().any(|c| c.is_ascii_digit()) {
+                word.replace('x', "х")
+            } else {
+                word.to_string()
+            };
+            crate::words::stem(&folded)
+        })
+        .filter(|word| word.chars().count() > 2 || word.chars().all(|c| c.is_ascii_digit()))
+        .collect()
+}
+
+fn dice(a: &[String], b: &[String]) -> f32 {
+    let sa: std::collections::BTreeSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: std::collections::BTreeSet<&str> = b.iter().map(String::as_str).collect();
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    let common = sa.intersection(&sb).count();
+    (2.0 * common as f32) / (sa.len() + sb.len()) as f32
+}
+
+fn stems_table() -> &'static [Vec<String>] {
+    static TABLE: OnceLock<Vec<Vec<String>>> = OnceLock::new();
+    TABLE.get_or_init(|| TASKS.iter().map(|(task, _)| stems_of(task)).collect())
+}
+
+/// The printed task a sentence is a near copy of, with a similarity score in
+/// percent. This is what keeps a retyped task with one changed word
+/// ("энергонезависимую" instead of the book's "энергозависимую") on its own
+/// solution instead of falling back to a single keyword.
+///
+/// Only a long sentence that clearly wins over the runner-up is accepted;
+/// everything else returns `None` and stays with the ordinary parser.
+pub fn closest(raw: &str) -> Option<(usize, Solution, u8)> {
+    let mine = stems_of(raw);
+    if mine.len() < FUZZY_WORDS {
+        return None;
+    }
+    let mut best: Option<(f32, usize, Solution)> = None;
+    let mut second = 0.0f32;
+    for (i, stems) in stems_table().iter().enumerate() {
+        let score = dice(&mine, stems);
+        let solution = TASKS[i].1;
+        match best {
+            Some((top, _, top_solution)) if score > top => {
+                let _ = top_solution;
+                if !same_solution(top_solution, solution) {
+                    second = second.max(best.map(|(t, _, _)| t).unwrap_or(0.0));
+                }
+                best = Some((score, i, solution));
+            }
+            Some((_, _, top_solution)) => {
+                if !same_solution(top_solution, solution) {
+                    second = second.max(score);
+                }
+            }
+            None => best = Some((score, i, solution)),
+        }
+    }
+    let (score, i, solution) = best?;
+    if score < FUZZY_MIN || score - second < FUZZY_MARGIN {
+        return None;
+    }
+    Some((i, solution, (score * 100.0).round() as u8))
+}
+
+fn same_solution(a: Solution, b: Solution) -> bool {
+    match (a, b) {
+        (Solution::Lesson(x), Solution::Lesson(y)) => x == y,
+        (Solution::Seed(x), Solution::Seed(y)) => x == y,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +851,35 @@ mod tests {
     fn a_wrapped_task_still_matches() {
         let raw = "Составить программу теста двигателя постоянного тока на биполяр- ном транзисторе n-p-n.";
         assert!(solution_for(raw).is_some(), "wrapped task was not found");
+    }
+
+    /// A retyped task with a couple of changed words still lands on its own
+    /// solution instead of falling back to one keyword.
+    #[test]
+    fn a_retyped_task_keeps_its_solution() {
+        // The access task, retyped with "энергонезависимую" instead of the
+        // book's "энергозависимую" and "заготовки" instead of "записи".
+        let raw = "Составить программу для МК контроля доступа на 49 карт сохранив в энергонезависимую память EEPROM и выводом информации заготовки и доступа на дисплей 128x64";
+        let (_, solution, score) = closest(raw).expect("retyped task was not recognised");
+        assert!(score >= 70, "score {score}");
+        assert!(matches!(solution, Solution::Seed(_)));
+
+        // A paraphrase of a lesson task keeps the lesson.
+        let raw = "Составить сигнализацию смены положения ртутного геркона. Режимы сигнализации показать на двух светодиодах и мигать при смене положения.";
+        let (_, solution, _) = closest(raw).expect("paraphrase was not recognised");
+        assert!(matches!(solution, Solution::Lesson(4)));
+
+        // "128x64" with a Latin x and the book's Cyrillic "128х64" are equal.
+        let raw = "Составить программу для МК контроля доступа на 49 карт с их записью в энергонезависимую память EEPROM и выводом информации записи и доступа на дисплей 128x64";
+        assert!(closest(raw).is_some());
+    }
+
+    /// A short phrase is left to the keyword parser: it must not inherit a
+    /// book task that also adds a siren or a display.
+    #[test]
+    fn a_short_phrase_does_not_borrow_a_book_task() {
+        assert!(closest("датчик газа").is_none());
+        assert!(closest("измерь температуру").is_none());
+        assert!(closest("").is_none());
     }
 }

@@ -564,8 +564,22 @@ pub fn parse(raw: &str) -> Parse {
 /// instead of being guessed from a few keywords.
 #[cfg(feature = "book-tasks")]
 fn exact_book_task(raw: &str) -> Option<Parse> {
-    match crate::book_tasks::solution_for(raw) {
-        Some(crate::book_tasks::Solution::Lesson(i)) => {
+    crate::book_tasks::solution_for(raw).map(|solution| from_book_solution(raw, solution))
+}
+
+/// A sentence that is close to a printed task keeps that task's solution even
+/// though a word or two changed. The similarity check is deliberately
+/// conservative and never overrides a short keyword phrase.
+#[cfg(feature = "book-tasks")]
+fn fuzzy_book_task(raw: &str) -> Option<Parse> {
+    crate::book_tasks::closest(raw).map(|(_, solution, _)| from_book_solution(raw, solution))
+}
+
+#[cfg(feature = "book-tasks")]
+fn from_book_solution(raw: &str, solution: crate::book_tasks::Solution) -> Parse {
+    use crate::book_tasks::Solution;
+    match solution {
+        Solution::Lesson(i) => {
             let mut parsed = parse_inner(crate::lessons::ALL[i].title.ru, false);
             // A bare title such as "Кнопка" is also an everyday word, so the
             // title alone may route elsewhere. The book already says which
@@ -574,24 +588,28 @@ fn exact_book_task(raw: &str) -> Option<Parse> {
             parsed.unsupported = None;
             parsed.alternatives.clear();
             parsed.intent.raw = raw.to_string();
-            Some(parsed)
+            parsed
         }
-        Some(crate::book_tasks::Solution::Seed(seed)) => {
+        Solution::Seed(seed) => {
             let normal = parse_inner(raw, false);
             if normal.unsupported.is_some() {
                 let mut parsed = parse_inner(seed, false);
                 parsed.intent.raw = raw.to_string();
-                Some(parsed)
+                parsed
             } else {
-                Some(normal)
+                normal
             }
         }
-        None => None,
     }
 }
 
 #[cfg(not(feature = "book-tasks"))]
 fn exact_book_task(_raw: &str) -> Option<Parse> {
+    None
+}
+
+#[cfg(not(feature = "book-tasks"))]
+fn fuzzy_book_task(_raw: &str) -> Option<Parse> {
     None
 }
 
@@ -601,6 +619,9 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // still reach the sketch.
     if books {
         if let Some(parsed) = exact_book_task(raw) {
+            return parsed;
+        }
+        if let Some(parsed) = fuzzy_book_task(raw) {
             return parsed;
         }
     }

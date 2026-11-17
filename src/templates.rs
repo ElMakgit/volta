@@ -227,11 +227,29 @@ fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
 /// A short, visible reason for the chosen plan, built from the same roles the
 /// parser used, so the UI never claims more than it understood.
 fn explain(raw: &str, lang: Lang) -> Option<String> {
+    let ru = lang == Lang::Ru;
+    let book = {
+        #[cfg(feature = "book-tasks")]
+        {
+            crate::book_tasks::closest(raw).map(|(_, _, score)| score)
+        }
+        #[cfg(not(feature = "book-tasks"))]
+        {
+            None
+        }
+    };
+    let prefix = match book {
+        Some(score) => format!(
+            "{} {}%; ",
+            if ru { "задача из книги, совпадение" } else { "a book task, match" },
+            score
+        ),
+        None => String::new(),
+    };
     let s = crate::semantics::analyse(raw);
     if s.confidence == 0.0 {
-        return None;
+        return (!prefix.is_empty()).then(|| prefix.trim_end_matches("; ").to_string());
     }
-    let ru = lang == Lang::Ru;
     let source = s.source.unwrap_or_else(|| if ru { "не назван".into() } else { "unnamed".into() });
     let sinks = if s.sinks.is_empty() {
         if ru { "нет" } else { "none" }.to_string()
@@ -251,7 +269,7 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
         None => String::new(),
     };
     let conf = format!("; {} {:.0}%", if ru { "уверенность" } else { "confidence" }, s.confidence * 100.0);
-    Some(format!("{}: {} → {}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, conf))
+    Some(format!("{prefix}{}: {} → {}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, conf))
 }
 
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
@@ -936,7 +954,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         headline: None,
         choices,
         recommended,
-        why: None,
+        why: explain(&intent.raw, lang),
     })
 }
 
