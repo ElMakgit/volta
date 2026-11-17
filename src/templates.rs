@@ -2336,7 +2336,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     let (circuit, mut code, summary, extra) = match tid {
         Tid::MotorSteps => motor_steps(lang, choice),
         Tid::MotorPot => motor_pot(lang, choice),
-        Tid::MotorTest => motor_test(lang, choice),
+        Tid::MotorTest => motor_test(lang, choice, &intent.raw),
         Tid::MotorDriver => motor_driver(lang, choice),
         Tid::Stepper => stepper(lang, choice),
         Tid::LedToggle => led_toggle(lang, choice),
@@ -3070,7 +3070,7 @@ fn motor_pot(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
 }
 
 /// Motor simply on: the test from the first lesson.
-fn motor_test(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
+fn motor_test(lang: Lang, choice: usize, raw: &str) -> (Circuit, String, L, Vec<L>) {
     let mut b = B::new(lang);
     let vcc = b.vcc(82.0);
     let gnd = b.gnd(78.0);
@@ -3091,7 +3091,7 @@ fn motor_test(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
             b.w(d.0, m[1], NetClass::Signal);
             (
                 b.finish(),
-                motor_test_sketch(lang, 7),
+                motor_test_sketch(lang, 7, raw),
                 L::new(
                     "Реле замыкает мотор на землю, D7 держит его включённым.",
                     "The relay grounds the motor, D7 keeps it on.",
@@ -3118,7 +3118,7 @@ fn motor_test(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
             b.w(d.0, m[1], NetClass::Signal);
             (
                 b.finish(),
-                motor_test_sketch(lang, 9),
+                motor_test_sketch(lang, 9, raw),
                 L::new(
                     "NPN-ключ: база через 1 кОм от D9, мотор на полную.",
                     "NPN switch: base through 1 kΩ from D9, motor flat out.",
@@ -3145,7 +3145,7 @@ fn motor_test(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
             b.w(d.0, m[1], NetClass::Signal);
             (
                 b.finish(),
-                motor_test_sketch(lang, 9),
+                motor_test_sketch(lang, 9, raw),
                 L::new(
                     "Полевой n-канальный ключ: мотор включается уровнем с D9.",
                     "An n-channel MOSFET switch: D9 turns the motor on.",
@@ -3702,7 +3702,46 @@ void loop() {
     )
 }
 
-fn motor_test_sketch(lang: Lang, pin: u8) -> String {
+fn motor_test_sketch(lang: Lang, pin: u8, raw: &str) -> String {
+    // "Полив раз в полчаса" is not a switch test: the pump must run on a
+    // schedule, or the plants are flooded once and the sketch lies about it.
+    if let Some(ms) = crate::semantics::analyse(raw).period_ms {
+        return fill(
+            r#"// <<C0>>
+const uint8_t MOTOR = <<PIN>>;
+const uint32_t PERIOD_MS = <<PERIOD>>;   // как часто включать
+const uint16_t RUN_MS = 5000;           // сколько держать включённым
+
+uint32_t last = 0;
+uint32_t started = 0;
+bool running = false;
+
+void setup() {
+  pinMode(MOTOR, OUTPUT);
+  digitalWrite(MOTOR, LOW);
+}
+
+void loop() {
+  uint32_t now = millis();
+  if (!running && now - last >= PERIOD_MS) {
+    running = true;
+    started = now;
+    last = now;
+    digitalWrite(MOTOR, HIGH);
+  }
+  if (running && now - started >= RUN_MS) {
+    running = false;
+    digitalWrite(MOTOR, LOW);
+  }
+}
+"#,
+            &[
+                ("C0", tr(lang, "Полив по расписанию: насос включается на 5 секунд", "Scheduled watering: the pump runs for five seconds")),
+                ("PIN", &pin.to_string()),
+                ("PERIOD", &ms.to_string()),
+            ],
+        );
+    }
     fill(
         r#"// <<C0>>
 const uint8_t MOTOR = <<PIN>>;
@@ -4597,6 +4636,20 @@ mod tests {
         assert!(built.code.contains("tone(BUZZ, 1200, 300);"), "no siren call");
         let values: Vec<&str> = built.circuit.parts().map(|p| p.value.as_str()).collect();
         assert!(values.iter().any(|v| *v == "пьезо"), "{values:?}");
+    }
+
+    /// A pump asked to water every half hour runs on that schedule instead of
+    /// staying on forever.
+    #[test]
+    fn a_watering_pump_follows_the_spoken_period() {
+        let text = "полив раз в полчаса";
+        let p = parse(text);
+        let sandbox = plan(&p.intent, Lang::Ru).expect("plans");
+        let built = build(&p.intent, sandbox.recommended, Lang::Ru).expect("builds");
+        assert!(built.code.contains("PERIOD_MS = 1800000"), "{}", built.code);
+        assert!(built.code.contains("RUN_MS"), "no run time");
+        assert!(built.code.contains("millis()"), "the schedule is not timed");
+        assert!(!built.code.contains("HIGH);   // тест"), "the pump still runs forever");
     }
 
     /// The EEPROM of an Uno holds 255 four-byte UIDs, so a bigger request is

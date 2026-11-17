@@ -287,6 +287,8 @@ tcs3200 | lesson:50
 двигатель постоянного тока | load:motor
 вентилятор | load:motor
 насос | load:motor
+полив цветов | load:motor
+полив раз в полчаса | load:motor
 мотор с кнопкой | load:motor+button
 мотор и потенциометр | load:motor+pot
 регулировать скорость мотора потенциометром | load:motor+pot
@@ -408,7 +410,6 @@ temperature above 20 and below 30 relay | compose:Temperature/Relay/Switch
 переведи текст | refuse
 свет | refuse
 робот | refuse
-полив цветов | refuse
 открыть дверь | refuse
 включи музыку | refuse
 сколько времени | refuse

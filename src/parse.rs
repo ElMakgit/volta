@@ -203,7 +203,8 @@ const MOTOR: Group = Group {
     words: &[
         "мотор", "моторчик", "двигател", "скорост", "оборот", "вентилятор",
         "насос", "кулер", "вертушк", "редуктор", "коллекторн", "motor", "speed",
-        "rpm", "fan", "pump",
+        "rpm", "fan", "pump", "полив", "поливалк", "полива", "орошен",
+        "капельн", "фонтан", "скважин",
     ],
     label: L::new("двигатель", "motor"),
 };
@@ -295,7 +296,8 @@ const LDR: Group = Group {
     words: &[
         "фоторезистор", "фотоэлемент", "светочувств", "ldr", "освещ", "темно",
         "сумерк", "датчик свет", "свет датчик", "light sensor", "light level",
-        "photoresistor",
+        "photoresistor", "вечер", "ночь", "рассвет", "закат", "twilight",
+        "dusk", "dawn",
     ],
     label: L::new("освещённость", "light level"),
 };
@@ -918,6 +920,27 @@ mod tests {
             "{}",
             plan.title_text(crate::text::Lang::Ru)
         );
+    }
+
+    /// Everyday words name the same roles as the technical ones: a watering
+    /// pump is a motor, evening and night ask for a light sensor, a lantern
+    /// is an LED.
+    #[test]
+    fn everyday_words_name_the_same_roles() {
+        let water = parse("полив раз в полчаса");
+        assert_eq!(water.intent.load, Load::Motor);
+        assert!(water.unsupported.is_none(), "{:?}", water.unsupported);
+
+        for text in [
+            "вечером включай фонарь",
+            "ночью зажги свет на крыльце",
+            "в темноте включи лампу",
+        ] {
+            let p = parse(text);
+            assert_eq!(p.intent.load, Load::Led, "{text}");
+            assert_eq!(p.intent.input, Some(Input::Ldr), "{text}");
+            assert!(p.unsupported.is_none(), "{text}: {:?}", p.unsupported);
+        }
     }
 
     #[test]
