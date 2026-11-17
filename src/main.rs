@@ -394,7 +394,7 @@ fn cmd_list() {
             ),
         ),
         (
-            text::L::new("уроки из книг", "lessons from the books"),
+            text::L::new("готовые уроки", "ready-made lessons"),
             text::L::new(
                 "51 урок и 10 занятий: датчики, экраны, память",
                 "51 lessons and 10 exercises: sensors, screens, memory",

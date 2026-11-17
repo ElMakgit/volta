@@ -253,11 +253,12 @@ fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
         ),
     ];
     let recommended = if wants_access(raw) { 3 } else { 0 };
-    (
-        L::new("RFID RC522: чтение метки", "RFID RC522: reading a tag"),
-        choices,
-        recommended,
-    )
+    let title = if recommended == 3 {
+        L::new("RFID RC522: карты в EEPROM", "RFID RC522: cards in EEPROM")
+    } else {
+        L::new("RFID RC522: чтение метки", "RFID RC522: reading a tag")
+    };
+    (title, choices, recommended)
 }
 
 /// A short, visible reason for the chosen plan, built from the same roles the
@@ -277,7 +278,7 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
     let prefix = match book {
         Some(score) => format!(
             "{} {}%; ",
-            if ru { "задача из книги, совпадение" } else { "a book task, match" },
+            if ru { "готовая задача, совпадение" } else { "a ready task, match" },
             score
         ),
         None => String::new(),
@@ -317,7 +318,13 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
         ),
         _ => String::new(),
     };
-    let conf = format!("; {} {:.0}%", if ru { "уверенность" } else { "confidence" }, s.confidence * 100.0);
+    // A ready task already explains itself; a role score next to it would
+    // only look like doubt.
+    let conf = if prefix.is_empty() {
+        format!("; {} {:.0}%", if ru { "уверенность" } else { "confidence" }, s.confidence * 100.0)
+    } else {
+        String::new()
+    };
     Some(format!("{prefix}{}: {} → {}{}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, limit, conf))
 }
 
@@ -1082,12 +1089,12 @@ fn lesson_plan(i: usize, lang: Lang) -> Plan {
         .unwrap_or("I");
     specs.push(spec_line(
         &format!("{part}, {}", l.number),
-        L::new("Книга, урок", "Book, lesson"),
+        L::new("Раздел, урок", "Section, lesson"),
     ));
     specs.push(spec_line(&level_word(l.level, lang), L::new("Сложность", "Effort")));
     Plan {
         tid: Tid::Lesson(i),
-        title: L::new("Урок из книги", "A lesson from the book"),
+        title: L::new("Готовый урок", "A ready-made lesson"),
         headline: None,
         choices: vec![Choice {
             name: l.title,

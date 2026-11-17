@@ -1,7 +1,12 @@
 [package]
 name = "volta"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+description = "Offline breadboard, Arduino sketch and checks from a task sentence"
+license = "MIT"
+repository = "https://github.com/ElMakgit/volta"
+readme = "README.md"
+authors = ["ElMak <89011639+ElMakgit@users.noreply.github.com>"]
 
 [features]
 # Exact task texts are shipped with the source. The feature can be turned off

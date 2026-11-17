@@ -1,13 +1,13 @@
 # Maintainer: elmak
 # Personal package: builds the working tree next to this folder.
 pkgname=volta
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Breadboard schematic, Arduino sketch and checks from a task sentence"
 arch=('x86_64')
-url="https://localhost/volta"
+url="https://github.com/ElMakgit/volta"
 license=('MIT')
-depends=('gcc-libs' 'glibc' 'librsvg')
+depends=('gcc-libs' 'glibc')
 makedepends=('rust' 'cargo')
 source=()
 sha256sums=()
