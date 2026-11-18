@@ -179,17 +179,59 @@ fn declared(code: &str) -> Vec<(String, String)> {
     out
 }
 
-fn pin_mode_pins(code: &str) -> Vec<String> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinDir {
+    Input,
+    Output,
+}
+
+/// Every `pinMode(arg, mode)` call, with its direction. The argument may be a
+/// constant name or a bare number: a sketch that writes `pinMode(13, OUTPUT)`
+/// still has to put something on D13.
+fn pin_mode_calls(code: &str) -> Vec<(String, PinDir)> {
     let mut out = Vec::new();
     for line in code.lines().filter(|l| l.contains("pinMode(")) {
-        if let Some(start) = line.find("pinMode(") {
-            let rest = &line[start + 8..];
-            if let Some(comma) = rest.find(',') {
-                out.push(rest[..comma].trim().to_string());
-            }
+        let Some(start) = line.find("pinMode(") else { continue };
+        let rest = &line[start + 8..];
+        let Some(comma) = rest.find(',') else { continue };
+        let arg = rest[..comma].trim().to_string();
+        let after = rest[comma + 1..].trim_start();
+        let mode = after
+            .split(|c: char| c == ')' || c == ',' || c == ';' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if arg.is_empty() || arg.contains('[') {
+            continue;
         }
+        out.push((arg, if mode.contains("OUTPUT") { PinDir::Output } else { PinDir::Input }));
     }
     out
+}
+
+/// Resolve a `pinMode` argument to the board's own pin name. A constant is
+/// looked up in the declarations; a number becomes `D<n>`, and `A0` stays an
+/// analog pin. An array element or a loop variable is not resolvable here.
+fn pin_target(arg: &str, declared: &[(String, String)]) -> Option<String> {
+    let value = declared
+        .iter()
+        .find(|(name, _)| name == arg)
+        .map(|(_, value)| value.as_str())
+        .unwrap_or(arg);
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('A') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("A{rest}"));
+        }
+    }
+    if let Some(rest) = value.strip_prefix('D') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return Some(format!("D{rest}"));
+        }
+    }
+    if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+        return Some(format!("D{value}"));
+    }
+    None
 }
 
 /// Pin numbers written into `analogWrite(...)` calls.
@@ -653,7 +695,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         .parts
         .iter()
         .enumerate()
-        .filter(|(_, p)| matches!(p.kind, Kind::Motor | Kind::Speaker))
+        .filter(|(_, p)| matches!(p.kind, Kind::Motor | Kind::Speaker | Kind::Lamp))
     {
         for &pin in &load.pins {
             if uno_signal_on(c, &roots, roots[pin]) {
@@ -760,9 +802,11 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
 
     // Checks 10-12 read the sketch, so a hand-drawn circuit skips them.
     if !code.is_empty() {
-        // 10. Sketch pins exist on the drawing and are wired.
+        // 10. Sketch pins exist on the drawing and are wired. A numeric
+        // `pinMode(13, OUTPUT)` is checked just like a named constant: the
+        // sketch may not drive a pin that has no part on it.
         let declared = declared(code);
-        let modes = pin_mode_pins(code);
+        let modes = pin_mode_calls(code);
         let mut mismatched = Vec::new();
         let mut bad_pins: Vec<usize> = Vec::new();
         let mut used = Vec::new();
@@ -776,17 +820,32 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 .map(|p| nets.pins_in(roots[p]).len() >= 2)
                 .unwrap_or(false)
         };
-        for (name, value) in &declared {
-            if !modes.contains(name) {
-                continue;
+        // One entry per pin: was it declared an input, an output, and which
+        // spelling did the sketch use.
+        let mut directions: Vec<(String, bool, bool, String)> = Vec::new();
+        for (arg, dir) in &modes {
+            let Some(pin_name) = pin_target(arg, &declared) else { continue };
+            let named = declared.iter().any(|(name, _)| name == arg);
+            used.push(if named { arg.clone() } else { pin_name.clone() });
+            let entry = {
+                let idx = directions
+                    .iter()
+                    .position(|(pin, ..)| *pin == pin_name)
+                    .unwrap_or_else(|| {
+                        directions.push((pin_name.clone(), false, false, arg.clone()));
+                        directions.len() - 1
+                    });
+                &mut directions[idx]
+            };
+            match dir {
+                PinDir::Input => entry.1 = true,
+                PinDir::Output => entry.2 = true,
             }
-            used.push(name.clone());
-            let pin_name = if value.starts_with('A') { value.clone() } else { format!("D{value}") };
             if !wired(&pin_name) {
                 if let Some(p) = uno_pin(&pin_name) {
                     bad_pins.push(p);
                 }
-                mismatched.push(format!("{name} → {pin_name}"));
+                mismatched.push(format!("{arg} → {pin_name}"));
             }
         }
         for name in analog_read_targets(code) {
@@ -804,6 +863,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 mismatched.push(format!("{name} → {pin_name}"));
             }
         }
+        mismatched.dedup();
         checks.push(if mismatched.is_empty() {
             Check::pass(
                 L::new("Код ↔ схема", "Code vs drawing"),
@@ -819,6 +879,81 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 L::new("Код ↔ схема", "Code vs drawing"),
                 format!("{}: {}", tr(lang, "в схеме не подключено", "not wired on the drawing"), mismatched.join(", ")),
                 focus_on_pins(c, &bad_pins),
+            )
+        });
+
+        // 10b. One pin, one job: no pin may be both an input and an output,
+        // and two loads may not sit on the same digital pin. A resistor next
+        // to a button is fine, so only parts that do something are counted.
+        let mut pin_problems = Vec::new();
+        let mut pin_focus = Vec::new();
+        for (pin_name, input, output, arg) in &directions {
+            if *input && *output {
+                pin_problems.push(format!(
+                    "{}: {} / {}",
+                    pin_name,
+                    tr(lang, "объявлен входом и выходом", "declared input and output"),
+                    arg
+                ));
+                if let Some(p) = uno_pin(pin_name) {
+                    pin_focus.push(p);
+                }
+            }
+        }
+        for i in 0..c.parts[uno].pins.len() {
+            let pin = c.parts[uno].pins[i];
+            let name = c.pins[pin].name;
+            if !name.starts_with('D') {
+                continue;
+            }
+            let root = roots[pin];
+            let mut sharing: Vec<usize> = c
+                .pins
+                .iter()
+                .enumerate()
+                .filter(|(j, p)| {
+                    roots[*j] == root
+                        && p.part != uno
+                        && matches!(
+                            c.parts[p.part].kind,
+                            Kind::Led
+                                | Kind::Buzzer
+                                | Kind::Speaker
+                                | Kind::Relay
+                                | Kind::Motor
+                                | Kind::Servo
+                                | Kind::Button
+                                | Kind::Lamp
+                                | Kind::Pot
+                                | Kind::Ldr
+                                | Kind::Reed
+                                | Kind::Thermistor
+                                | Kind::Peltier
+                        )
+                })
+                .map(|(_, p)| p.part)
+                .collect();
+            sharing.sort_unstable();
+            sharing.dedup();
+            if sharing.len() > 1 {
+                pin_problems.push(format!(
+                    "{}: {}",
+                    name,
+                    tr(lang, "на одном пине две детали", "two parts on one pin")
+                ));
+                pin_focus.push(pin);
+            }
+        }
+        checks.push(if pin_problems.is_empty() {
+            Check::pass(
+                L::new("Пины", "Pins"),
+                tr(lang, "У каждого пина одно назначение.", "Every pin has one role.").to_string(),
+            )
+        } else {
+            Check::fail_at(
+                L::new("Пины", "Pins"),
+                pin_problems.join("; "),
+                focus_on_pins(c, &pin_focus),
             )
         });
 
@@ -1225,5 +1360,52 @@ mod tests {
                 ("SENSE".to_string(), "A0".to_string())
             ]
         );
+    }
+
+    fn one_led() -> Built {
+        let intent = Intent {
+            load: Load::Led,
+            input: None,
+            transistor: false,
+            presses: false,
+            lesson: None,
+            action: None,
+            raw: String::new(),
+            condition: None,
+            recipe: None,
+            text_screens: None,
+        };
+        crate::templates::build(&intent, 0, Lang::Ru).unwrap()
+    }
+
+    /// A bare number is still a pin: the sketch may not switch D13 when the
+    /// drawing has nothing there.
+    #[test]
+    fn a_numeric_output_pin_without_a_part_fails_the_code_check() {
+        let mut built = one_led();
+        built.code = "void setup() {\n  pinMode(13, OUTPUT);\n}\nvoid loop() {}\n".to_string();
+        let report = run(&built, Lang::Ru);
+        let bad = report
+            .checks
+            .iter()
+            .find(|c| c.name.ru == "Код ↔ схема")
+            .expect("the code check is present");
+        assert_eq!(bad.sev, Sev::Fail, "{}", bad.detail);
+        assert!(bad.detail.contains("D13"), "{}", bad.detail);
+    }
+
+    /// The same pin may not be declared an input and an output in one sketch.
+    #[test]
+    fn one_pin_cannot_be_an_input_and_an_output() {
+        let mut built = one_led();
+        built.code = "const uint8_t P = 9;\nvoid setup() {\n  pinMode(P, INPUT_PULLUP);\n  pinMode(P, OUTPUT);\n}\nvoid loop() {}\n".to_string();
+        let report = run(&built, Lang::Ru);
+        let bad = report
+            .checks
+            .iter()
+            .find(|c| c.name.ru == "Пины")
+            .expect("the pin check is present");
+        assert_eq!(bad.sev, Sev::Fail, "{}", bad.detail);
+        assert!(bad.detail.contains("D9"), "{}", bad.detail);
     }
 }

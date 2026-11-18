@@ -16,6 +16,10 @@ pub enum Load {
     Stepper,
     Servo,
     Led,
+    /// An incandescent lamp switched by a transistor or a relay. It is a
+    /// heavy load, not a light-emitting diode, so it never gets a series
+    /// resistor or a "blink" sketch.
+    Lamp,
     Buzzer,
     /// An RC522 RFID reader.
     Rfid,
@@ -280,6 +284,24 @@ const SERVO: Group = Group {
     ],
     label: L::new("сервопривод", "servo"),
 };
+
+/// An incandescent lamp is a heavy load, not an LED. The words are narrow on
+/// purpose: a bare "лампа" still means a small light and stays an LED, while
+/// "накаливания", "галоген" and a mains voltage name the real thing.
+const LAMP: Group = Group {
+    words: &[
+        "накалив",
+        "галоген",
+        "диммер",
+        "incandescent",
+        "лампа накаливания",
+        "лампа на 12",
+        "лампа на 220",
+        "лампочка на 12",
+        "лампочка на 220",
+    ],
+    label: L::new("лампа накаливания", "incandescent lamp"),
+};
 const BUZZER: Group = Group {
     words: &[
         "пьезо", "динамик", "звук", "мелод", "сирен", "пища", "пищалка", "сигнал",
@@ -304,7 +326,7 @@ const LDR: Group = Group {
         "фоторезистор", "фотоэлемент", "светочувств", "ldr", "освещ", "темно",
         "сумерк", "датчик свет", "свет датчик", "light sensor", "light level",
         "photoresistor", "вечер", "ночь", "рассвет", "закат", "twilight",
-        "dusk", "dawn",
+        "dusk", "dawn", "ночник", "night light",
     ],
     label: L::new("освещённость", "light level"),
 };
@@ -439,6 +461,7 @@ fn load_at(i: usize) -> Load {
         8 => Load::Motor,
         9 => Load::Servo,
         10 => Load::Buzzer,
+        11 => Load::Lamp,
         _ => Load::Led,
     }
 }
@@ -449,6 +472,7 @@ fn load_group(load: Load) -> &'static Group {
         Load::Motors => &MOTORS,
         Load::Stepper => &STEPPER,
         Load::Servo => &SERVO,
+        Load::Lamp => &LAMP,
         Load::Led => &LED,
         Load::Buzzer => &BUZZER,
         Load::Rfid => &RFID,
@@ -466,6 +490,7 @@ fn load_label(load: Load) -> L {
         Load::Motors => MOTORS.label,
         Load::Stepper => STEPPER.label,
         Load::Servo => SERVO.label,
+        Load::Lamp => LAMP.label,
         Load::Led => LED.label,
         Load::Buzzer => BUZZER.label,
         Load::Rfid => RFID.label,
@@ -600,6 +625,29 @@ fn count_of(text: &str, words: &[&str]) -> usize {
     1
 }
 
+/// "Шаговый двигатель" is a stepper, not a DC motor: the word "двигатель"
+/// must not add a second, transistor-driven motor to the stepper lesson.
+fn motor_count(text: &str) -> usize {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let mut kept = String::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let stepper = i > 0
+            && crate::words::mentions(token, "двигател")
+            && crate::words::mentions(tokens[i - 1], "шагов");
+        if stepper {
+            continue;
+        }
+        if !kept.is_empty() {
+            kept.push(' ');
+        }
+        kept.push_str(token);
+    }
+    count_of(
+        &kept,
+        &["двигател", "мотор", "motor", "вентилятор", "насос", "кулер"],
+    )
+}
+
 pub fn named_devices(raw: &str) -> NamedDevices {
     let text = crate::words::normalize(raw);
     let rgb = count_of(&text, &["rgb", "трёхцвет", "трехцвет", "цветной светодиод"]);
@@ -609,12 +657,16 @@ pub fn named_devices(raw: &str) -> NamedDevices {
         relay: count_of(&text, &["реле", "relay"]),
         // "RGB" is a light-emitting diode too, but it is one part with three
         // channels: counting it twice would draw a second, needless LED.
-        led: if rgb > 0 { 0 } else { count_of(&text, &["светодиод", "led", "индик"]) },
+        led: if rgb > 0 {
+            0
+        } else {
+            count_of(
+                &text,
+                &["светодиод", "led", "индик", "ночник", "фонар", "гирлянд"],
+            )
+        },
         rgb,
-        motor: count_of(
-            &text,
-            &["двигател", "мотор", "motor", "вентилятор", "насос", "кулер"],
-        ),
+        motor: motor_count(&text),
         // "Поворот" alone is too vague: it also shows up in servo lessons'
         // wording and in phrases about turning a knob.
         servo: count_of(
@@ -641,7 +693,7 @@ pub fn screens_in(raw: &str) -> Option<Screens> {
         ScreenKind::Oled
     } else if text.contains("2004") || text.contains("20 4") {
         ScreenKind::Lcd2004
-    } else if text.contains("lcd") || text.contains("16x2") {
+    } else if text.contains("lcd") || text.contains("16x2") || text.contains("1602") {
         ScreenKind::Lcd
     } else {
         ScreenKind::Any
@@ -672,8 +724,21 @@ pub fn screens_in(raw: &str) -> Option<Screens> {
 /// scene: the displays are the whole circuit, so the parser must not pull a
 /// motion sensor out of a similar-looking word.
 pub fn text_screen_task(raw: &str) -> Option<Screens> {
-    let screens = screens_in(raw)?;
     let text = crate::words::normalize(raw);
+    let screens = match screens_in(raw) {
+        Some(screens) => screens,
+        // "Текст и светодиод" names no display type, but a bare message next
+        // to an output is still a text scene. On its own ("переведи текст")
+        // the word is not a screen.
+        None if text.contains("текст")
+            && ["светодиод", "пьезо", "пищал", "реле", "мотор", "серво", "ламп"]
+                .iter()
+                .any(|w| text.contains(w)) =>
+        {
+            Screens { kind: ScreenKind::Any, count: 1 }
+        }
+        None => return None,
+    };
     let message = [
         "приветств", "привет", "надпис", "сообщен", "greeting", "hello", "caption",
     ]
@@ -698,8 +763,15 @@ pub fn text_screen_task(raw: &str) -> Option<Screens> {
     if s.source.is_some() {
         return None;
     }
-    // A relay, a buzzer or a motor named next to the screen has its own plan.
-    if s.sinks.iter().any(|sink| sink != "display") {
+    // A relay, a buzzer or a motor named next to the screen can be added to
+    // the text scene: "текст на экране и пьезо" prints the message and beeps.
+    // A radio, storage or another board is a different circuit, not an extra.
+    if s.sinks.iter().any(|sink| {
+        !matches!(
+            sink.as_str(),
+            "display" | "led" | "buzzer" | "relay" | "motor" | "servo"
+        )
+    }) {
         return None;
     }
     Some(screens)
@@ -741,12 +813,26 @@ fn from_book_solution(raw: &str, solution: crate::book_tasks::Solution) -> Parse
         }
         Solution::Seed(seed) => {
             let normal = parse_inner(raw, false);
-            if normal.unsupported.is_some() {
-                let mut parsed = parse_inner(seed, false);
+            let seeded = parse_inner(seed, false);
+            // The seed is the book's own answer, so it wins when the ordinary
+            // reading found a different shape of circuit: a spurious recipe
+            // ("по алгоритму движения" is not a motion sensor), a lesson, or
+            // another load. When both readings agree on the shape, the
+            // ordinary one is kept: it also keeps the button, knob or sensor
+            // the task names.
+            let same_shape = normal.intent.load == seeded.intent.load
+                && normal.intent.lesson == seeded.intent.lesson
+                && normal.intent.recipe.is_some() == seeded.intent.recipe.is_some()
+                && normal.intent.text_screens.is_some()
+                    == seeded.intent.text_screens.is_some();
+            let keep_normal = normal.unsupported.is_none()
+                && (seeded.unsupported.is_some() || same_shape);
+            if keep_normal {
+                normal
+            } else {
+                let mut parsed = seeded;
                 parsed.intent.raw = raw.to_string();
                 parsed
-            } else {
-                normal
             }
         }
     }
@@ -793,7 +879,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // L298N task would be read as a single-transistor motor switch.
     let load_groups = [
         &STEPPER, &MOTORS, &RFID, &RADIO_NRF, &RADIO433, &BLUETOOTH, &GSM, &ETHERNET,
-        &MOTOR, &SERVO, &BUZZER, &LED,
+        &MOTOR, &SERVO, &BUZZER, &LAMP, &LED,
     ];
     let load_votes = votes(&text, &load_groups);
     let (mut load, mut load_hits) = match load_votes.first() {
@@ -818,6 +904,45 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             )
         }) {
             load = load_at(*i);
+            load_hits = h.clone();
+        }
+    }
+    // An incandescent lamp is a heavy load, not an LED, although the LED
+    // group also knows the word "лампа". It only overrides a plain light: a
+    // named board still wins, and a light-sensor task that merely mentions a
+    // lamp ("фотореле с лампами накаливания") keeps its sensor.
+    let lamp_words =
+        text.contains("ламп") || text.contains("галоген") || text.contains("диммер");
+    let lamp_heavy = text.contains("накалив")
+        || text.contains("галоген")
+        || text.contains("диммер")
+        || text.contains("12 в")
+        || text.contains("220 в")
+        || text.contains("вольт");
+    let lamp_task = lamp_words
+        && lamp_heavy
+        && !text.contains("фотореле")
+        && !text.contains("датчик свет")
+        && !text.contains("освещ")
+        && !text.contains("инкубатор")
+        && !text.contains("термостат")
+        && !text.contains("светодиодн");
+    if lamp_task && (load == Load::Led || load_hits.is_empty()) {
+        load = Load::Lamp;
+        load_hits = hits(&text, &LAMP);
+        if load_hits.is_empty() {
+            load_hits.push("лампа".to_string());
+        }
+    }
+    // A driver is a named board, not a single transistor switch. "Драйвер
+    // двигателей и мотор" names the driver twice, and the generic "мотор"
+    // wins the vote on its own; the named board is still the subject.
+    if load == Load::Motor {
+        if let Some((_, h)) = load_votes
+            .iter()
+            .find(|(i, _)| matches!(load_at(*i), Load::Motors))
+        {
+            load = Load::Motors;
             load_hits = h.clone();
         }
     }
@@ -865,9 +990,24 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         .find_map(|(a, g)| (!hits(&text, g).is_empty()).then_some(*a));
 
     let semantic = crate::templates::route(load, input);
-    // A sentence that only asks for text on displays needs no sensor or
-    // driver: the displays are the circuit.
-    let mut text_screens = if !named_load && !named_input && !transistor {
+    // A clock is a noun ("часы"), not a duration ("каждый час"). The
+    // distinction matters: "часы и пьезо" is an alarm clock, while "мигать
+    // каждый час" is just a timer.
+    let clock_noun = [
+        "часы", "часов", "часам", "часами", "часах", "часики", "будильник",
+    ]
+    .iter()
+    .any(|w| text.split_whitespace().any(|t| t == *w));
+    let clock_object = clock_noun
+        || text.contains("clock")
+        || text.contains("ds3231")
+        || text.contains("ds1307")
+        || text.contains("rtc")
+        || text.contains("часы реальн");
+    // A sentence that asks for text on displays needs no sensor or driver:
+    // the displays are the circuit. A named LED, relay or buzzer next to the
+    // screen is an output, not a different reading, and is added to it later.
+    let text_screens = if !named_input && !transistor {
         text_screen_task(raw)
     } else {
         None
@@ -877,11 +1017,6 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // Everyday words like "термометр" stand in for a part only when the
     // sentence names nothing else: "шуметь динамиком" must stay a buzzer.
     let mut lesson = crate::lessons::find_with(&text, !named_load && !transistor);
-    // The named board has to survive the lesson choice. "RFID и rgb
-    // светодиод" names a reader, and the RGB lesson does not: keeping the
-    // lesson would silently drop the reader from the task. An LED, a motor
-    // or a buzzer is different: the lesson may itself be about it, or it is
-    // simply the output the lesson's sensor drives.
     let board_load = matches!(
         load,
         Load::Rfid
@@ -893,6 +1028,31 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             | Load::Stepper
             | Load::Motors
     );
+    // "Часы на LCD1602" is the clock lesson with a screen, not the display
+    // lesson: the model number must not hide what the circuit is for. The
+    // same holds for an alarm clock: "часы и пьезо" is an RTC with a buzzer,
+    // not the buzzer lesson.
+    if clock_object && !board_load && (screens_in(raw).is_some() || named_load) {
+        if let Some(rtc) = crate::lessons::ALL
+            .iter()
+            .position(|l| l.keys.contains(&"ds3231"))
+        {
+            lesson = Some(rtc);
+        }
+    }
+    if lesson.is_some_and(crate::lessons::is_text_display) && clock_object {
+        if let Some(rtc) = crate::lessons::ALL
+            .iter()
+            .position(|l| l.keys.contains(&"ds3231"))
+        {
+            lesson = Some(rtc);
+        }
+    }
+    // The named board has to survive the lesson choice. "RFID и rgb
+    // светодиод" names a reader, and the RGB lesson does not: keeping the
+    // lesson would silently drop the reader from the task. An LED, a motor
+    // or a buzzer is different: the lesson may itself be about it, or it is
+    // simply the output the lesson's sensor drives.
     if named_load && board_load {
         if let Some(i) = lesson {
             let l = &crate::lessons::ALL[i];
@@ -927,17 +1087,13 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     }
     // Text on a display is its own scene even when the sentence also names
     // the display type: the LCD lesson prints its own clock, not the text the
-    // task asked for. A lesson about SD, radio or a sensor keeps its circuit,
-    // and the display joins it as an extra part.
+    // task asked for. A lesson about SD, radio or a sensor never reaches this
+    // point: `text_screen_task` rejects those sinks and sources. A named
+    // output is added to the text scene by `augment_devices`, not turned into
+    // a lesson that loses the text.
     if text_screens.is_some() {
-        match lesson {
-            Some(i) if crate::lessons::is_text_display(i) => lesson = None,
-            Some(_) => text_screens = None,
-            None => {}
-        }
-        if text_screens.is_some() {
-            understood.push(L::new("текст на экране", "text on a display"));
-        }
+        lesson = None;
+        understood.push(L::new("текст на экране", "text on a display"));
     }
     if let Some(i) = lesson {
         understood.push(crate::lessons::ALL[i].title);
@@ -955,7 +1111,8 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     let condition = spoken_condition(raw);
     // "пьезопищалка" in a clock task is a buzzer, not a sound sensor. Never
     // turn an RTC build into a microphone readout because of that word.
-    let clock_tick = text.contains("часы реальн")
+    let clock_tick = clock_object
+        || text.contains("часы реальн")
         || text.contains("ds3231")
         || text.contains("ds1307")
         || text.contains("rtc");
@@ -1102,6 +1259,7 @@ pub fn describe(intent: &Intent, lang: Lang) -> String {
         Load::Stepper => L::new("шаговый двигатель", "stepper"),
         Load::Servo => L::new("сервопривод", "servo"),
         Load::Led => L::new("светодиод", "LED"),
+        Load::Lamp => L::new("лампа накаливания", "incandescent lamp"),
         Load::Buzzer => L::new("звук", "buzzer"),
         Load::Rfid => L::new("RFID", "RFID"),
         Load::Radio433 => L::new("радио 433 МГц", "433 MHz radio"),
@@ -1129,6 +1287,55 @@ pub fn describe(intent: &Intent, lang: Lang) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_stems_do_not_invent_sensors() {
+        // "ради" is a stem of "радио", but not of "радиация".
+        let radio = parse("радио 433 и реле");
+        assert_eq!(radio.intent.load, Load::Radio433);
+        assert!(radio.intent.recipe.is_none(), "{:?}", radio.intent.recipe);
+
+        // "тока" in "постоянного тока" names the motor's supply.
+        let motor = parse("двигатель постоянного тока");
+        assert_eq!(motor.intent.load, Load::Motor);
+        assert!(motor.intent.recipe.is_none(), "{:?}", motor.intent.recipe);
+
+        // "по алгоритму движения" is a motion program, not a motion sensor.
+        let program = parse("двух двигателей постоянного тока по алгоритму движения");
+        assert!(program.intent.recipe.is_none(), "{:?}", program.intent.recipe);
+    }
+
+    /// A named driver board is the subject even when the sentence also uses
+    /// the generic word "мотор": the board is what the circuit is built on.
+    #[test]
+    fn a_named_driver_beats_the_generic_motor() {
+        for task in ["драйвер двигателей и мотор", "драйвер и мотор"] {
+            let parsed = parse(task);
+            assert_eq!(parsed.intent.load, Load::Motors, "{task}");
+        }
+    }
+
+    #[test]
+    fn a_stepper_is_not_counted_as_a_dc_motor() {
+        assert_eq!(named_devices("шаговый двигатель и кнопка").motor, 0);
+        assert_eq!(named_devices("шаговый двигатель и светодиод").motor, 0);
+        assert_eq!(named_devices("два мотора").motor, 2);
+        assert_eq!(named_devices("шаговый двигатель и мотор").motor, 1);
+    }
+
+    #[test]
+    fn a_clock_on_a_named_display_keeps_its_clock() {
+        let p = parse("часы на LCD1602");
+        let lesson = p.intent.lesson.expect("the clock lesson wins");
+        assert!(
+            crate::lessons::ALL[lesson]
+                .keys
+                .contains(&"ds3231"),
+            "picked {:?}",
+            crate::lessons::ALL[lesson].title
+        );
+    }
+
 
     #[test]
     fn recognises_the_motor_button_example() {
@@ -1235,6 +1442,7 @@ mod tests {
             "stepper" => Load::Stepper,
             "servo" => Load::Servo,
             "led" => Load::Led,
+            "lamp" => Load::Lamp,
             "buzzer" => Load::Buzzer,
             "rfid" => Load::Rfid,
             "radio433" => Load::Radio433,
@@ -1384,6 +1592,23 @@ mod tests {
             parse("текст на трёх экранах").intent.text_screens.map(|s| s.count),
             Some(3)
         );
+    }
+
+    /// The task from the bug report: an incandescent lamp is a heavy load,
+    /// not a blinking LED, even though the LED group also knows "лампа".
+    #[test]
+    fn an_incandescent_lamp_is_not_an_led() {
+        let task =
+            "Составить программу для МК управления яркостью лампы накаливания на 12 Вольт.";
+        let p = parse(task);
+        assert_eq!(p.intent.load, Load::Lamp, "{:?}", p.understood);
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported);
+        let plan = crate::templates::plan(&p.intent, Lang::Ru).expect("a lamp has a plan");
+        assert_eq!(plan.tid, crate::templates::Tid::Lamp);
+
+        // A bare lamp with no filament and no mains voltage is still the
+        // small light of the LED lessons.
+        assert_eq!(parse("лампа мигает").intent.load, Load::Led);
     }
 
     /// Every named part has its own counter, so the circuit augmenter knows

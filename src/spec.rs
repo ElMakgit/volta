@@ -146,6 +146,9 @@ pub struct Composition {
     pub behavior: Behavior,
     /// An explicit threshold from the sentence, if it gave one.
     pub condition: Option<Condition>,
+    /// How many screens the sentence asked for. One unless it says "два
+    /// экрана"; other sinks ignore it.
+    pub screens: usize,
 }
 
 /// One way to read a sensor: the analogue output, the module comparator, or a
@@ -337,7 +340,7 @@ pub const SOURCES: &[SourceSpec] = &[
         title: L::new("Фоторезистор GL5528", "The GL5528 photoresistor"),
         short: L::new("свет", "light"),
         lesson: 9,
-        keys: &["фоторезистор", "ldr", "люкс", "освещ", "датчик света", "темн", "light", "photoresistor", "brightness", "dark"],
+        keys: &["фоторезистор", "ldr", "люкс", "освещ", "датчик света", "темн", "light", "photoresistor", "brightness", "dark", "ночник", "night light"],
         period_ms: 100,
         place: Place::Ldr,
         summary: L::new(

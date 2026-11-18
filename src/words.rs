@@ -144,8 +144,12 @@ pub fn alike(a: &str, b: &str) -> bool {
     }
     // A short word must not swallow every word that starts with it:
     // "свет" is not "светочувствительность".
+    // A four-letter stem is too short to stand in for a much longer word:
+    // "ради" (from "радио") must not match "радиац" (from "радиация").
+    let length_diff = a.chars().count().abs_diff(b.chars().count());
     if (a.starts_with(b) || b.starts_with(a))
-        && a.chars().count().abs_diff(b.chars().count()) <= 3
+        && length_diff <= 3
+        && (short >= 5 || length_diff <= 1)
     {
         return true;
     }
@@ -191,7 +195,11 @@ pub fn mentions(text: &str, key: &str) -> bool {
             .iter()
             .any(|t| t.trim_matches(|c: char| !c.is_alphanumeric()) == key);
     }
-    if text.contains(&key) {
+    // A long key may sit inside a word ("температур" in "температуру"). A
+    // short plain word must not: "ток" is not inside "поток". A part number
+    // such as "mq-2" keeps the substring test even when it is short.
+    let short_word = key.chars().count() < 5 && key.chars().all(|c| c.is_alphabetic());
+    if !short_word && text.contains(&key) {
         return true;
     }
     // A key with a digit or a hyphen is a whole phrase or a part number
@@ -221,6 +229,20 @@ fn word_matches(token: &str, key: &str) -> bool {
     let key_stem = stem(key);
     if alike(&token_stem, &key_stem) || alike(&token_stem, key) {
         return true;
+    }
+    // A short key still takes its own case endings ("ток" → "тока", "час" →
+    // "часы"), but the ending list is closed: the rest of a longer word is
+    // not an inflection of the key.
+    if key_stem.chars().count() <= 4 && token_stem.starts_with(&key_stem) {
+        const ENDINGS: &[&str] = &[
+            "", "а", "я", "ы", "и", "е", "у", "ю", "о", "ь", "й", "ом", "ем", "ам",
+            "ям", "ах", "ях", "ов", "ев", "ами", "ями", "ет", "ут", "ют", "ат", "ят",
+            "ит", "ешь", "ишь", "ал", "ил", "ла", "ло", "ли", "ть", "ться",
+            "ется", "ится",
+        ];
+        if ENDINGS.contains(&&token_stem[key_stem.len()..]) {
+            return true;
+        }
     }
     // One typo is allowed on a real word of at least six letters. A long
     // word may have two, but only when the lengths differ: a skipped or

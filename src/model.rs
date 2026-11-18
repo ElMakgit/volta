@@ -342,6 +342,10 @@ pub enum Kind {
     Button,
     Motor,
     Servo,
+    /// An incandescent lamp: a glass bulb with a filament, switched by a
+    /// transistor or a relay. It is not an LED, so it has no series resistor
+    /// and no polarity to get wrong.
+    Lamp,
     Buzzer,
     Speaker,
     Pot,
@@ -1516,6 +1520,7 @@ impl Circuit {
             // of cutting through the gear.
             Kind::Motor => Rect::new(p.at.x - 5.0, p.at.y - 4.0, 30.0, 18.0),
             Kind::Servo => Rect::new(p.at.x, p.at.y - 2.0, 18.0, 26.0),
+            Kind::Lamp => Rect::new(p.at.x - 1.0, p.at.y - 3.0, 19.0, 20.0),
             Kind::Buzzer => Rect::new(p.at.x - 1.0, p.at.y - 3.0, 19.0, 17.0),
             Kind::Speaker => Rect::new(p.at.x - 1.0, p.at.y - 4.0, 19.0, 20.0),
             Kind::Relay => Rect::new(p.at.x, p.at.y, 34.0, 22.0),

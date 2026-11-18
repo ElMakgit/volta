@@ -271,6 +271,7 @@ fn recipe_json(c: Composition) -> Value {
         "sink": c.sink as usize,
         "behavior": behavior_name(c.behavior),
         "condition": c.condition.map(condition_json),
+        "screens": c.screens,
     })
 }
 
@@ -379,7 +380,11 @@ fn recipe_from(v: &Value) -> Result<Composition, String> {
         .filter(|x| !x.is_null())
         .map(condition_from)
         .transpose()?;
-    Ok(Composition { source, sink, behavior, condition })
+    let screens = obj
+        .get("screens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(1) as usize;
+    Ok(Composition { source, sink, behavior, condition, screens })
 }
 
 fn condition_from(v: &Value) -> Result<Condition, String> {
@@ -722,6 +727,7 @@ fn kind_name(k: Kind) -> &'static str {
         Kind::Button => "Button",
         Kind::Motor => "Motor",
         Kind::Servo => "Servo",
+        Kind::Lamp => "Lamp",
         Kind::Buzzer => "Buzzer",
         Kind::Speaker => "Speaker",
         Kind::Pot => "Pot",
@@ -748,6 +754,7 @@ fn kind_from(s: &str) -> Option<Kind> {
         "Button" => Kind::Button,
         "Motor" => Kind::Motor,
         "Servo" => Kind::Servo,
+        "Lamp" => Kind::Lamp,
         "Buzzer" => Kind::Buzzer,
         "Speaker" => Kind::Speaker,
         "Pot" => Kind::Pot,

@@ -1100,6 +1100,55 @@ impl D {
         }
     }
 
+    fn lamp(&mut self, part: &Part) {
+        let at = part.at;
+        let c = Pt::new(at.x + 8.0, at.y + 9.0);
+        // The glass bulb, then the filament drawn as the usual cross.
+        self.circle_stroke(
+            c,
+            7.0,
+            Rgba::rgb(0xF6, 0xE7, 0xB8).alpha(0.65),
+            Rgba::rgb(0xB8, 0x8A, 0x2E),
+            0.35,
+        );
+        for r in [4.6, 2.2] {
+            let k = r * std::f32::consts::FRAC_1_SQRT_2;
+            self.line(
+                Pt::new(c.x - k, c.y - k),
+                Pt::new(c.x + k, c.y + k),
+                0.35,
+                Rgba::rgb(0x8A, 0x66, 0x1E),
+            );
+            self.line(
+                Pt::new(c.x - k, c.y + k),
+                Pt::new(c.x + k, c.y - k),
+                0.35,
+                Rgba::rgb(0x8A, 0x66, 0x1E),
+            );
+        }
+        // A screw base above the bulb: two ridges and stems to the terminals.
+        for i in 0..2 {
+            let y = at.y + 0.2 + i as f32 * 1.6;
+            self.line(Pt::new(at.x + 4.0, y), Pt::new(at.x + 12.0, y), 0.3, SILVER);
+        }
+        for dx in [5.0, 11.0] {
+            self.line(
+                Pt::new(at.x + dx, at.y - 3.0),
+                Pt::new(at.x + dx, at.y + 1.0),
+                0.35,
+                SILVER.darken(0.15),
+            );
+        }
+        for (i, (_, dx, dy)) in bench_pins(part.kind, &part.value).iter().enumerate() {
+            let p = Pt::new(at.x + dx, at.y + dy);
+            self.rrect(
+                Rect::new(p.x - 1.0, p.y - 1.5, 2.0, 3.2),
+                0.35,
+                if i == 0 { PLASTIC } else { WIRE_VCC },
+            );
+        }
+    }
+
     fn speaker(&mut self, part: &Part) {
         let at = part.at;
         let c = Pt::new(at.x + 8.0, at.y + 6.0);
@@ -1689,6 +1738,7 @@ fn body_height(part: &Part) -> f32 {
         Kind::Module => crate::modules::find(&part.value).map(|m| m.h).unwrap_or(20.0),
         Kind::Motor => 14.0,
         Kind::Servo => 24.0,
+        Kind::Lamp => 20.0,
         Kind::Buzzer => 12.0,
         Kind::Speaker => 16.0,
         Kind::Relay => 22.0,
@@ -1855,6 +1905,7 @@ pub fn draw(c: &Circuit, theme: &Theme, opt: &Opts) -> Scene {
             Kind::Tmp36 => d.to92(part),
             Kind::Motor => d.motor(part),
             Kind::Servo => d.servo(part),
+            Kind::Lamp => d.lamp(part),
             Kind::Buzzer => d.buzzer(part),
             Kind::Speaker => d.speaker(part),
             Kind::Relay => d.relay(part),

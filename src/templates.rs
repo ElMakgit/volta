@@ -22,6 +22,8 @@ pub enum Tid {
     LedToggle,
     LedBlink,
     NightLight,
+    /// An incandescent lamp: PWM through a MOSFET, or a relay for mains.
+    Lamp,
     ServoSweep,
     ServoPot,
     BuzzerTone,
@@ -51,6 +53,7 @@ pub fn route(load: Load, input: Option<Input>) -> Option<Tid> {
         (Load::Led, Some(Input::Button)) => Some(Tid::LedToggle),
         (Load::Led, Some(Input::Ldr)) => Some(Tid::NightLight),
         (Load::Led, _) => Some(Tid::LedBlink),
+        (Load::Lamp, _) => Some(Tid::Lamp),
         (Load::Buzzer, _) => Some(Tid::BuzzerTone),
         (Load::Rfid, _) => Some(Tid::Rfid),
         (Load::Radio433, _) => Some(Tid::Radio433),
@@ -566,6 +569,72 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             ],
             0,
         ),
+        Tid::Lamp => {
+            let mains = {
+                let text = crate::words::normalize(&intent.raw);
+                text.contains("220") || text.contains("сеть") || text.contains("симистор")
+            };
+            let mosfet = Choice {
+                name: L::new("IRLZ44N, 12 В", "IRLZ44N, 12 V"),
+                blurb: L::new(
+                    "MOSFET в ключе низкой стороны: ШИМ на D9 плавно меняет яркость лампы 12 В.",
+                    "A low-side MOSFET: PWM on D9 sets the brightness of a 12 V lamp.",
+                ),
+                pros: vec![
+                    L::new("Плавная регулировка, ключ не греется", "Smooth dimming, the switch stays cool"),
+                    L::new("Ток до 10 А — запас на лампу мощнее", "Up to 10 A, room for a bigger lamp"),
+                ],
+                cons: vec![
+                    L::new("Нужен отдельный блок 12 В", "Needs a separate 12 V supply"),
+                    L::new("Не годится для 220 В: ключ на 55 В", "Not for 220 V: the switch is rated 55 V"),
+                ],
+                specs: vec![
+                    spec_line("12 В", VOLTAGE),
+                    spec_line("0.5 А", CURRENT),
+                    spec_line("средняя", PRICE),
+                    spec_line(&level_word(2, lang), LEVEL),
+                ],
+                level: 2,
+            };
+            let relay = Choice {
+                name: L::new("Реле SRD-05VDC, 220 В", "Relay SRD-05VDC, 220 V"),
+                blurb: L::new(
+                    "Реле развязывает лампу 220 В, но даёт только вкл/выкл: яркость им не регулируют.",
+                    "A relay isolates a 220 V lamp but only switches it: it cannot dim.",
+                ),
+                pros: vec![L::new("Гальваническая развязка от сети", "Galvanic isolation from the mains")],
+                cons: vec![
+                    L::new("Яркость не регулируется", "Brightness is not adjustable"),
+                    L::new("Для яркости нужен симисторный диммер", "Dimming needs a triac dimmer"),
+                ],
+                specs: vec![
+                    spec_line("220 В AC", VOLTAGE),
+                    spec_line("10 А", CURRENT),
+                    spec_line("низкая", PRICE),
+                    spec_line(&level_word(2, lang), LEVEL),
+                ],
+                level: 2,
+            };
+            // A mains lamp gets the relay only. Offering the 55 V MOSFET for
+            // it would be unsafe, however the user picks.
+            let choices = if mains {
+                vec![relay]
+            } else {
+                vec![mosfet, relay]
+            };
+            let title = if mains {
+                L::new(
+                    "Лампа 220 В: включение и выключение",
+                    "220 V lamp: on and off",
+                )
+            } else {
+                L::new(
+                    "Лампа накаливания: яркость",
+                    "Incandescent lamp: brightness",
+                )
+            };
+            (title, choices, 0)
+        }
         Tid::ServoSweep => (
             L::new("Сервопривод: проход по углам", "Servo: sweep between angles"),
             vec![
@@ -1193,10 +1262,24 @@ fn display_lesson_plan(i: usize, screens: Option<crate::parse::Screens>, lang: L
             n => format!("{n} I2C displays"),
         }
     };
+    // A display lesson is about the screen; any other lesson (the clock, an
+    // access counter) merely uses it as a readout, so its own title stays in
+    // the header.
+    let (title, headline) = if crate::lessons::is_text_display(i) {
+        (
+            L::new("Экран для урока", "A display for the lesson"),
+            Some(headline),
+        )
+    } else {
+        (
+            base.title,
+            Some(crate::lessons::ALL[i].title.get(lang).to_string()),
+        )
+    };
     Plan {
         tid: base.tid,
-        title: L::new("Экран для урока", "A display for the lesson"),
-        headline: Some(headline),
+        title,
+        headline,
         choices,
         recommended: 0,
         why: None,
@@ -1213,7 +1296,7 @@ const SCREEN_ROW_GAP: f32 = 8.0;
 /// never on top of each other or of the controller. A wide board such as the
 /// 98 mm LCD2004 gets the room it needs, so a row may grow past the Uno
 /// instead of hiding half of the next board.
-fn screen_spots(count: usize, module: &str, top: f32) -> Vec<Pt> {
+pub(crate) fn screen_spots(count: usize, module: &str, top: f32) -> Vec<Pt> {
     let (w, h) = crate::modules::find(module)
         .map(|m| (m.w, m.h))
         .unwrap_or((60.0, 26.0));
@@ -1601,11 +1684,20 @@ fn lesson_build(
     // routes to a lesson: "часы ... на любой тип дисплея" is a clock *with* a
     // display, and "два экрана" means two of them.
     if let Some(wish) = screens {
+        // A display lesson already placed the screen it teaches: "LCD1602"
+        // must not draw a second one. Only the shortfall is added, so the
+        // schematic matches the plan's "Экранов: 1".
+        let present = l
+            .boards
+            .iter()
+            .filter(|b| b.name.starts_with("LCD") || b.name.starts_with("OLED"))
+            .count();
+        let want = wish.count.saturating_sub(present);
         let modules = display_modules(wish);
         let module = modules[choice.min(modules.len() - 1)].1;
         let top = b.c.bbox().bottom() + 8.0;
         let h = crate::modules::find(module).map(|m| m.h).unwrap_or(30.0);
-        for at in screen_spots(wish.count, module, top) {
+        for at in screen_spots(want, module, top) {
             let name = format!("U{}", label);
             label += 1;
             let disp = b.breakout(&name, module, at);
@@ -1719,6 +1811,10 @@ pub fn bench_pins(kind: Kind, value: &str) -> &'static [(&'static str, f32, f32)
         Kind::Tmp36 => &[("+", 1.0, -3.0), ("O", 1.9, -3.0), ("-", 2.8, -3.0)],
         Kind::Servo => &[("-", 3.0, -3.0), ("+", 9.0, -3.0), ("S", 15.0, -3.0)],
         Kind::Buzzer | Kind::Speaker => &[("-", 5.0, -3.0), ("+", 11.0, -3.0)],
+        // An incandescent lamp has no polarity: one terminal is the supply,
+        // the other is the switched side. Both leave the screw base, drawn
+        // above the bulb so the wires do not cross the glass.
+        Kind::Lamp => &[("-", 5.0, -3.0), ("+", 11.0, -3.0)],
         Kind::Relay => &[
             ("IN", 5.0, -3.0),
             ("VCC", 11.0, -3.0),
@@ -1769,6 +1865,8 @@ pub fn bench_pin_kind(kind: Kind, _value: &str, name: &str) -> PinKind {
         (Kind::Servo, "-") => PinKind::Ground,
         (Kind::Buzzer, "-") => PinKind::Ground,
         (Kind::Buzzer, _) => PinKind::Signal,
+        (Kind::Lamp, "+") => PinKind::Power,
+        (Kind::Lamp, _) => PinKind::Passive,
         (Kind::Speaker, "+") => PinKind::Power,
         (Kind::Speaker, _) => PinKind::Passive,
         (Kind::Relay, "VCC") => PinKind::Power,
@@ -2406,6 +2504,142 @@ void loop() {
     )
 }
 
+fn lamp_pot_sketch(lang: Lang) -> String {
+    fill(
+        r#"// <<C0>>
+// A0 — ручка, D9 — ШИМ на затворе MOSFET, лампа 12 В в стоке
+const uint8_t KNOB = A0;
+const uint8_t LAMP = 9;
+const uint16_t SAMPLE_MS = 20;
+
+uint32_t lastSample = 0;
+
+void setup() {
+  pinMode(LAMP, OUTPUT);
+  Serial.begin(9600);
+}
+
+void loop() {
+  if (millis() - lastSample < SAMPLE_MS) return;
+  lastSample = millis();
+  int raw = analogRead(KNOB);
+  // Линейная шкала: 0…1023 с ручки в 0…255 скважности. Для лампы этого
+  // достаточно, а понять и подправить map() проще, чем таблицу кривой.
+  int duty = map(raw, 0, 1023, 0, 255);
+  analogWrite(LAMP, duty);
+  Serial.println(duty);
+}
+"#,
+        &[("C0", tr(lang, "Яркость лампы 12 В от ручки", "12 V lamp brightness from a knob"))],
+    )
+}
+
+fn lamp_buttons_sketch(lang: Lang) -> String {
+    fill(
+        r#"// <<C0>>
+// D2 — ярче, D3 — тусклее; D9 — ШИМ на затворе MOSFET
+const uint8_t UP = 2;
+const uint8_t DOWN = 3;
+const uint8_t LAMP = 9;
+const uint8_t STEP = 25;
+const uint16_t DEBOUNCE_MS = 30;
+
+uint8_t duty = 0;
+bool upWas = false;
+bool downWas = false;
+uint32_t lastEdge = 0;
+
+void setup() {
+  pinMode(UP, INPUT_PULLUP);
+  pinMode(DOWN, INPUT_PULLUP);
+  pinMode(LAMP, OUTPUT);
+  analogWrite(LAMP, duty);
+}
+
+void loop() {
+  bool up = digitalRead(UP) == LOW;
+  bool down = digitalRead(DOWN) == LOW;
+  if (millis() - lastEdge >= DEBOUNCE_MS) {
+    if (up && !upWas) {
+      lastEdge = millis();
+      duty = (duty <= 255 - STEP) ? duty + STEP : 255;
+    } else if (down && !downWas) {
+      lastEdge = millis();
+      duty = (duty >= STEP) ? duty - STEP : 0;
+    }
+    upWas = up;
+    downWas = down;
+    analogWrite(LAMP, duty);
+  }
+}
+"#,
+        &[("C0", tr(lang, "Две кнопки задают яркость лампы", "Two buttons set the lamp brightness"))],
+    )
+}
+
+fn lamp_ramp_sketch(lang: Lang) -> String {
+    fill(
+        r#"// <<C0>>
+// D9 — ШИМ на затворе MOSFET, лампа 12 В плавно разгорается и гаснет
+const uint8_t LAMP = 9;
+const uint8_t STEP = 1;
+const uint16_t STEP_MS = 12;
+
+uint8_t duty = 0;
+int8_t dir = 1;
+uint32_t last = 0;
+
+void setup() {
+  pinMode(LAMP, OUTPUT);
+}
+
+void loop() {
+  if (millis() - last < STEP_MS) return;
+  last = millis();
+  if (dir > 0 && duty == 255) dir = -1;
+  if (dir < 0 && duty == 0) dir = 1;
+  duty += dir * STEP;
+  analogWrite(LAMP, duty);
+}
+"#,
+        &[("C0", tr(lang, "Плавное разжигание лампы 12 В", "A 12 V lamp fading up and down"))],
+    )
+}
+
+fn lamp_relay_sketch(lang: Lang) -> String {
+    fill(
+        r#"// <<C0>>
+// D2 — кнопка, D7 — модуль реле; лампа включается и выключается
+const uint8_t BTN = 2;
+const uint8_t RELAY = 7;
+const uint16_t DEBOUNCE_MS = 30;
+
+bool lampOn = false;
+bool pressed = false;
+uint32_t lastEdge = 0;
+
+void setup() {
+  pinMode(BTN, INPUT_PULLUP);
+  pinMode(RELAY, OUTPUT);
+  digitalWrite(RELAY, LOW);
+}
+
+void loop() {
+  bool now = digitalRead(BTN) == LOW;
+  if (now != pressed && millis() - lastEdge >= DEBOUNCE_MS) {
+    lastEdge = millis();
+    pressed = now;
+    if (now) {
+      lampOn = !lampOn;
+      digitalWrite(RELAY, lampOn ? HIGH : LOW);
+    }
+  }
+}
+"#,
+        &[("C0", tr(lang, "Кнопка включает и выключает лампу через реле", "A button switches the lamp through a relay"))],
+    )
+}
+
 fn servo_sweep_sketch(lang: Lang, pin: u8) -> String {
     fill(
         r#"// <<C0>>
@@ -2680,6 +2914,9 @@ fn augment_devices(
         added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
     }
 
+    // A relay is only useful when it switches something. Every added relay
+    // gets its own small siren on COM/NO, so "два реле" has two working
+    // contacts instead of a second relay whose terminals hang in the air.
     for _ in 0..named.relay.saturating_sub(count_kinds(c, &[Kind::Relay])) {
         let Some(pin) = ledger.claim_pin(&signals) else { break };
         if !ledger.claim_current(30) {
@@ -2694,6 +2931,23 @@ fn augment_devices(
         c.wire(End::Pin(inn), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
         c.wire(End::Pin(vcc_pin), End::Pin(vcc), NetClass::Vcc);
         c.wire(End::Pin(gnd_pin), End::Pin(gnd), NetClass::Gnd);
+        // The load on the contact side keeps COM and NO connected: a relay
+        // with an open contact is a part that does nothing.
+        let s_label = free_label(c, "HA");
+        let siren = bench_part(
+            c,
+            Kind::Buzzer,
+            &s_label,
+            "сирена 5 В",
+            row.take(22.0, 18.0),
+        );
+        let contact = c.pin(part, "COM");
+        let normally_open = c.pin(part, "NO");
+        let plus = c.pin(siren, "+");
+        let minus = c.pin(siren, "-");
+        c.wire(End::Pin(contact), End::Pin(vcc), NetClass::Vcc);
+        c.wire(End::Pin(normally_open), End::Pin(plus), NetClass::Signal);
+        c.wire(End::Pin(minus), End::Pin(gnd), NetClass::Gnd);
         added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
     }
 
@@ -2916,6 +3170,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::LedToggle => led_toggle(lang, choice),
         Tid::LedBlink => led_blink(lang, choice),
         Tid::NightLight => night_light(lang, choice),
+        Tid::Lamp => lamp(lang, choice, &intent.raw),
         Tid::ServoSweep => servo_sweep(lang, choice),
         Tid::ServoPot => servo_sweep(lang, if choice == 1 { 1 } else { 2 }),
         Tid::BuzzerTone => buzzer_tone(lang, choice),
@@ -3313,6 +3568,144 @@ fn night_light(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
     }
 }
 
+/// An incandescent lamp. It is a heavy load, so a pin never drives it
+/// directly: choice 0 puts a logic-level MOSFET in the low side and dims with
+/// PWM, choice 1 switches a relay for a lamp that only needs on and off.
+fn lamp(lang: Lang, choice: usize, raw: &str) -> (Circuit, String, L, Vec<L>) {
+    let mut b = B::new(lang);
+    let text = crate::words::normalize(raw);
+    let knob = text.contains("потенциометр")
+        || text.contains("регулятор")
+        || text.contains("крутилк")
+        || text.contains("ручк");
+    let buttons = text.contains("кнопк") || text.contains("нажат");
+    let mains = text.contains("220") || text.contains("сеть") || text.contains("симистор");
+    // A mains lamp is switched by the relay only: the 55 V MOSFET is not
+    // safe on 220 V, so any chosen index maps to the relay branch.
+    let choice = if mains { 1 } else { choice };
+    match choice {
+        1 => {
+            let rl = b.bench(Kind::Relay, "K1", "SRD-05VDC", Pt::new(6.0, 76.0));
+            let lamp = b.bench(Kind::Lamp, "H1", "220 В, 60 Вт", Pt::new(46.0, 78.0));
+            let btn = b.button("B1", 4, Row::E);
+            let gnd = b.gnd(24.0);
+            b.w(b.uno_pin("D2"), btn[3], NetClass::Signal);
+            b.w(btn[0], gnd, NetClass::Gnd);
+            b.w(b.uno_pin("D7"), rl[0], NetClass::Signal);
+            b.w(rl[1], b.vcc(16.0), NetClass::Vcc);
+            b.w(rl[2], b.gnd(22.0), NetClass::Gnd);
+            b.w(lamp[1], b.uno_pin("VIN"), NetClass::Vcc);
+            b.w(lamp[0], rl[4], NetClass::Signal);
+            b.w(rl[3], b.gnd(30.0), NetClass::Gnd);
+            feeds(&mut b);
+            (
+                b.finish(),
+                lamp_relay_sketch(lang),
+                L::new(
+                    "Кнопка на D2 включает реле K1 на D7; контакт замыкает цепь лампы.",
+                    "A button on D2 toggles the K1 relay on D7; its contact closes the lamp circuit.",
+                ),
+                vec![
+                    L::new(
+                        "Реле даёт только вкл/выкл: яркость им не меняют.",
+                        "A relay only switches on and off: it cannot dim.",
+                    ),
+                    L::new(
+                        "Для 220 В контакт реле ставят в разрыв фазного провода, а лампу питает сеть. Макетка и плата остаются под 5 В.",
+                        "For 220 V the relay contact goes in series with the live wire and the lamp runs from the mains. The breadboard and the board stay at 5 V.",
+                    ),
+                ],
+            )
+        }
+        _ => {
+            let lamp = b.bench(Kind::Lamp, "H1", "12 В, 21 Вт", Pt::new(8.0, 58.0));
+            let (r1a, r1b) = b.res("R1", "1 кОм", 21, Row::A, 3);
+            let (r2a, r2b) = b.res("R2", "10 кОм", 24, Row::A, 3);
+            let q = b.to92(Kind::Nmos, "Q1", "IRLZ44N", 21, Row::E, ["G", "S", "D"]);
+            let gnd = b.gnd(32.0);
+            b.w(b.uno_pin("D9"), r1a, NetClass::Signal);
+            b.w(r1b, q[0], NetClass::Signal);
+            b.w(q[0], r2a, NetClass::Signal);
+            b.w(r2b, gnd, NetClass::Gnd);
+            b.w(q[1], gnd, NetClass::Gnd);
+            b.w(lamp[1], b.uno_pin("VIN"), NetClass::Vcc);
+            b.w(lamp[0], q[2], NetClass::Signal);
+            let (code, summary, notes, input) = if knob {
+                let pot = b.bench(Kind::Pot, "RV1", "10 кОм", Pt::new(8.0, 84.0));
+                let vcc = b.vcc(82.0);
+                b.w(pot[0], vcc, NetClass::Vcc);
+                b.w(pot[2], b.gnd(78.0), NetClass::Gnd);
+                b.w(pot[1], b.uno_pin("A0"), NetClass::Analog);
+                (
+                    lamp_pot_sketch(lang),
+                    L::new(
+                        "Ручка задаёт ШИМ на затворе IRLZ44N, лампа 12 В светит ярче или тусклее.",
+                        "The knob sets PWM at the IRLZ44N gate, so the 12 V lamp dims and brightens.",
+                    ),
+                    vec![L::new(
+                        "Лампа — резистивная нагрузка, обратный диод ей не нужен.",
+                        "A lamp is a resistive load, so it needs no flyback diode.",
+                    )],
+                    Some("A0"),
+                )
+            } else if buttons {
+                let b1 = b.button("B1", 4, Row::E);
+                let b2 = b.button("B2", 10, Row::E);
+                let g = b.gnd(16.0);
+                b.w(b.uno_pin("D2"), b1[3], NetClass::Signal);
+                b.w(b1[0], g, NetClass::Gnd);
+                b.w(b.uno_pin("D3"), b2[3], NetClass::Signal);
+                b.w(b2[0], g, NetClass::Gnd);
+                (
+                    lamp_buttons_sketch(lang),
+                    L::new(
+                        "Кнопки D2 и D3 прибавляют и убавляют скважность ШИМ на затворе.",
+                        "Buttons on D2 and D3 raise and lower the PWM duty at the gate.",
+                    ),
+                    vec![L::new(
+                        "Шаг 25 из 255: двадцать нажатий от нуля до полной яркости.",
+                        "A step of 25 out of 255: twenty presses from off to full brightness.",
+                    )],
+                    Some("D2, D3"),
+                )
+            } else {
+                (
+                    lamp_ramp_sketch(lang),
+                    L::new(
+                        "ШИМ на D9 через IRLZ44N плавно разжигает и гасит лампу 12 В.",
+                        "PWM on D9 through the IRLZ44N fades the 12 V lamp up and down.",
+                    ),
+                    vec![L::new(
+                        "12 В подаётся на VIN отдельным блоком: плата даёт только сигнал затвора.",
+                        "The 12 V comes to VIN from a separate supply: the board only provides the gate signal.",
+                    )],
+                    None,
+                )
+            };
+            feeds(&mut b);
+            let mut summary = summary;
+            if mains {
+                summary = L::new(
+                    "Лампа 220 В питается от сети: макетка коммутирует только затвор MOSFET.",
+                    "A 220 V lamp runs from the mains: the breadboard only drives the MOSFET gate.",
+                );
+            }
+            let mut notes = notes;
+            notes.push(L::new(
+                "IRLZ44N открывается логическим уровнем 5 В и держит ток до 10 А.",
+                "The IRLZ44N turns on at a 5 V logic level and carries up to 10 A.",
+            ));
+            if input.is_some() {
+                notes.push(L::new(
+                    "Питание лампы — отдельный блок 12 В; земля блока соединена с землёй платы.",
+                    "The lamp has its own 12 V supply; its ground is tied to the board ground.",
+                ));
+            }
+            (b.finish(), code, summary, notes)
+        }
+    }
+}
+
 fn servo_sweep(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
     let mut b = B::new(lang);
     let gnd = b.gnd(56.0);
@@ -3538,6 +3931,7 @@ pub fn kind_name(kind: Kind, lang: Lang) -> &'static str {
         Kind::Button => tr(lang, "кнопка", "button"),
         Kind::Motor => tr(lang, "двигатель", "motor"),
         Kind::Servo => tr(lang, "сервопривод", "servo"),
+        Kind::Lamp => tr(lang, "лампа накаливания", "incandescent lamp"),
         Kind::Buzzer => tr(lang, "излучатель", "buzzer"),
         Kind::Speaker => tr(lang, "динамик", "speaker"),
         Kind::Pot => tr(lang, "потенциометр", "potentiometer"),
@@ -4118,6 +4512,12 @@ fn bluetooth(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
     b.w(b.uno_pin("D3"), r1a, NetClass::Signal);
     b.w(r1b, b.mp(bt, "RXD"), NetClass::Signal);
     b.w(r2b, b.gnd(78.0), NetClass::Gnd);
+    // The phone's '1' and '0' switch a visible LED, so the sketch's output
+    // pin exists on the drawing instead of being a bare number.
+    let (r3a, _r3b) = b.res("R3", "220 Ом", 24, Row::A, 3);
+    let (_led_a, led_k) = b.led("D1", "красный 5 мм", 27, Row::A);
+    b.w(b.uno_pin("D13"), r3a, NetClass::Signal);
+    b.w(led_k, b.gnd(82.0), NetClass::Gnd);
     feeds(&mut b);
     if choice == 2 {
         let rl = b.bench(Kind::Relay, "K1", "SRD-05VDC", Pt::new(48.0, 58.0));
@@ -4471,6 +4871,17 @@ fn rfid_sketch(lang: Lang, choice: usize) -> String {
         _ => "",
     };
     vars.push(("EXTRA", extra));
+    // Only the relay lock owns pin 8. The template used to drive it as an
+    // output unconditionally, which turned an augmented button on D8 into an
+    // output and made it unreadable.
+    vars.push((
+        "SETUP",
+        if choice == 2 {
+            "  pinMode(LOCK, OUTPUT);\n"
+        } else {
+            ""
+        },
+    ));
     let body = match choice {
         1 => "  lcd.setCursor(0, 0);\n  lcd.print(\"UID:\");\n  lcd.setCursor(0, 1);\n  for (byte i = 0; i < mfrc522.uid.size; i++) lcd.print(mfrc522.uid.uidByte[i], HEX);\n",
         2 => "  // Своя карта открывает замок на пять секунд.\n  digitalWrite(LOCK, HIGH);\n  delay(5000);\n  digitalWrite(LOCK, LOW);\n",
@@ -4490,8 +4901,7 @@ void setup() {
   Serial.begin(9600);
   SPI.begin();
   mfrc522.PCD_Init();
-  pinMode(8, OUTPUT);
-}
+<<SETUP>>}
 
 void loop() {
   if (!mfrc522.PICC_IsNewCardPresent()) return;
@@ -4823,6 +5233,11 @@ fn bluetooth_sketch(lang: Lang, choice: usize) -> String {
     } else {
         "      digitalWrite(LED, c == '1' ? HIGH : LOW);\n"
     };
+    let setup = if choice == 2 {
+        "  pinMode(RELAY, OUTPUT);\n"
+    } else {
+        "  pinMode(LED, OUTPUT);\n"
+    };
     fill(
         r#"// <<C0>>
 #include <SoftwareSerial.h>
@@ -4831,9 +5246,7 @@ SoftwareSerial bt(2, 3);          // TX модуля на D2, RX через де
 void setup() {
   Serial.begin(9600);
   bt.begin(9600);
-  pinMode(13, OUTPUT);
-  pinMode(4, OUTPUT);
-}
+<<SETUP>>}
 
 void loop() {
   while (bt.available()) {
@@ -4849,6 +5262,7 @@ void loop() {
         &[
             ("C0", tr(lang, "HC-05: команды '1' и '0' из терминала телефона", "HC-05: '1' and '0' from the phone's terminal")),
             ("EXTRA", extra),
+            ("SETUP", setup),
             ("ACTION", action),
         ],
     )
@@ -4898,20 +5312,25 @@ fn gsm_sketch(lang: Lang, choice: usize) -> String {
             tr(lang, "Мост между терминалом и модемом: проверка AT вручную", "A bridge between terminal and modem: AT by hand"),
         ),
     };
+    let mode = match choice {
+        1 => "  pinMode(BTN, INPUT_PULLUP);\n",
+        2 => "  pinMode(RELAY, OUTPUT);\n",
+        _ => "",
+    };
     fill(
         r#"// <<C0>>
 #include <SoftwareSerial.h>
 SoftwareSerial modem(2, 3);        // TX модема на D2, RX через делитель с D3
+const uint8_t PWR = 4;
 <<EXTRA>>
 void setup() {
   Serial.begin(9600);
   modem.begin(9600);
-  pinMode(4, OUTPUT);
-  pinMode(5, INPUT_PULLUP);
-  // Импульс на PWR включает модем.
-  digitalWrite(4, HIGH);
+  pinMode(PWR, OUTPUT);
+<<MODE>>  // Импульс на PWR включает модем.
+  digitalWrite(PWR, HIGH);
   delay(1200);
-  digitalWrite(4, LOW);
+  digitalWrite(PWR, LOW);
   delay(3000);
   modem.println(F("AT"));
 }
@@ -4922,6 +5341,7 @@ void loop() {
         &[
             ("C0", title),
             ("EXTRA", extra),
+            ("MODE", mode),
             ("LOOP", loop_body),
         ],
     )
@@ -4957,15 +5377,20 @@ void loop() {
         );
     }
     let relay = if choice == 2 {
-        "  if (request.indexOf(\"GET /on\") >= 0) { digitalWrite(7, HIGH); }\n  if (request.indexOf(\"GET /off\") >= 0) { digitalWrite(7, LOW); }\n"
+        "  if (request.indexOf(\"GET /on\") >= 0) { digitalWrite(RELAY, HIGH); }\n  if (request.indexOf(\"GET /off\") >= 0) { digitalWrite(RELAY, LOW); }\n"
     } else {
         ""
+    };
+    let (decl, relay_setup) = if choice == 2 {
+        ("const uint8_t RELAY = 7;\n", "  pinMode(RELAY, OUTPUT);\n")
+    } else {
+        ("", "")
     };
     fill(
         r#"// <<C0>>
 #include <SPI.h>
 #include <Ethernet.h>
-
+<<DECL>>
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 IPAddress ip(10, 0, 0, 42);
 EthernetServer server(80);
@@ -4974,8 +5399,7 @@ void setup() {
   Serial.begin(9600);
   Ethernet.begin(mac, ip);
   server.begin();
-  pinMode(7, OUTPUT);
-  Serial.print(F("server: "));
+<<RELAY_SETUP>>  Serial.print(F("server: "));
   Serial.println(Ethernet.localIP());
 }
 
@@ -4995,6 +5419,8 @@ void loop() {
 "#,
         &[
             ("C0", tr(lang, "W5100: веб-страница со статусом", "W5100: a web page with status")),
+            ("DECL", decl),
+            ("RELAY_SETUP", relay_setup),
             ("RELAY", relay),
         ],
     )
@@ -5024,6 +5450,193 @@ mod tests {
         let screens = built.circuit.parts().filter(|p| p.value == "OLED 0.96").count();
         assert_eq!(screens, 2, "two screens means two boards");
         assert!(built.code.contains("screen0") && built.code.contains("screen1"));
+    }
+
+    #[test]
+    fn every_added_relay_switches_a_load() {
+        use crate::text::Lang;
+        let parsed = parse("два реле");
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let report = crate::checks::run(&built, Lang::Ru);
+        assert_eq!(report.failed(), 0);
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|c| !c.detail.contains("COM") && !c.detail.contains("NO")),
+            "an added relay has open contacts: {:?}",
+            report
+                .checks
+                .iter()
+                .map(|c| c.detail.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            built.circuit.parts().filter(|p| p.kind == crate::model::Kind::Relay).count() >= 2,
+            "the second relay is gone"
+        );
+    }
+
+    #[test]
+    fn a_named_display_lesson_draws_one_screen() {
+        use crate::text::Lang;
+        for task in ["LCD1602", "OLED 128x64"] {
+            let parsed = parse(task);
+            let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+            let screens = built
+                .circuit
+                .parts()
+                .filter(|p| p.value.starts_with("LCD") || p.value.starts_with("OLED"))
+                .count();
+            assert_eq!(screens, 1, "{task} draws {screens} screens");
+        }
+    }
+
+    #[test]
+    fn a_clock_on_lcd1602_keeps_the_clock_and_one_screen() {
+        use crate::text::Lang;
+        let parsed = parse("часы на LCD1602");
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let screens = built
+            .circuit
+            .parts()
+            .filter(|p| p.value.starts_with("LCD") || p.value.starts_with("OLED"))
+            .count();
+        assert_eq!(screens, 1);
+        assert!(
+            built.circuit.parts().any(|p| p.value == "DS3231"),
+            "the clock board is gone"
+        );
+        assert!(built.code.contains("rtc.now()"));
+    }
+
+    /// A text scene keeps both its message and the output named beside it.
+    #[test]
+    fn a_named_output_does_not_hide_the_text() {
+        use crate::text::Lang;
+        for task in ["текст и светодиод", "текст на экране и светодиод"] {
+            let parsed = parse(task);
+            assert!(parsed.intent.text_screens.is_some(), "{task}");
+            let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+            let report = crate::checks::run(&built, Lang::Ru);
+            assert_eq!(report.failed(), 0, "{task}: {:?}", report.checks.iter().map(|c| &c.detail).collect::<Vec<_>>());
+            assert!(
+                built.circuit.parts().any(|p| p.value == "LCD1602"),
+                "{task}: the display is gone"
+            );
+            assert!(
+                built.circuit.parts().any(|p| p.kind == crate::model::Kind::Led),
+                "{task}: the LED is gone"
+            );
+            assert!(built.code.contains("MESSAGE"), "{task}:\n{}", built.code);
+            assert!(built.code.contains("LED_PIN"), "{task}:\n{}", built.code);
+        }
+    }
+
+    /// A clock and a buzzer are one alarm clock, not the buzzer lesson; the
+    /// clock also keeps a named display and an LED beside it.
+    #[test]
+    fn a_clock_keeps_its_time_next_to_an_output() {
+        use crate::text::Lang;
+        let alarm = parse("часы и пьезо");
+        let built = build(&alarm.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.circuit.parts().any(|p| p.value == "DS3231"));
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Buzzer));
+        assert!(built.code.contains("rtc.now()"), "{}", built.code);
+
+        let led = parse("часы на LCD и светодиод");
+        let plan = plan(&led.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.title_text(Lang::Ru), "Часы реального времени DS3231");
+        let built = build(&led.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.circuit.parts().any(|p| p.value == "DS3231"));
+        assert!(built.circuit.parts().any(|p| p.value == "LCD1602"));
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Led));
+        assert!(built.code.contains("rtc.now()"), "{}", built.code);
+    }
+
+    /// A bare "текст" next to an output means a display; on its own it is not
+    /// a screen ("переведи текст" stays refused).
+    #[test]
+    fn a_bare_text_word_is_a_screen_only_beside_an_output() {
+        assert!(parse("текст и светодиод").intent.text_screens.is_some());
+        assert!(parse("переведи текст").intent.text_screens.is_none());
+    }
+
+    /// The everyday names of a night light and of a dimmer must not fall
+    /// through to "Не нашёл, чем управлять".
+    #[test]
+    fn everyday_loads_find_a_circuit() {
+        use crate::text::Lang;
+        let night = parse("ночник");
+        let recipe = night.intent.recipe.expect("the night light composes");
+        assert_eq!(recipe.behavior, crate::spec::Behavior::Solid);
+        let built = build(&night.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Ldr));
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Led));
+        assert!(
+            built.code.contains("digitalWrite(SINK_PIN, active ? HIGH : LOW)"),
+            "{}",
+            built.code
+        );
+        assert!(!built.code.contains("lit = !lit"), "{}", built.code);
+
+        let night = parse("ночник и реле");
+        let built = build(&night.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Ldr));
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Relay));
+        assert!(built.circuit.parts().any(|p| p.kind == crate::model::Kind::Led));
+
+        let dimmer = parse("диммер на симисторе");
+        let dimmer_plan = plan(&dimmer.intent, Lang::Ru).expect("plans");
+        assert!(
+            dimmer_plan.title_text(Lang::Ru).contains("220 В"),
+            "{:?}",
+            dimmer_plan.title_text(Lang::Ru)
+        );
+
+        for task in ["метеостанция", "умный дом"] {
+            let parsed = parse(task);
+            assert!(plan(&parsed.intent, Lang::Ru).is_some(), "{task}");
+        }
+    }
+
+    /// "Часы на дисплее 1602" names the LCD model without the "LCD" word.
+    #[test]
+    fn a_1602_display_is_an_lcd() {
+        use crate::text::Lang;
+        let parsed = parse("часы на дисплее 1602");
+        let screens = parsed.intent.text_screens.or_else(|| crate::parse::named_devices("часы на дисплее 1602").screens);
+        let screens = screens.expect("a display is named");
+        assert_eq!(screens.kind, crate::parse::ScreenKind::Lcd);
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.title_text(Lang::Ru), "Часы реального времени DS3231");
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        assert!(built.circuit.parts().any(|p| p.value == "LCD1602"));
+    }
+
+    #[test]
+    fn two_named_screens_are_drawn_in_a_composition() {
+        use crate::text::Lang;
+        let parsed = parse("датчик температуры и два экрана");
+        let recipe = parsed.intent.recipe.expect("composes");
+        assert_eq!(recipe.screens, 2);
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        assert!(
+            plan.choices[0].specs.iter().any(|s| s.1.contains("×2")),
+            "the plan hides the second screen"
+        );
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let screens = built
+            .circuit
+            .parts()
+            .filter(|p| p.value == "LCD1602")
+            .count();
+        assert_eq!(screens, 2);
+        assert!(
+            built.code.contains("lcd0") && built.code.contains("lcd1"),
+            "the sketch prints on one screen only:\n{}",
+            built.code
+        );
     }
 
     /// "Текст приветствия на двух экранах" is two displays showing a message,
@@ -5200,6 +5813,45 @@ mod tests {
                 signatures.windows(2).any(|w| w[0] != w[1]),
                 "the three choices are the same circuit"
             );
+        }
+    }
+
+    /// An incandescent lamp gets a MOSFET dimmer or a relay, never a series
+    /// resistor and a blink.
+    #[test]
+    fn a_lamp_is_switched_by_a_transistor_or_a_relay() {
+        let p = parse("лампа накаливания 12 В");
+        let plan = plan(&p.intent, Lang::Ru).expect("a lamp is routable");
+        assert_eq!(plan.tid, Tid::Lamp);
+        let mosfet = build(&p.intent, 0, Lang::Ru).expect("MOSFET choice");
+        assert!(mosfet.circuit.parts.iter().any(|x| x.kind == Kind::Lamp));
+        assert!(mosfet.circuit.parts.iter().any(|x| x.kind == Kind::Nmos));
+        assert!(!mosfet.circuit.parts.iter().any(|x| x.kind == Kind::Led));
+        assert!(mosfet.code.contains("analogWrite(LAMP"));
+
+        let relay = build(&p.intent, 1, Lang::Ru).expect("relay choice");
+        assert!(relay.circuit.parts.iter().any(|x| x.kind == Kind::Relay));
+        assert!(relay.circuit.parts.iter().any(|x| x.kind == Kind::Lamp));
+        assert!(relay.code.contains("digitalWrite(RELAY"));
+    }
+
+    /// A template may already declare `Servo arm;`. The servo added from the
+    /// sentence must take a free name instead of declaring the object twice.
+    #[test]
+    fn added_servos_never_share_a_name() {
+        for task in ["два сервопривода", "датчик движения и два сервопривода"] {
+            let p = parse(task);
+            let plan = plan(&p.intent, Lang::Ru).expect("routable");
+            let built = build(&p.intent, plan.recommended, Lang::Ru).expect("builds");
+            let names: Vec<&str> = built
+                .code
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("Servo "))
+                .filter_map(|rest| rest.strip_suffix(';'))
+                .collect();
+            assert!(names.len() >= 2, "{task}: {names:?}");
+            let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+            assert_eq!(unique.len(), names.len(), "{task}: {names:?}");
         }
     }
 

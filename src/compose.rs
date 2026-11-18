@@ -84,9 +84,14 @@ pub fn detect(
     // The book lesson is a strong hint, but it can be about the sink: in
     // "газ выше 400, реле" the relay lesson wins the vote. So fall back to
     // the source whose own keywords match the sentence best.
+    // The book's "двигатель постоянного тока" describes the motor; it is not
+    // a request for a current sensor. Likewise "по алгоритму движения" is a
+    // motion program, not the HC-SR501. Both readings come from word stems,
+    // so the words are dropped before the source table looks at them.
+    let source_text = source_scope(&text);
     let source = lesson
         .and_then(source_for_lesson)
-        .or_else(|| source_in(&text))?;
+        .or_else(|| source_in(&source_text))?;
     // A lesson that teaches a screen is about the screen itself: "цветной
     // дисплей 1.44" is a screen, not a colour sensor with an OLED readout.
     // "Давление на OLED" stays a recipe: its sensor is not the word "цвет".
@@ -99,7 +104,7 @@ pub fn detect(
     if matches!(condition, Some(Condition::Between { .. })) {
         let names_other = SOURCES.iter().any(|s| {
             s.id != source.id
-                && s.keys.iter().any(|k| crate::words::mentions(&text, k))
+                && s.keys.iter().any(|k| crate::words::mentions(&source_text, k))
         });
         if names_other {
             return None;
@@ -157,13 +162,46 @@ pub fn detect(
             _ => return None,
         }
     };
-    let behavior = behavior_for(sink, action);
+    // A night light is a steady lamp, not a flasher: when it gets dark the
+    // LED simply stays on. Blinking is only the default for an alarm.
+    let night_light = sink == SinkId::Led
+        && (text.contains("ночник") || text.contains("night light"));
+    let behavior = if night_light {
+        Behavior::Solid
+    } else {
+        behavior_for(sink, action)
+    };
     Some(Composition {
         source: source.id,
         sink,
         behavior,
         condition,
+        screens: crate::parse::screens_in(raw).map(|s| s.count).unwrap_or(1),
     })
+}
+
+/// Drop the stem collisions that are not about a sensor: "постоянного тока"
+/// names the motor's supply, and "по алгоритму движения" names a motion
+/// program. Both words still reach the rest of the parser.
+fn source_scope(text: &str) -> String {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let algorithmic = tokens.iter().any(|t| crate::words::mentions(t, "алгоритм"));
+    let mut out = String::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let motion_program = algorithmic && crate::words::mentions(token, "движени");
+        let dc_supply = i > 0
+            && crate::words::mentions(token, "ток")
+            && (crate::words::mentions(tokens[i - 1], "постоянн")
+                || crate::words::mentions(tokens[i - 1], "переменн"));
+        if motion_program || dc_supply {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
 }
 
 /// The lesson's own board is a display: the sentence is about showing
@@ -246,6 +284,8 @@ struct Resolved<'a> {
     /// The number the sentence gave, if it gave one: a comparator variant has
     /// to say that the number does not reach its sketch.
     spoken: Option<Condition>,
+    /// How many screens the sentence asked for.
+    screens: usize,
 }
 
 fn resolve(c: &Composition, variant: usize) -> Option<Resolved<'static>> {
@@ -284,6 +324,7 @@ fn resolve(c: &Composition, variant: usize) -> Option<Resolved<'static>> {
         sink_pins,
         behavior: c.behavior,
         spoken: c.condition,
+        screens: c.screens,
     })
 }
 
@@ -346,6 +387,12 @@ fn choice(r: &Resolved, lang: Lang) -> Choice {
         L::new("Сложность", "Effort"),
     );
     let (pros, specs) = if r.behavior == Behavior::Show {
+        let screen = sink(r.sink).title.get(lang);
+        let screen = if r.screens > 1 {
+            format!("{screen} ×{}", r.screens)
+        } else {
+            screen.to_string()
+        };
         (
             vec![L::new(
                 "Значение видно на экране, порт остаётся свободным",
@@ -353,7 +400,7 @@ fn choice(r: &Resolved, lang: Lang) -> Choice {
             )],
             vec![
                 templates::spec_line("I2C: A4, A5", L::new("Шина", "Bus")),
-                templates::spec_line(sink(r.sink).title.get(lang), L::new("Экран", "Screen")),
+                templates::spec_line(&screen, L::new("Экран", "Screen")),
                 templates::spec_line(&current, L::new("Ток", "Current")),
                 effort,
             ],
@@ -488,6 +535,12 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
         ),
     });
     // A screen has no threshold to tune: the reading goes out as it is.
+    if r.behavior == Behavior::Show && r.screens > 1 {
+        notes.push(L::new(
+            "Несколько экранов на одной шине I2C: задай им разные адреса перемычками, иначе они ответят одновременно.",
+            "Several screens on one I2C bus need different addresses set by their jumpers, or they answer together.",
+        ));
+    }
     if r.behavior != Behavior::Show {
         notes.push(match r.condition {
             Condition::Above(_) | Condition::Below(_) => L::new(
@@ -667,18 +720,29 @@ fn place_sink(b: &mut B, r: &Resolved) -> Option<()> {
         SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled => {
             let spec = sink(r.sink);
             let name = spec.module?;
-            let part = place_board(b, "DS1", name, spec.at);
-            // The supply is already on the rails; the bus lines go to the
-            // shared A4/A5 pair, where the source may already sit.
+            // The sentence may ask for two screens: every board joins the
+            // same A4/A5 bus, and the drawing must show as many as the plan
+            // promised. One screen keeps its usual place on the bench.
+            let spots = if r.screens <= 1 {
+                vec![Pt::new(spec.at.0, spec.at.1)]
+            } else {
+                let top = b.c.bbox().bottom() + 8.0;
+                templates::screen_spots(r.screens, name, top)
+            };
             let sda = *r.sink_pins.first()?;
             let scl = *r.sink_pins.get(1)?;
-            for (pin_name, target) in [("SDA", sda), ("SCL", scl)] {
-                if b.c.parts[part]
-                    .pins
-                    .iter()
-                    .any(|&p| b.c.pins[p].name == pin_name)
-                {
-                    b.w(b.mp(part, pin_name), b.uno_pin(target), NetClass::Signal);
+            for (n, at) in spots.iter().enumerate() {
+                let part = place_board(b, &format!("DS{}", n + 1), name, (at.x, at.y));
+                // The supply is already on the rails; the bus lines go to the
+                // shared A4/A5 pair, where the source may already sit.
+                for (pin_name, target) in [("SDA", sda), ("SCL", scl)] {
+                    if b.c.parts[part]
+                        .pins
+                        .iter()
+                        .any(|&p| b.c.pins[p].name == pin_name)
+                    {
+                        b.w(b.mp(part, pin_name), b.uno_pin(target), NetClass::Signal);
+                    }
                 }
             }
         }
@@ -698,6 +762,37 @@ fn join_unique(a: &str, b: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// One object, one initialisation and one show block per screen, each on its
+/// own I2C address. A composition that names two screens must print on both,
+/// not only on the first board in the drawing.
+fn screen_fragments(spec: &SinkSpec, count: usize) -> (String, String, String) {
+    let oled = spec.id == SinkId::Oled;
+    let base = if oled { "display" } else { "lcd" };
+    let mut globals = String::new();
+    let mut setup = String::new();
+    let mut show = String::new();
+    for n in 0..count {
+        let name = format!("{base}{n}");
+        let addr = if oled {
+            0x3C + n as u8
+        } else {
+            0x27u8.wrapping_sub(n as u8)
+        };
+        let addr = format!("0x{addr:02X}");
+        globals.push_str(&spec.globals.replace(base, &name).replace("0x27", &addr));
+        let mut init = spec.setup.replace(base, &name);
+        if oled {
+            init = init.replace("0x3C", &addr);
+        }
+        if n > 0 {
+            init = init.replace("  Wire.begin();\n", "");
+        }
+        setup.push_str(&init);
+        show.push_str(&spec.show.replace(base, &name));
+    }
+    (globals, setup, show)
 }
 
 fn sketch(r: &Resolved, lang: Lang) -> String {
@@ -808,8 +903,22 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
         )
     };
     let includes = join_unique(r.variant.includes, spec.includes);
-    let globals = join_unique(r.variant.globals, spec.globals);
-    let setup = format!("{}{}", r.variant.setup, spec.setup);
+    // Two screens must both receive the reading: each gets its own object and
+    // its own address on the bus.
+    let (globals, setup, action) = if show && r.screens > 1 {
+        let (g, s, a) = screen_fragments(spec, r.screens);
+        (
+            join_unique(r.variant.globals, &g),
+            format!("{}{}", r.variant.setup, s),
+            a,
+        )
+    } else {
+        (
+            join_unique(r.variant.globals, spec.globals),
+            format!("{}{}", r.variant.setup, spec.setup),
+            action,
+        )
+    };
     let title = format!(
         "{}: {}",
         r.source.title.get(lang),
@@ -944,6 +1053,7 @@ mod tests {
                         sink,
                         behavior,
                         condition: None,
+                        screens: 1,
                     };
                     let plan = plan(c, Lang::Ru)
                         .unwrap_or_else(|| panic!("{}: {sink:?} plans", source.title.ru));
@@ -995,6 +1105,7 @@ mod tests {
             sink: SinkId::Led,
             behavior: Behavior::Blink,
             condition: None,
+            screens: 1,
         };
         let built = build(c, 0, Lang::Ru).unwrap();
         let uses = |pin: &str| {
@@ -1035,6 +1146,7 @@ mod tests {
                 sink: SinkId::Led,
                 behavior: Behavior::Solid,
                 condition: None,
+                screens: 1,
             };
             let built = build(c, 0, Lang::Ru).unwrap();
             assert!(
@@ -1101,6 +1213,7 @@ mod tests {
             sink: SinkId::Oled,
             behavior: Behavior::Show,
             condition: None,
+            screens: 1,
         };
         assert!(fits(c));
         let built = build(c, 0, Lang::Ru).unwrap();

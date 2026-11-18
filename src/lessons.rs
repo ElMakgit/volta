@@ -2115,6 +2115,10 @@ const ALIASES: &[(&str, usize)] = &[
     ("gas", 13),
     ("color sensor", 50),
     ("colour sensor", 50),
+    ("метеостанц", 12),
+    ("метеоцентр", 12),
+    ("умный дом", 6),
+    ("smart home", 6),
 ];
 
 /// Indices of lessons that everyday words may point at.

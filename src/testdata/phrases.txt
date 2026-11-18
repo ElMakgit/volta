@@ -307,13 +307,13 @@ nrf24l01 | load:radionrf
 bluetooth модуль hc-05 | load:bluetooth
 gsm модем | load:gsm
 ethernet w5100 | load:ethernet
-ночник | load:led
+ночник | load:led+ldr
 гирлянда | load:led
 фонарь | load:led
 лампочка | load:led
 светодиод кнопкой | load:led+button
 крутилка и мотор | load:motor+pot
-диммер для лампы | load:led
+диммер для лампы | load:lamp
 датчик света | lesson:9
 люксметр | lesson:9
 освещенность | lesson:9

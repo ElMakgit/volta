@@ -5,7 +5,7 @@
 //! on which schedule. This module reads those roles with a small dictionary of
 //! inflections, synonyms, common misspellings and number patterns.
 
-use crate::words::{normalize, stem};
+use crate::words::normalize;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Semantic {
@@ -50,21 +50,11 @@ const SINKS: &[(&str, &[&str])] = &[
 ];
 
 fn mentions_any(text: &str, words: &[&str]) -> bool {
-    words.iter().any(|key| {
-        let key = *key;
-        // A short Latin word is matched as a whole token: "oled" contains
-        // "led", but an OLED is not an LED sink.
-        if key.len() <= 4 && key.chars().all(|c| c.is_ascii_alphabetic()) {
-            return text
-                .split_whitespace()
-                .any(|word| word.trim_matches(|c: char| !c.is_alphanumeric()) == key);
-        }
-        if text.contains(key) {
-            return true;
-        }
-        let k = stem(key);
-        k.len() >= 4 && text.split_whitespace().any(|word| stem(word) == k)
-    })
+    // The same word rules as the parser: a short key must not sit inside a
+    // longer word, so "свет" in "светодиод" is not a light sensor.
+    words
+        .iter()
+        .any(|key| crate::words::mentions(text, key))
 }
 
 /// The words right after a cue phrase, for the number reader.
