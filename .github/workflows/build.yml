@@ -19,7 +19,9 @@ concurrency:
 jobs:
   linux:
     name: Linux x86_64
-    runs-on: ubuntu-latest
+    # The oldest supported Ubuntu runner keeps the glibc requirement low, so
+    # the archive also starts on newer Ubuntu releases and other distributions.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
