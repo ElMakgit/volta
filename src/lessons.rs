@@ -1490,7 +1490,7 @@ void loop() {
         book: 3,
         number: 5,
         title: L::new("Карта памяти SD", "An SD card"),
-        keys: &["sd-карт", "microsd", "sd card", "карта памяти"],
+        keys: &["sd", "sd-карт", "microsd", "sd card", "карта памяти"],
         boards: &[board("SD", 2.0, 54.0)],
         wires: &[("CS", "D10"), ("SCK", "D13"), ("MOSI", "D11"), ("MISO", "D12")],
         extras: NO_EXTRA,
@@ -1541,7 +1541,7 @@ void loop() {
         book: 3,
         number: 6,
         title: L::new("Датчик звука", "A sound sensor"),
-        keys: &["датчик звука", "микрофон", "sound sensor"],
+        keys: &["датчик звука", "микрофон", "хлоп", "хлопк", "sound sensor"],
         boards: &[board("SOUND", 2.0, 54.0)],
         wires: &[("AO", "A0"), ("DO", "D2")],
         extras: NO_EXTRA,
@@ -2083,7 +2083,13 @@ const ALIASES: &[(&str, usize)] = &[
     ("дым", 13),
     ("утечк", 13),
     ("присутств", 14),
-    ("пульт", 17),
+    ("пульт", TSOP),
+    ("ик приемник", TSOP),
+    ("ик-приемник", TSOP),
+    ("инфракрасный приемник", TSOP),
+    ("хлоп", SOUND),
+    ("хлопк", SOUND),
+    ("clap", SOUND),
     ("часы", 31),
     ("кольцо", 32),
     ("клавиатур", 34),
@@ -2134,6 +2140,8 @@ pub const THERMISTOR: usize = 10;
 pub const RANGE: usize = 15;
 /// The digital sound sensor lesson.
 pub const SOUND: usize = 36;
+/// The TSOP1838 IR receiver lesson.
+pub const TSOP: usize = 17;
 
 /// Whether the lesson is an I2C text display, so a task that asks for its own
 /// text can take over the display instead of building the lesson's demo.

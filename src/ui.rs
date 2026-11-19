@@ -608,8 +608,73 @@ impl App {
             understood: vec![alt.label],
             unsupported: None,
             alternatives: Vec::new(),
+            trace: Vec::new(),
         };
         self.plan_parsed(next);
+    }
+
+    /// Save the sentence, the trace and the report as one text file, so a
+    /// wrong build becomes a reproducible case instead of a memory. The file
+    /// lands next to the projects, in `data_dir()/feedback`.
+    fn save_feedback(&mut self) {
+        let Some(parsed) = &self.parsed else { return };
+        let now = chrono::Local::now();
+        let dir = crate::paths::data_dir().join("feedback");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("feedback: {e}");
+            self.status_bad = true;
+            return;
+        }
+        let name = format!(
+            "{}-{:03}.txt",
+            now.format("%Y%m%d-%H%M%S"),
+            now.timestamp_subsec_millis()
+        );
+        let mut text = String::new();
+        text.push_str(&format!("time: {}\n", now.format("%Y-%m-%d %H:%M:%S")));
+        text.push_str(&format!("task: {}\n", self.task));
+        if let Some(plan) = &self.plan {
+            text.push_str(&format!("plan: {}\n", plan.title_text(self.lang)));
+            text.push_str(&format!("choice: {}\n", self.chosen));
+        }
+        text.push_str("\ntrace:\n");
+        for line in &parsed.trace {
+            text.push_str("  ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        if let Some(built) = &self.built {
+            text.push_str("\nparts:\n");
+            for p in &built.circuit.parts {
+                text.push_str(&format!("  {} {}\n", p.label, p.value));
+            }
+        }
+        if let Some(report) = self.ai_report() {
+            text.push_str("\nchecks:\n");
+            for c in &report.checks {
+                text.push_str(&format!(
+                    "  {:?} {}: {}\n",
+                    c.sev,
+                    c.name.get(self.lang),
+                    c.detail
+                ));
+            }
+        }
+        let path = dir.join(name);
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.status = format!(
+                    "{}: {}",
+                    self.t("task.wrong.saved"),
+                    path.display()
+                );
+                self.status_bad = false;
+            }
+            Err(e) => {
+                self.status = format!("feedback: {e}");
+                self.status_bad = true;
+            }
+        }
     }
 
     /// Change one field of the read recipe and rebuild the bench, without
@@ -625,6 +690,7 @@ impl App {
             understood: crate::compose::recipe_words(recipe),
             unsupported: None,
             alternatives: Vec::new(),
+            trace: Vec::new(),
         };
         self.plan_parsed(next);
         crate::config::save_draft(&self.task, self.mode == Mode::Manual);
@@ -796,7 +862,9 @@ impl App {
     }
 
     fn ai_report(&self) -> Option<Report> {
-        self.built.as_ref().map(|b| checks::run(b, self.lang))
+        self.built
+            .as_ref()
+            .map(|b| checks::run_with(b, self.lang, &self.task))
     }
 
     // -------------------------------------------------------------- projects
@@ -1759,15 +1827,18 @@ impl App {
                 ui.label(RichText::new(self.t("task.other")).size(11.0).color(muted));
                 ui.horizontal_wrapped(|ui| {
                     for (i, alt) in p.alternatives.iter().enumerate() {
-                        if ui
-                            .add(
-                                Button::new(RichText::new(alt.label.get(self.lang)).size(11.5))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.7)))
-                                    .corner_radius(crate::style::RADIUS),
-                            )
-                            .clicked()
-                        {
+                        let button = Button::new(
+                            RichText::new(alt.label.get(self.lang)).size(11.5),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, accent.gamma_multiply(0.7)))
+                        .corner_radius(crate::style::RADIUS);
+                        let resp = ui.add(button);
+                        let resp = match &alt.note {
+                            Some(note) => resp.on_hover_text(note),
+                            None => resp,
+                        };
+                        if resp.clicked() {
                             alt_pick = Some(i);
                         }
                     }
@@ -1776,6 +1847,45 @@ impl App {
         }
         if let Some(i) = alt_pick {
             self.choose_alternative(i);
+        }
+
+        // The same evidence `volta explain` prints, one click away. It does
+        // not make the parse smarter; it makes a wrong choice arguable.
+        if let Some(p) = &self.parsed {
+            if !p.trace.is_empty() {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(
+                    RichText::new(self.t("task.why")).size(11.0).color(muted),
+                )
+                .id_salt("why-this")
+                .show(ui, |ui| {
+                    for line in &p.trace {
+                        ui.label(
+                            RichText::new(line)
+                                .size(10.0)
+                                .monospace()
+                                .color(muted),
+                        );
+                    }
+                });
+            }
+        }
+
+        // "Not this" writes the sentence, the trace and the report to a file.
+        // One click turns a mismatch into a reproducible case.
+        if self.parsed.is_some() && self.built.is_some() {
+            ui.add_space(4.0);
+            let wrong = Button::new(RichText::new(self.t("task.wrong")).size(11.0))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(1.0, muted.gamma_multiply(0.5)))
+                .corner_radius(crate::style::RADIUS);
+            if ui
+                .add(wrong)
+                .on_hover_text(self.t("task.wrong.hint"))
+                .clicked()
+            {
+                self.save_feedback();
+            }
         }
 
         if let Some(plan) = &self.plan {

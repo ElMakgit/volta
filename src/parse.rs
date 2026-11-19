@@ -191,6 +191,9 @@ pub struct Parse {
     pub unsupported: Option<L>,
     /// Two readings of an ambiguous sentence, offered as one-click choices.
     pub alternatives: Vec<Alternative>,
+    /// The words behind every decision, for `volta explain`. Technical, so
+    /// it stays in one language instead of being translated with the UI.
+    pub trace: Vec<String>,
 }
 
 /// Another way to read the same sentence: the label names the difference, the
@@ -199,6 +202,9 @@ pub struct Parse {
 pub struct Alternative {
     pub label: L,
     pub intent: Intent,
+    /// Extra context for the hover, such as the printed task a fuzzy match
+    /// came from. Free text, shown as is.
+    pub note: Option<String>,
 }
 
 struct Group {
@@ -238,7 +244,7 @@ const RFID: Group = Group {
 const RADIO433: Group = Group {
     words: &[
         "433", "fs1000a", "xy-mk", "радиопередатчик", "радиоприем", "приемник",
-        "радиомодул", "одноканальн",
+        "радиомодул", "одноканальн", "радио",
     ],
     label: L::new("радио 433 МГц", "433 MHz radio"),
 };
@@ -552,6 +558,63 @@ fn search_text(raw: &str) -> String {
     out
 }
 
+/// An infrared part is not a 433 MHz radio, although both are called a
+/// "receiver" in everyday speech. The parser has separate lessons for the
+/// TSOP1838 and the IR emitter, so a bare "приёмник" must not claim them.
+fn ir_part(text: &str) -> bool {
+    text.split_whitespace().any(|t| {
+        t == "ик"
+            || t.starts_with("ик-")
+            || t.starts_with("инфракрас")
+            || t == "tsop"
+            || t.starts_with("tsop")
+            || t.starts_with("ir-")
+            || t == "ir"
+    })
+}
+
+/// Words that make the sentence a real 433 MHz radio task. An IR receiver
+/// with a remote control is not one.
+fn radio_433_context(text: &str) -> bool {
+    [
+        "433",
+        "fs1000a",
+        "xy-mk",
+        "радиомодул",
+        "радиопередатчик",
+        "радиоприем",
+        "радиочастот",
+    ]
+    .iter()
+    .any(|k| text.contains(k))
+}
+
+/// A card in a reader is not a memory card. The SD lesson is a separate
+/// circuit, so the RFID group must not win merely on the word "карта".
+fn sd_storage(text: &str) -> bool {
+    let card = text.contains("sd")
+        || text.contains("microsd")
+        || text.contains("флеш")
+        || text.contains("flash")
+        || text.contains("карта памяти");
+    let access = [
+        "доступ", "пропуск", "турникет", "замок", "домофон", "rfid", "rc522",
+        "метк", "считыват",
+    ]
+    .iter()
+    .any(|k| text.contains(k));
+    card && !access
+}
+
+/// A seven-segment indicator keeps its own lesson. "Часы на семисегментном
+/// индикаторе" must not be turned into the DS3231 demo just because the word
+/// "часы" is present.
+fn seven_segment(text: &str) -> bool {
+    ["семисегмент", "7seg", "7-сегмент", "tm1650", "tm1637"]
+        .iter()
+        .any(|k| text.contains(k))
+}
+
 /// A display asked for in words. A book task names the lesson's sensor, but
 /// the reader still has to honour "на любой тип дисплея" or "два экрана".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -792,8 +855,29 @@ fn exact_book_task(raw: &str) -> Option<Parse> {
 /// though a word or two changed. The similarity check is deliberately
 /// conservative and never overrides a short keyword phrase.
 #[cfg(feature = "book-tasks")]
-fn fuzzy_book_task(raw: &str) -> Option<Parse> {
-    crate::book_tasks::closest(raw).map(|(_, solution, _)| from_book_solution(raw, solution))
+fn fuzzy_book_task(raw: &str) -> Option<(Parse, usize, u8)> {
+    crate::book_tasks::closest(raw).map(|(i, solution, score)| {
+        (from_book_solution(raw, solution), i, score)
+    })
+}
+
+/// Model numbers the user typed. A fuzzy match to a printed task that never
+/// mentions them is a different task, not a retyped one.
+fn specific_parts(raw: &str) -> Vec<String> {
+    const MODELS: &[&str] = &[
+        "dht11", "dht22", "ds18b20", "bmp180", "bmp280", "bme280", "mq-2", "mq-3",
+        "hc-sr04", "hc-sr501", "rc522", "fs1000a", "xy-mk", "nrf24", "hc-05",
+        "hc-06", "neoway", "sd", "microsd", "tsop", "7seg", "tm1637", "max7219",
+        "ws2812", "ds3231", "lcd1602", "lcd2004", "oled", "enc28j60", "w5100",
+        "l298n", "l293d", "28byj", "uln2003", "acs712", "hx711", "mpu6050",
+        "tcs3200", "dfplayer", "mt8870", "ttp223",
+    ];
+    let text = crate::words::normalize(raw);
+    text.split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-'))
+        .filter(|t| MODELS.contains(t))
+        .map(|t| t.to_string())
+        .collect()
 }
 
 #[cfg(feature = "book-tasks")]
@@ -844,7 +928,7 @@ fn exact_book_task(_raw: &str) -> Option<Parse> {
 }
 
 #[cfg(not(feature = "book-tasks"))]
-fn fuzzy_book_task(_raw: &str) -> Option<Parse> {
+fn fuzzy_book_task(_raw: &str) -> Option<(Parse, usize, u8)> {
     None
 }
 
@@ -852,28 +936,40 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     let _ = books;
     // The user's own sentence stays in `raw`, so numbers in it ("на 49 карт")
     // still reach the sketch.
+    let mut book_hint: Option<(Parse, usize, u8)> = None;
     if books {
-        if let Some(parsed) = exact_book_task(raw) {
+        if let Some(mut parsed) = exact_book_task(raw) {
+            parsed.trace.insert(0, "book: exact task".to_string());
             return parsed;
         }
         // A short ask such as "две надписи на двух OLED" can look like a
         // printed display task, but it is the text scene, not the lesson's
         // demo. A copied task still wins above, and a fuzzy match to a
         // sensor, radio or storage keeps its own circuit.
-        if let Some(parsed) = fuzzy_book_task(raw) {
+        if let Some((parsed, index, score)) = fuzzy_book_task(raw) {
             let own_text = text_screen_task(raw).is_some()
                 && parsed
                     .intent
                     .lesson
                     .is_some_and(crate::lessons::is_text_display);
-            if !own_text {
+            // A near copy stays a copy. But if the user typed a model number
+            // the printed task never mentions, the match answers a different
+            // question: keep the book reading as an offer, and parse the
+            // sentence as written.
+            let printed = crate::book_tasks::TASKS[index].0.to_lowercase();
+            let foreign = specific_parts(raw).iter().any(|p| !printed.contains(p));
+            if !own_text && !foreign {
                 return parsed;
+            }
+            if foreign {
+                book_hint = Some((parsed, index, score));
             }
         }
     }
     let text = search_text(raw);
     let mut matched = Vec::new();
     let mut understood = Vec::new();
+    let mut trace = vec![format!("text: {text}")];
 
     // Specific boards come before the generic word "мотор", otherwise an
     // L298N task would be read as a single-transistor motor switch.
@@ -882,6 +978,13 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         &MOTOR, &SERVO, &BUZZER, &LAMP, &LED,
     ];
     let load_votes = votes(&text, &load_groups);
+    for (i, h) in &load_votes {
+        trace.push(format!(
+            "load group {}: [{}]",
+            load_groups[*i].label.ru,
+            h.join(", ")
+        ));
+    }
     let (mut load, mut load_hits) = match load_votes.first() {
         Some((i, h)) => (load_at(*i), h.clone()),
         None => (Load::Led, Vec::new()),
@@ -946,7 +1049,25 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             load_hits = h.clone();
         }
     }
+    // "Приёмник" is also an IR receiver, and "карта" is also an SD card. Both
+    // have their own lessons; letting the radio or RFID group win on the
+    // shared word builds a plausible but wrong circuit. Drop the group and
+    // let the lesson lookup name the real part.
+    if load == Load::Radio433 && ir_part(&text) && !radio_433_context(&text) {
+        trace.push("context: IR receiver is not a 433 MHz radio".to_string());
+        load = Load::Led;
+        load_hits.clear();
+    }
+    if load == Load::Rfid && sd_storage(&text) {
+        trace.push("context: SD card is not an RFID tag".to_string());
+        load = Load::Led;
+        load_hits.clear();
+    }
     let named_load = !load_hits.is_empty();
+    if !named_load {
+        trace.push("load: default (no load word)".to_string());
+    }
+    trace.push(format!("load: {:?} [{}]", load, load_hits.join(", ")));
     matched.extend(load_hits);
     if named_load {
         understood.push(load_label(load));
@@ -959,6 +1080,11 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         None => (None, Vec::new()),
     };
     let named_input = !input_hits.is_empty();
+    trace.push(format!(
+        "input: {:?} [{}]",
+        input,
+        input_hits.join(", ")
+    ));
     matched.extend(input_hits);
     if let Some(i) = input {
         understood.push(input_label(i));
@@ -988,6 +1114,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     let action = action_groups
         .iter()
         .find_map(|(a, g)| (!hits(&text, g).is_empty()).then_some(*a));
+    trace.push(format!("action: {:?}", action));
 
     let semantic = crate::templates::route(load, input);
     // A clock is a noun ("часы"), not a duration ("каждый час"). The
@@ -1032,7 +1159,11 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // lesson: the model number must not hide what the circuit is for. The
     // same holds for an alarm clock: "часы и пьезо" is an RTC with a buzzer,
     // not the buzzer lesson.
-    if clock_object && !board_load && (screens_in(raw).is_some() || named_load) {
+    if clock_object
+        && !board_load
+        && !seven_segment(&text)
+        && (screens_in(raw).is_some() || named_load)
+    {
         if let Some(rtc) = crate::lessons::ALL
             .iter()
             .position(|l| l.keys.contains(&"ds3231"))
@@ -1048,11 +1179,16 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             lesson = Some(rtc);
         }
     }
-    // The named board has to survive the lesson choice. "RFID и rgb
-    // светодиод" names a reader, and the RGB lesson does not: keeping the
-    // lesson would silently drop the reader from the task. An LED, a motor
-    // or a buzzer is different: the lesson may itself be about it, or it is
-    // simply the output the lesson's sensor drives.
+    // A lesson may not hide the load the sentence names. That used to apply
+    // only to ready-made boards, so "полив по влажности почвы" turned into
+    // the DHT lesson: the pump was named, but the lesson did not know the
+    // word. The sensor the sentence itself names is the stronger evidence:
+    // when the lesson teaches a different sensor, it is the wrong lesson.
+    let lesson_source = lesson.and_then(crate::spec::source_for_lesson);
+    let named_source = crate::compose::source_in_text(raw);
+    let wrong_source = lesson_source
+        .zip(named_source)
+        .is_some_and(|(a, b)| a.id != b.id);
     if named_load && board_load {
         if let Some(i) = lesson {
             let l = &crate::lessons::ALL[i];
@@ -1062,6 +1198,8 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
                 lesson = None;
             }
         }
+    } else if wrong_source {
+        lesson = None;
     }
     // EEPROM is a way to keep data, not the thing the circuit drives: in
     // "контроль доступа на 49 карт ... в EEPROM" the reader is named, so the
@@ -1095,6 +1233,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         lesson = None;
         understood.push(L::new("текст на экране", "text on a display"));
     }
+    trace.push(format!("lesson: {:?}", lesson));
     if let Some(i) = lesson {
         understood.push(crate::lessons::ALL[i].title);
     }
@@ -1134,6 +1273,11 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     if let Some(c) = condition {
         understood.push(c.label());
     }
+    trace.push(format!(
+        "recipe: {:?}",
+        recipe.map(|r| (r.source, r.sink, r.behavior))
+    ));
+    trace.push(format!("text screens: {:?}", text_screens));
     // A composition is read back as its recipe: source · condition · action.
     // That is more useful than the lesson title and the bare verb.
     if let Some(r) = recipe {
@@ -1169,6 +1313,10 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         None
     };
 
+    trace.push(match unsupported {
+        Some(ref msg) => format!("unsupported: {}", msg.ru),
+        None => "unsupported: none".to_string(),
+    });
     // Ambiguity is answered with one-click readings instead of a silent
     // coin toss: two loads named with equal force, or two inputs.
     let intent_of = |load: Load, input: Option<Input>| Intent {
@@ -1184,9 +1332,27 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         raw: raw.to_string(),
     };
     let mut alternatives = Vec::new();
-    if load_votes.len() > 1 && load_votes[1].1.len() == load_votes[0].1.len() {
-        for (i, _) in load_votes.iter().skip(1).take(2) {
+    // A tie is a tie, but so is a one-vote lead on a short match: "реле и
+    // мотор" should not silently build a relay switch when the sentence names
+    // both. A real lesson or recipe is specific enough to stand alone.
+    let top_load = load_votes.first().map(|(_, h)| h.len()).unwrap_or(0);
+    let second_load = load_votes.get(1).map(|(_, h)| h.len()).unwrap_or(0);
+    let tied = load_votes.len() > 1 && second_load == top_load;
+    let near_tie = load_votes.len() > 1
+        && top_load <= 3
+        && second_load + 1 >= top_load
+        && lesson.is_none()
+        && recipe.is_none()
+        && text_screens.is_none();
+    if tied || near_tie {
+        if near_tie && !tied {
+            trace.push("load: near tie, offering readings".to_string());
+        }
+        for (i, h) in load_votes.iter().skip(1).take(2) {
             let other = load_at(*i);
+            if h.len() + 1 < top_load {
+                continue;
+            }
             if other != load
                 && crate::templates::route(other, input).is_some()
                 && alternatives.len() < 2
@@ -1194,6 +1360,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
                 alternatives.push(Alternative {
                     label: plan_label(other, input),
                     intent: intent_of(other, input),
+                    note: None,
                 });
             }
         }
@@ -1208,9 +1375,29 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
                 alternatives.push(Alternative {
                     label: input_label(input_at(*i)),
                     intent: intent_of(load, other),
+                    note: None,
                 });
             }
         }
+    }
+    // "По радио" names a link, not its band. Offer the 2.4 GHz board next to
+    // the 433 MHz pair instead of silently choosing one.
+    let bare_radio = text.split_whitespace().any(|t| t == "радио")
+        && !radio_433_context(&text)
+        && !text.contains("nrf");
+    if bare_radio
+        && load == Load::Radio433
+        && alternatives.len() < 2
+        && !alternatives
+            .iter()
+            .any(|a| a.intent.load == Load::RadioNrf)
+        && crate::templates::route(Load::RadioNrf, input).is_some()
+    {
+        alternatives.push(Alternative {
+            label: plan_label(Load::RadioNrf, input),
+            intent: intent_of(Load::RadioNrf, input),
+            note: None,
+        });
     }
     // Nothing was named as a load but an input was: offer the circuits that
     // can use that input instead of guessing one.
@@ -1225,10 +1412,38 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             alternatives.push(Alternative {
                 label: plan_label(candidate, input),
                 intent: intent_of(candidate, input),
+                note: None,
             });
         }
     }
 
+    // The printed task is a suggestion, not a silent replacement: the
+    // sentence as written is what gets built, and the book reading waits one
+    // click away with the printed text on hover.
+    if let Some((parsed, index, score)) = book_hint {
+        trace.push(format!(
+            "book: suggestion, {}%, printed: {}",
+            score, crate::book_tasks::TASKS[index].0
+        ));
+        if alternatives.len() < 2 {
+            alternatives.insert(
+                0,
+                Alternative {
+                    label: L::new("Так, как в книге", "The book's version"),
+                    intent: parsed.intent,
+                    note: Some(format!(
+                        "{} {}%: {}",
+                        "Задача из книги", score, crate::book_tasks::TASKS[index].0
+                    )),
+                },
+            );
+        }
+    }
+    for alt in &alternatives {
+        if alt.note.is_none() {
+            trace.push(format!("alternative: {}", alt.label.ru));
+        }
+    }
     matched.sort();
     matched.dedup();
     Parse {
@@ -1248,6 +1463,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         understood,
         unsupported,
         alternatives,
+        trace,
     }
 }
 
@@ -1334,6 +1550,119 @@ mod tests {
             "picked {:?}",
             crate::lessons::ALL[lesson].title
         );
+    }
+
+    /// Every one of these sentences used to build a plausible circuit that
+    /// answered a different question. They are kept together so a new group
+    /// word cannot bring the old mistakes back.
+    #[test]
+    fn a_shared_word_does_not_steal_another_lesson() {
+        // "Приёмник" is an IR receiver, not the 433 MHz radio pair.
+        let p = parse("ИК приёмник и передатчик");
+        assert_eq!(p.intent.load, Load::Led);
+        let lesson = p.intent.lesson.expect("the IR lesson wins");
+        assert!(
+            crate::lessons::ALL[lesson].keys.contains(&"tsop"),
+            "picked {:?}",
+            crate::lessons::ALL[lesson].title
+        );
+
+        // A memory card is not an access card.
+        let p = parse("записать данные на SD карту");
+        assert_eq!(p.intent.load, Load::Led);
+        let lesson = p.intent.lesson.expect("the SD lesson wins");
+        assert!(
+            crate::lessons::ALL[lesson].keys.contains(&"sd"),
+            "picked {:?}",
+            crate::lessons::ALL[lesson].title
+        );
+
+        // A clock on a seven-segment display is not the DS3231 demo.
+        let p = parse("часы на семисегментном индикаторе");
+        let lesson = p.intent.lesson.expect("the segment lesson wins");
+        assert!(
+            !crate::lessons::ALL[lesson].keys.contains(&"ds3231"),
+            "picked {:?}",
+            crate::lessons::ALL[lesson].title
+        );
+    }
+
+    #[test]
+    fn soil_moisture_composes_with_the_pump() {
+        let p = parse("полив растений по влажности почвы");
+        let recipe = p.intent.recipe.expect("the soil probe composes");
+        assert_eq!(recipe.source, crate::spec::SourceId::Soil);
+        assert_eq!(recipe.sink, crate::spec::SinkId::Motor);
+        assert_ne!(
+            p.intent.lesson,
+            Some(crate::lessons::THERMISTOR),
+            "the DHT lesson must not answer a soil question"
+        );
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the soil pump builds");
+        assert!(built.circuit.parts().any(|part| part.value == "SOIL"));
+        assert!(built
+            .circuit
+            .parts
+            .iter()
+            .any(|part| part.kind == crate::model::Kind::Motor));
+        assert_eq!(
+            crate::checks::run_with(&built, crate::text::Lang::Ru, &p.intent.raw).failed(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_clap_light_stays_on() {
+        let p = parse("управление светом по хлопку");
+        let recipe = p.intent.recipe.expect("the clap light composes");
+        assert_eq!(recipe.source, crate::spec::SourceId::Sound);
+        assert_eq!(recipe.sink, crate::spec::SinkId::Led);
+        assert_eq!(recipe.behavior, crate::spec::Behavior::Solid);
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the clap light builds");
+        assert!(built.circuit.parts().any(|part| part.value == "SOUND"));
+    }
+
+    /// Two of each really means two parts, in the drawing and in the report.
+    #[test]
+    fn counts_are_checked_after_the_build() {
+        let p = parse("две кнопки и два светодиода");
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("two buttons and two LEDs build");
+        let count = |kind| built.circuit.parts.iter().filter(|x| x.kind == kind).count();
+        assert_eq!(count(crate::model::Kind::Button), 2);
+        assert_eq!(count(crate::model::Kind::Led), 2);
+        let report = crate::checks::run_with(&built, crate::text::Lang::Ru, &p.intent.raw);
+        assert_eq!(report.failed(), 0);
+    }
+
+    /// A near-tie is not a decision: the second reading is offered too.
+    #[test]
+    fn a_one_vote_lead_still_offers_the_other_reading() {
+        let p = parse("светодиод и лампа и мотор");
+        assert!(!p.alternatives.is_empty(), "understood {:?}", p.understood);
+        assert!(
+            p.trace.iter().any(|line| line.contains("near tie")),
+            "{:?}",
+            p.trace
+        );
+    }
+
+    /// A printed task that never mentions the part the user typed is a
+    /// suggestion, not the parse; the sentence as written still builds.
+    #[test]
+    fn a_foreign_part_turns_a_fuzzy_book_match_into_a_suggestion() {
+        let p = parse(
+            "Составить программу для МК последовательно, через каждые 2 секунды отправлять значения температуры и влажности на разных платах от 1 платы с передатчиком на 1 приёмник с помощью структуры и датчика DHT22.",
+        );
+        let book = p
+            .alternatives
+            .iter()
+            .find(|a| a.note.is_some())
+            .expect("the book reading is offered");
+        assert_eq!(book.label.ru, "Так, как в книге");
+        assert!(book.note.as_deref().unwrap_or("").contains("Задача из книги"));
     }
 
 

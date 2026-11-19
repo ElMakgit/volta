@@ -96,6 +96,7 @@ impl Plan {
     }
 }
 
+#[derive(Clone)]
 pub struct Built {
     pub tid: Tid,
     pub title: String,
@@ -338,18 +339,36 @@ fn explain(raw: &str, lang: Lang) -> Option<String> {
     Some(format!("{prefix}{}: {} → {}{}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, limit, conf))
 }
 
+/// A composition explains itself through its own recipe. The semantic roles
+/// are a guess about the sentence; the recipe is what was actually built, so
+/// the two must not disagree on screen.
+fn recipe_why(recipe: crate::spec::Composition, lang: Lang) -> String {
+    let words: Vec<String> = crate::compose::recipe_words(recipe)
+        .iter()
+        .map(|l| l.get(lang).to_string())
+        .collect();
+    format!(
+        "{}: {}",
+        tr(lang, "Прочитано", "Read as"),
+        words.join(" → ")
+    )
+}
+
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
     if let Some(screens) = intent.text_screens {
         return Some(text_screen_plan(&intent.raw, screens, lang));
     }
     if let Some(recipe) = intent.recipe {
         let mut p = crate::compose::plan(recipe, lang)?;
-        p.why = explain(&intent.raw, lang);
+        p.why = Some(recipe_why(recipe, lang));
         return Some(p);
     }
     if let Some(i) = intent.lesson {
         let mut p = display_lesson_plan(i, crate::parse::named_devices(&intent.raw).screens, lang);
-        p.why = explain(&intent.raw, lang);
+        // The lesson title is already the first choice; a role guess from
+        // `semantics` would argue with it ("не назван → radio" under the IR
+        // lesson). The trace panel carries the evidence instead.
+        p.why = None;
         return Some(p);
     }
     let tid = route(intent.load, intent.input)?;
@@ -897,45 +916,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             0,
         ),
         Tid::Rfid => rfid_plan(lang, &intent.raw),
-        Tid::Radio433 => (
-            L::new("Радио 433 МГц: передатчик и приёмник", "433 MHz radio: transmitter and receiver"),
-            vec![
-                quick(
-                    lang,
-                    L::new("FS1000A + XY-MK-5V", "FS1000A + XY-MK-5V"),
-                    L::new(
-                        "Пара с одной платы: данные идут в одну сторону, антенна обязательна.",
-                        "The usual pair: one-way data, and an antenna is mandatory.",
-                    ),
-                    "30 мА",
-                    "низкая",
-                    2,
-                ),
-                quick(
-                    lang,
-                    L::new("Приёмник + реле", "Receiver + relay"),
-                    L::new(
-                        "Принятая команда включает реле: готовый радиоудлинитель.",
-                        "A received command clicks a relay: a ready radio extender.",
-                    ),
-                    "100 мА",
-                    "средняя",
-                    3,
-                ),
-                quick(
-                    lang,
-                    L::new("Передатчик + светодиод", "Transmitter + LED"),
-                    L::new(
-                        "Передатчик мигает светодиодом при отправке '1' и '0'.",
-                        "The transmitter blinks an LED while sending '1' and '0'.",
-                    ),
-                    "50 мА",
-                    "низкая",
-                    2,
-                ),
-            ],
-            0,
-        ),
+        Tid::Radio433 => radio433_plan(lang, &intent.raw),
         Tid::RadioNrf => (
             L::new("NRF24L01: обмен по 2.4 ГГц", "NRF24L01: 2.4 GHz link"),
             vec![
@@ -3175,7 +3156,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::ServoPot => servo_sweep(lang, if choice == 1 { 1 } else { 2 }),
         Tid::BuzzerTone => buzzer_tone(lang, choice),
         Tid::Rfid => rfid(lang, choice, &intent.raw),
-        Tid::Radio433 => radio433(lang, choice),
+        Tid::Radio433 => radio433(lang, choice, &intent.raw),
         Tid::RadioNrf => radio_nrf(lang, choice),
         Tid::Bluetooth => bluetooth(lang, choice),
         Tid::Gsm => gsm(lang, choice),
@@ -4393,7 +4374,97 @@ fn rfid(lang: Lang, choice: usize, raw: &str) -> (Circuit, String, L, Vec<L>) {
     }
 }
 
-fn radio433(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
+/// Does the task ask for a sensor struct sent from one board to another?
+/// "Структура" or a pair of temperature and humidity words names the DHT
+/// link: it is not the one-board test pair that only sends '1' and '0'.
+fn radio433_link(raw: &str) -> bool {
+    let text = crate::words::normalize(raw);
+    // A link that carries a reading needs the sensor on the board; a plain
+    // pair of radios does not. "Передать температуру по радио" used to build
+    // a pair with nothing to measure.
+    let sensor = text.contains("температур")
+        || text.contains("влажност")
+        || text.contains("dht")
+        || text.contains("ds18b20");
+    let link = text.contains("радио")
+        || text.contains("433")
+        || text.contains("передатчик")
+        || text.contains("приемник");
+    text.contains("структур") || (sensor && link)
+}
+
+fn radio433_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
+    if radio433_link(raw) {
+        return (
+            L::new(
+                "Радио 433 МГц: структура между двумя платами",
+                "433 MHz radio: a struct between two boards",
+            ),
+            vec![quick(
+                lang,
+                L::new(
+                    "DHT22 + FS1000A / XY-MK-5V",
+                    "DHT22 + FS1000A / XY-MK-5V",
+                ),
+                L::new(
+                    "Передатчик с DHT22 раз в 2 секунды шлёт номер, температуру и влажность структурой; вторая плата принимает и печатает.",
+                    "A transmitter with a DHT22 sends its number, temperature and humidity as a struct every 2 seconds; the second board receives and prints them.",
+                ),
+                "30 мА",
+                "низкая",
+                3,
+            )],
+            0,
+        );
+    }
+    (
+        L::new(
+            "Радио 433 МГц: передатчик и приёмник",
+            "433 MHz radio: transmitter and receiver",
+        ),
+        vec![
+            quick(
+                lang,
+                L::new("FS1000A + XY-MK-5V", "FS1000A + XY-MK-5V"),
+                L::new(
+                    "Пара с одной платы: данные идут в одну сторону, антенна обязательна.",
+                    "The usual pair: one-way data, and an antenna is mandatory.",
+                ),
+                "30 мА",
+                "низкая",
+                2,
+            ),
+            quick(
+                lang,
+                L::new("Приёмник + реле", "Receiver + relay"),
+                L::new(
+                    "Принятая команда включает реле: готовый радиоудлинитель.",
+                    "A received command clicks a relay: a ready radio extender.",
+                ),
+                "100 мА",
+                "средняя",
+                3,
+            ),
+            quick(
+                lang,
+                L::new("Передатчик + светодиод", "Transmitter + LED"),
+                L::new(
+                    "Передатчик мигает светодиодом при отправке '1' и '0'.",
+                    "The transmitter blinks an LED while sending '1' and '0'.",
+                ),
+                "50 мА",
+                "низкая",
+                2,
+            ),
+        ],
+        0,
+    )
+}
+
+fn radio433(lang: Lang, choice: usize, raw: &str) -> (Circuit, String, L, Vec<L>) {
+    if radio433_link(raw) {
+        return radio433_link_build(lang);
+    }
     let mut b = B::new(lang);
     let gnd = b.gnd(74.0);
     let vcc = b.vcc(78.0);
@@ -4458,6 +4529,139 @@ fn radio433(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
             )
         }
     }
+}
+
+/// One board of a two-board link: the transmitter carries the DHT22 and the
+/// FS1000A, the receiver is the second board with an XY-MK-5V. The sketch
+/// holds both roles, so the single drawing is the half with the sensor.
+fn radio433_link_build(lang: Lang) -> (Circuit, String, L, Vec<L>) {
+    let mut b = B::new(lang);
+    let tx_gnd = b.gnd(16.0);
+    let tx_vcc = b.vcc(20.0);
+    let dht_gnd = b.gnd(52.0);
+    let dht_vcc = b.vcc(56.0);
+    feeds(&mut b);
+    // Both modules are turned over: their header then faces the rails and the
+    // board above, so a cable leaves the header instead of walking round a
+    // thirty-millimetre body first. Each module keeps its own pair of rail
+    // holes, so no cable runs past the other module.
+    let tx = b.breakout("U2", "FS1000A", Pt::new(24.0, 94.0));
+    b.c.rotate_part(tx, 2);
+    // The sensor sits two millimetres lower, so its two cables run beside the
+    // transmitter's instead of on top of them.
+    let dht = b.breakout("U3", "DHT22", Pt::new(60.0, 98.0));
+    b.c.rotate_part(dht, 2);
+    b.w(b.uno_pin("A1"), b.mp(tx, "DATA"), NetClass::Signal);
+    b.w(b.mp(tx, "VCC"), tx_vcc, NetClass::Vcc);
+    b.w(b.mp(tx, "GND"), tx_gnd, NetClass::Gnd);
+    b.w(b.uno_pin("A2"), b.mp(dht, "DATA"), NetClass::Signal);
+    b.w(b.mp(dht, "VCC"), dht_vcc, NetClass::Vcc);
+    b.w(b.mp(dht, "GND"), dht_gnd, NetClass::Gnd);
+    (
+        b.finish(),
+        radio433_link_sketch(lang),
+        L::new(
+            "Плата передатчика: DHT22 на A2 и FS1000A на A1 (цифровые 16 и 15). Вторая плата — тот же скетч с SENDER 0 и XY-MK-5V на D2.",
+            "The transmitter board: a DHT22 on A2 and an FS1000A on A1 (digital 16 and 15). The second board runs the same sketch with SENDER 0 and an XY-MK-5V on D2.",
+        ),
+        vec![
+            L::new(
+                "Обе платы прошиваются одним скетчем: у передатчика SENDER 1, у приёмника SENDER 0.",
+                "Flash the same sketch into both boards: SENDER 1 on the transmitter, SENDER 0 on the receiver.",
+            ),
+            L::new(
+                "Структура Reading уходит в эфир 32 битами: номер 8, температура 12 (со смещением 400), влажность 12.",
+                "The Reading struct goes on air as 32 bits: an 8-bit number, 12-bit temperature (offset by 400) and 12-bit humidity.",
+            ),
+            L::new(
+                "DHT22 опрашивают не чаще раза в 2 секунды, поэтому период уже 2000 мс; антенна 17 см нужна обоим модулям.",
+                "A DHT22 is read at most every 2 seconds, so the period is already 2000 ms; both modules need a 17 cm antenna.",
+            ),
+        ],
+    )
+}
+
+fn radio433_link_sketch(lang: Lang) -> String {
+    format!(
+        r#"// {C0}
+// Прошей этот скетч в обе платы: у передатчика SENDER 1, у приёмника SENDER 0.
+#include <RCSwitch.h>
+#include <DHT.h>
+
+#define SENDER 1              // 1 — плата с передатчиком, 0 — плата с приёмником
+const uint16_t PERIOD_MS = 2000;
+
+// Структура, которой обмениваются платы.
+struct Reading {{
+  uint8_t id;         // номер передатчика
+  int16_t temp10;     // температура в десятых долях, °C
+  uint16_t hum10;     // влажность в десятых долях, %
+}};
+
+RCSwitch radio = RCSwitch();
+#if SENDER
+const uint8_t SENDER_ID = 1;  // номер этой платы в эфире
+const uint8_t TX_PIN = A1;    // FS1000A DATA, цифровой 15
+const uint8_t DHT_PIN = A2;   // DHT22 DATA, цифровой 16
+DHT dht(DHT_PIN, DHT22);
+#else
+const uint8_t RX_PIN = 2;     // XY-MK-5V DATA, прерывание 0
+#endif
+
+void setup() {{
+  Serial.begin(9600);
+#if SENDER
+  radio.enableTransmit(TX_PIN);
+  dht.begin();
+#else
+  radio.enableReceive(digitalPinToInterrupt(RX_PIN));
+#endif
+}}
+
+#if SENDER
+void loop() {{
+  static uint32_t last = 0;
+  if (millis() - last < PERIOD_MS) return;
+  last = millis();
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) return;
+  Reading r;
+  r.id = SENDER_ID;
+  r.temp10 = (int16_t)(t * 10.0 + (t < 0 ? -0.5 : 0.5));
+  r.hum10 = (uint16_t)(h * 10.0 + 0.5);
+  // RCSwitch шлёт 32 бита: номер, температура со смещением 400, влажность.
+  uint32_t payload = ((uint32_t)r.id << 24)
+                   | ((uint32_t)(r.temp10 + 400) << 12)
+                   | (r.hum10 & 0x0FFF);
+  radio.send(payload, 32);
+  Serial.print(F("send "));
+  Serial.println(payload);
+}}
+#else
+void loop() {{
+  if (!radio.available()) return;
+  Reading r;
+  uint32_t payload = radio.getReceivedValue();
+  r.id = payload >> 24;
+  r.temp10 = (int16_t)((payload >> 12) & 0x0FFF) - 400;
+  r.hum10 = payload & 0x0FFF;
+  Serial.print(F("id "));
+  Serial.print(r.id);
+  Serial.print(F(" t "));
+  Serial.print(r.temp10 / 10.0);
+  Serial.print(F(" C h "));
+  Serial.println(r.hum10 / 10.0);
+  radio.resetAvailable();
+}}
+#endif
+"#,
+        C0 = tr(
+            lang,
+            "Передатчик с DHT22 шлёт структуру раз в 2 секунды, приёмник печатает её поля",
+            "A DHT22 transmitter sends a struct every 2 seconds; the receiver prints its fields"
+        ),
+    )
 }
 
 fn radio_nrf(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
@@ -5430,6 +5634,98 @@ void loop() {
 mod tests {
     use super::*;
     use crate::parse::{parse, Action, Input, Load};
+
+    /// A task that sends a sensor struct from one board to another is not the
+    /// one-board test pair: it names the DHT and both roles in one sketch.
+    #[test]
+    fn a_radio_link_sends_a_struct_between_two_boards() {
+        use crate::text::Lang;
+        let task = "Составить программу для МК последовательно, через каждые 2 секунды отправлять значения номера передатчика, температуры и влажности на разных платах от 1 платы с передатчиком на 1 приёмник с по-мощью структуры.";
+        let parsed = parse(task);
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        assert_eq!(
+            plan.title_text(Lang::Ru),
+            "Радио 433 МГц: структура между двумя платами"
+        );
+        assert_eq!(plan.choices.len(), 1);
+        let built = build(&parsed.intent, plan.recommended, Lang::Ru).expect("builds");
+        assert!(built.circuit.parts().any(|p| p.value == "DHT22"));
+        assert!(built.circuit.parts().any(|p| p.value == "FS1000A"));
+        assert!(
+            !built.circuit.parts().any(|p| p.value == "XY-MK-5V"),
+            "the receiver belongs to the second board"
+        );
+        for needle in [
+            "struct Reading",
+            "SENDER_ID",
+            "enableTransmit(TX_PIN)",
+            "digitalPinToInterrupt(RX_PIN)",
+            "TX_PIN = A1",
+            "DHT_PIN = A2",
+            "readTemperature",
+            "readHumidity",
+            "PERIOD_MS = 2000",
+            "radio.send(payload, 32)",
+        ] {
+            assert!(built.code.contains(needle), "{needle}:\n{}", built.code);
+        }
+        // The drawing has to carry the same two data pins as the sketch: on
+        // A1 for the transmitter and A2 for the DHT.
+        let uno = built
+            .circuit
+            .parts
+            .iter()
+            .position(|p| p.kind == Kind::Arduino)
+            .expect("an Uno");
+        let dht = built
+            .circuit
+            .parts
+            .iter()
+            .position(|p| p.value == "DHT22")
+            .expect("a DHT22");
+        let fs = built
+            .circuit
+            .parts
+            .iter()
+            .position(|p| p.value == "FS1000A")
+            .expect("a transmitter");
+        let wired = |pin: usize, other: usize| {
+            built.circuit.wires.iter().any(|w| {
+                (w.a == End::Pin(pin) && w.b == End::Pin(other))
+                    || (w.b == End::Pin(pin) && w.a == End::Pin(other))
+            })
+        };
+        assert!(wired(
+            built.circuit.pin(uno, "A1"),
+            built.circuit.pin(fs, "DATA")
+        ));
+        assert!(wired(
+            built.circuit.pin(uno, "A2"),
+            built.circuit.pin(dht, "DATA")
+        ));
+        // Both modules are turned over, so their header faces the board and a
+        // cable leaves it without a lap around a thirty-millimetre body.
+        for part in [fs, dht] {
+            let data = built.circuit.pin(part, "DATA");
+            assert!(
+                built.circuit.pins[data].pos.y < built.circuit.parts[part].at.y,
+                "{} header faces away from the board",
+                built.circuit.parts[part].value
+            );
+        }
+        let report = crate::checks::run(&built, Lang::Ru);
+        assert_eq!(
+            report.failed(),
+            0,
+            "{:?}",
+            report
+                .checks
+                .iter()
+                .filter(|c| c.sev == crate::checks::Sev::Fail)
+                .map(|c| format!("{}: {}", c.name.ru, c.detail))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn a_clock_naming_a_display_gets_one_and_two_gets_two() {

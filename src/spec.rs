@@ -26,6 +26,8 @@ pub enum SourceId {
     Tilt,
     Weight,
     Color,
+    /// Soil moisture: a resistive probe, not the DHT humidity sensor.
+    Soil,
 }
 
 /// How the source is put on the bench. Boards come from the module table;
@@ -448,7 +450,10 @@ pub const SOURCES: &[SourceSpec] = &[
         title: L::new("Датчик звука", "The sound sensor"),
         short: L::new("звук", "sound"),
         lesson: 36,
-        keys: &["звук", "шум", "микрофон", "громкост", "sound", "noise", "microphone"],
+        keys: &[
+            "звук", "шум", "микрофон", "громкост", "хлоп", "хлопк", "sound",
+            "noise", "microphone", "clap",
+        ],
         period_ms: 100,
         place: Place::Board { name: "SOUND", at: (2.0, 54.0) },
         summary: L::new(
@@ -920,6 +925,44 @@ pub const SOURCES: &[SourceSpec] = &[
             note: L::new(
                 "Один канал — грубое приближение: для настоящего цвета нужны все три и баланс белого.",
                 "One channel is a rough guess: real colour needs all three and a white balance.",
+            ),
+        }],
+    },
+    SourceSpec {
+        id: SourceId::Soil,
+        title: L::new("Влажность почвы FC-28", "FC-28 soil moisture"),
+        short: L::new("влажность почвы", "soil moisture"),
+        // No book lesson teaches this probe yet: the sensor is a bench part,
+        // not a page of the course.
+        lesson: usize::MAX,
+        keys: &["почв", "soil", "fc-28", "yl-69", "yl-38", "датчик влажности почвы"],
+        period_ms: 1000,
+        place: Place::Board { name: "SOIL", at: (2.0, 54.0) },
+        summary: L::new(
+            "FC-28: аналоговый выход на A0, компараторный — на D2. Сухая почва даёт большее число.",
+            "The FC-28: an analogue output on A0 and a comparator on D2. Dry soil reads higher.",
+        ),
+        variants: &[Variant {
+            name: L::new("Аналоговый AO", "Analogue AO"),
+            blurb: L::new(
+                "AO на A0: число переводится в проценты, порог задан в скетче.",
+                "AO to A0: the reading is mapped to percent, and the threshold lives in the sketch.",
+            ),
+            logic: Logic::Number,
+            pins: &["A0"],
+            signals: &[("AO", "A0")],
+            includes: "",
+            globals: "",
+            setup: "",
+            sample: "  float value = map(analogRead(A0), 1023, 0, 0, 100);\n",
+            print: "  Serial.println(value, 0);\n",
+            unit: L::new("%", "%"),
+            decimals: 0,
+            condition: Condition::Below(40.0),
+            level: 1,
+            note: L::new(
+                "Сухой воздух и сухая почва дают разные числа: откалибруй порог на своей земле, полив и насухо.",
+                "Dry air and dry soil read differently: calibrate the threshold on your own soil, wet and dry.",
             ),
         }],
     },

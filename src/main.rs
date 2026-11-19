@@ -23,6 +23,7 @@ mod pdf;
 mod png;
 mod project;
 mod registry;
+mod requirements;
 mod resources;
 mod scene;
 mod semantics;
@@ -42,6 +43,7 @@ volta — схема из текста: макетка, скетч, скринш
 
   volta                         открыть окно
   volta plan <текст>            разобрать задачу и показать три варианта деталей
+  volta explain <текст>         показать, какие слова что решили
   volta render <текст> [ключи]  собрать схему, скетч и PNG без окна
   volta list                    что вообще умеет
   volta --help
@@ -53,6 +55,7 @@ volta — схема из текста: макетка, скетч, скринш
   --labels        подписать детали на скриншоте
   --wires arc|straight|ortho  как вести провода (по умолчанию из настроек)
   --json          машинный вывод
+  --trace         печатать разбор слов в stderr
 ";
 
 fn main() {
@@ -65,6 +68,7 @@ fn main() {
             }
         }
         Some("plan") => cmd_plan(&args[1..]),
+        Some("explain") => cmd_explain(&args[1..]),
         Some("render") => cmd_render(&args[1..]),
         Some("list") => cmd_list(),
         Some("help") | Some("-h") | Some("--help") => print!("{HELP}"),
@@ -84,6 +88,7 @@ struct Flags {
     labels: bool,
     wires: crate::model::WireStyle,
     json: bool,
+    trace: bool,
 }
 
 fn flags(args: &[String]) -> Flags {
@@ -95,6 +100,7 @@ fn flags(args: &[String]) -> Flags {
         labels: false,
         wires: crate::config::load_wire_style(),
         json: false,
+        trace: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -125,6 +131,7 @@ fn flags(args: &[String]) -> Flags {
                 };
             }
             "--json" => f.json = true,
+            "--trace" => f.trace = true,
             other => {
                 if !other.starts_with("--") {
                     if !f.task.is_empty() {
@@ -147,6 +154,11 @@ fn cmd_plan(args: &[String]) {
     }
     let parsed = parse::parse(&f.task);
     let lang = f.lang;
+    if f.trace {
+        for line in &parsed.trace {
+            eprintln!("{line}");
+        }
+    }
     if let Some(msg) = parsed.unsupported {
         let msg = msg.get(lang).to_string();
         if f.json {
@@ -222,6 +234,86 @@ fn cmd_plan(args: &[String]) {
     }
 }
 
+/// Show the evidence behind a parse: which words voted, what was chosen,
+/// what was refused and which other readings were offered. It is the same
+/// parser the build uses; nothing is recomputed differently.
+fn cmd_explain(args: &[String]) {
+    let f = flags(args);
+    let lang = f.lang;
+    if f.task.trim().is_empty() {
+        eprintln!("volta explain: нужен текст задачи");
+        std::process::exit(2);
+    }
+    let parsed = parse::parse(&f.task);
+    let plan = if parsed.unsupported.is_none() {
+        templates::plan(&parsed.intent, lang)
+    } else {
+        None
+    };
+    if f.json {
+        let choices: Vec<_> = plan
+            .as_ref()
+            .map(|p| {
+                p.choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        serde_json::json!({
+                            "index": i,
+                            "name": c.name.get(lang),
+                            "recommended": i == p.recommended,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": parsed.unsupported.is_none(),
+                "trace": parsed.trace,
+                "understood": parsed.understood.iter().map(|l| l.get(lang)).collect::<Vec<_>>(),
+                "error": parsed.unsupported.map(|l| l.get(lang).to_string()),
+                "alternatives": parsed.alternatives.iter().map(|a| a.label.get(lang)).collect::<Vec<_>>(),
+                "title": plan.as_ref().map(|p| p.title_text(lang)),
+                "why": plan.as_ref().and_then(|p| p.why.clone()),
+                "choices": choices,
+            })
+        );
+        return;
+    }
+    for line in &parsed.trace {
+        println!("{line}");
+    }
+    if !parsed.understood.is_empty() {
+        println!(
+            "understood: {}",
+            parsed
+                .understood
+                .iter()
+                .map(|l| l.get(lang))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(msg) = parsed.unsupported {
+        println!("error: {}", msg.get(lang));
+    }
+    for alt in &parsed.alternatives {
+        println!("alternative: {}", alt.label.get(lang));
+    }
+    if let Some(plan) = plan {
+        println!("title: {}", plan.title_text(lang));
+        if let Some(why) = &plan.why {
+            println!("why: {why}");
+        }
+        for (i, c) in plan.choices.iter().enumerate() {
+            let mark = if i == plan.recommended { "*" } else { " " };
+            println!("{mark} [{i}] {}", c.name.get(lang));
+        }
+    }
+}
+
 fn cmd_render(args: &[String]) {
     let f = flags(args);
     let lang = f.lang;
@@ -230,6 +322,11 @@ fn cmd_render(args: &[String]) {
         std::process::exit(2);
     }
     let parsed = parse::parse(&f.task);
+    if f.trace {
+        for line in &parsed.trace {
+            eprintln!("{line}");
+        }
+    }
     if let Some(msg) = parsed.unsupported {
         let msg = msg.get(lang).to_string();
         if f.json {
@@ -251,7 +348,7 @@ fn cmd_render(args: &[String]) {
         }
         std::process::exit(1);
     };
-    let report = checks::run(&built, lang);
+    let report = checks::run_with(&built, lang, &f.task);
 
     let th = theme::Theme::load();
     let sc = scene::draw(

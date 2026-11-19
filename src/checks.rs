@@ -265,6 +265,17 @@ pub fn run(built: &Built, lang: Lang) -> Report {
     Report { sim: simulate(built), ..run_circuit(&built.circuit, lang, Some(&built.code)) }
 }
 
+/// The same checks plus the sentence-level requirement list. A build can be
+/// electrically valid and still have lost the DHT22 or the `struct` the task
+/// named; `run` cannot know the sentence, so callers that have it use this.
+pub fn run_with(built: &Built, lang: Lang, raw: &str) -> Report {
+    let mut report = run(built, lang);
+    report
+        .checks
+        .extend(crate::requirements::check(built, raw, lang));
+    report
+}
+
 /// Checks that need no Arduino at all: a hand-drawn signal chain is still a
 /// circuit and deserves to be checked.
 fn run_bare(c: &Circuit, lang: Lang) -> Report {

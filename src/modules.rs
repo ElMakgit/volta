@@ -411,6 +411,13 @@ const SOUND_PINS: &[Pin] = &[
     p("AO", 16.0, 23.0),
 ];
 
+const SOIL_PINS: &[Pin] = &[
+    p("VCC", 4.0, 23.0),
+    p("GND", 8.0, 23.0),
+    p("DO", 12.0, 23.0),
+    p("AO", 16.0, 23.0),
+];
+
 const DFPLAYER_PINS: &[Pin] = &[
     p("VCC", 5.0, 31.0),
     p("GND", 10.0, 31.0),
@@ -916,6 +923,16 @@ pub const ALL: &[Module] = &[
         colour: (0x1D, 0x4F, 0xA8),
         look: Look::Sensor,
         pins: SOUND_PINS,
+        current_ma: 5,
+        three_three: false,
+    },
+    Module {
+        name: "SOIL",
+        w: 24.0,
+        h: 20.0,
+        colour: (0x1D, 0x4F, 0xA8),
+        look: Look::Sensor,
+        pins: SOIL_PINS,
         current_ma: 5,
         three_three: false,
     },

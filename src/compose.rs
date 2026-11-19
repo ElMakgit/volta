@@ -67,6 +67,9 @@ pub fn detect(
         || text.contains("гирлянд")
         || text.contains("rgb")
         || text.contains("цветной светодиод")
+        || text.contains("светом")
+        || text.contains("полив")
+        || text.contains("орошен")
         || names_screen;
     let asks_action = matches!(
         action,
@@ -137,6 +140,8 @@ pub fn detect(
         || text.contains("вентилятор")
         || text.contains("насос")
         || text.contains("кулер")
+        || text.contains("полив")
+        || text.contains("орошен")
     {
         SinkId::Motor
     } else if text.contains("rgb")
@@ -166,7 +171,12 @@ pub fn detect(
     // LED simply stays on. Blinking is only the default for an alarm.
     let night_light = sink == SinkId::Led
         && (text.contains("ночник") || text.contains("night light"));
-    let behavior = if night_light {
+    // A clap light stays on while the sound is there; blinking would turn a
+    // single clap into a strobe. A sound *level* alarm still blinks.
+    let clap_light = sink == SinkId::Led
+        && source.id == SourceId::Sound
+        && (text.contains("хлоп") || text.contains("clap"));
+    let behavior = if night_light || clap_light {
         Behavior::Solid
     } else {
         behavior_for(sink, action)
@@ -250,8 +260,22 @@ pub fn recipe_words(c: Composition) -> Vec<L> {
     vec![source.short, condition.label(), c.behavior.label()]
 }
 
+/// The sensor the sentence itself names, ignoring any lesson hint. The parser
+/// uses it to reject a book lesson that teaches a different sensor than the
+/// words do: "влажность почвы" is not the DHT lesson.
+pub fn source_in_text(raw: &str) -> Option<&'static SourceSpec> {
+    source_in(&source_scope(&crate::words::normalize(raw)))
+}
+
 /// The declared source whose keywords best match the sentence.
 fn source_in(text: &str) -> Option<&'static SourceSpec> {
+    // "Влажность почвы" is a resistive probe, not the DHT humidity sensor.
+    // The words share "влажность", so the soil probe has to win by name.
+    if crate::words::mentions(text, "почв") {
+        if let Some(s) = SOURCES.iter().find(|s| s.id == SourceId::Soil) {
+            return Some(s);
+        }
+    }
     let mut best: Option<((usize, usize), &'static SourceSpec)> = None;
     for s in SOURCES {
         let mut hits = 0;
