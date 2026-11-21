@@ -39,6 +39,9 @@ pub enum Tid {
     Lesson(usize),
     /// A text message on one or more I2C displays.
     TextScreens,
+    /// Buttons counted on an I2C display: the screen shows what the controls
+    /// do instead of pretending the sentence asked for an LED.
+    ButtonsScreen,
 }
 
 pub fn route(load: Load, input: Option<Input>) -> Option<Tid> {
@@ -289,76 +292,107 @@ fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
     (title, choices, recommended)
 }
 
-/// A short, visible reason for the chosen plan, built from the same roles the
-/// parser used, so the UI never claims more than it understood.
-fn explain(raw: &str, lang: Lang) -> Option<String> {
+/// Why this plan, from the slots it closes. The number is not a share of
+/// matched keywords: it is the evidence-weighted part of the typed task that
+/// the circuit actually draws, and what stays open is named honestly.
+fn explain(intent: &Intent, tid: Tid, choice: usize, lang: Lang) -> String {
     let ru = lang == Lang::Ru;
-    let book = {
-        #[cfg(feature = "book-tasks")]
-        {
-            crate::book_tasks::closest(raw).map(|(_, _, score)| score)
+    let task = &intent.task;
+    let mut cover = crate::task::template_cover(tid, choice);
+    // `augment_built` adds every named output to the drawing, so a named
+    // output that the template does not drive itself is still closed by the
+    // built circuit. Sensors, controls and screens are not added that way,
+    // so they stay honest in the coverage below.
+    for slot in &task.outputs {
+        if !cover.outputs.contains(&slot.kind) {
+            cover.outputs.push(slot.kind);
         }
-        #[cfg(not(feature = "book-tasks"))]
-        {
-            None
-        }
-    };
-    let prefix = match book {
-        Some(score) => format!(
-            "{} {}%; ",
-            if ru { "готовая задача, совпадение" } else { "a ready task, match" },
-            score
-        ),
-        None => String::new(),
-    };
-    let s = crate::semantics::analyse(raw);
-    if s.confidence == 0.0 {
-        return (!prefix.is_empty()).then(|| prefix.trim_end_matches("; ").to_string());
     }
-    let source = s.source.unwrap_or_else(|| if ru { "не назван".into() } else { "unnamed".into() });
-    let sinks = if s.sinks.is_empty() {
-        if ru { "нет" } else { "none" }.to_string()
-    } else {
-        s.sinks.join(", ")
-    };
-    let extra = crate::parse::named_devices(raw);
-    let mut parts = Vec::new();
-    if extra.screens.is_some() { parts.push(if ru { "экран" } else { "display" }); }
-    if extra.buzzer > 0 { parts.push(if ru { "пищалка" } else { "buzzer" }); }
-    if extra.relay > 0 { parts.push(if ru { "реле" } else { "relay" }); }
-    let add = if parts.is_empty() { String::new() } else {
-        format!("; {}: {}", if ru { "добавлено" } else { "added" }, parts.join(", "))
-    };
-    let when = match s.period_ms {
-        Some(ms) => format!(
+    let coverage = task.coverage(&cover);
+    let mut read: Vec<String> = Vec::new();
+    for slot in &task.outputs {
+        read.push(slot.kind.label().get(lang).to_string());
+    }
+    for slot in &task.controls {
+        read.push(match slot.kind {
+            Input::Button => tr(lang, "кнопка", "button").to_string(),
+            Input::Pot => tr(lang, "потенциометр", "potentiometer").to_string(),
+            Input::Ldr => tr(lang, "фоторезистор", "photoresistor").to_string(),
+        });
+    }
+    for slot in &task.sensors {
+        read.push(crate::task::SlotName::Sensor(slot.source).label().get(lang).to_string());
+    }
+    if !task.screens.is_empty() {
+        read.push(tr(lang, "экран", "display").to_string());
+    }
+    if read.is_empty() {
+        read.push(tr(lang, "не назван", "unnamed").to_string());
+    }
+    let mut out = format!("{}: {}", tr(lang, "Прочитано", "Read as"), read.join(" + "));
+    if coverage.total > 0 {
+        out.push_str(&format!(
+            "; {} {:.0}% ({} {}/{})",
+            tr(lang, "покрытие слотов", "slot coverage"),
+            (coverage.closed as f32 / coverage.total as f32) * 100.0,
+            tr(lang, "закрыто", "closed"),
+            coverage.closed,
+            coverage.total
+        ));
+    }
+    let missing: Vec<String> = coverage
+        .missing
+        .iter()
+        .map(|s| s.label().get(lang).to_string())
+        .collect();
+    if !missing.is_empty() {
+        out.push_str(&format!(
+            "; {}: {}",
+            tr(lang, "не закрыто", "left open"),
+            missing.join(", ")
+        ));
+    }
+    let extra: Vec<String> = coverage
+        .extra
+        .iter()
+        .map(|s| s.label().get(lang).to_string())
+        .collect();
+    if !extra.is_empty() {
+        out.push_str(&format!(
+            "; {}: {}",
+            tr(lang, "план добавляет", "the plan adds"),
+            extra.join(", ")
+        ));
+    }
+    if let Some(ms) = crate::semantics::analyse(&intent.raw).period_ms {
+        out.push_str(&format!(
             "; {} {} {}",
-            if ru { "период" } else { "period" },
+            tr(lang, "период", "period"),
             ms,
-            if ru { "мс" } else { "ms" }
-        ),
-        None => String::new(),
-    };
+            tr(lang, "мс", "ms")
+        ));
+    }
     // A table that does not fit is clamped, not silently shrunk: an Uno keeps
     // 255 four-byte UIDs in 1024 bytes of EEPROM.
-    let limit = match card_slots(raw) {
-        Some(n) if wants_access(raw) && n > 255 => format!(
-            "; {}",
-            if ru {
-                format!("в EEPROM Uno помещается 255 карт, запрошено {n}")
-            } else {
-                format!("an Uno EEPROM holds 255 cards, {n} requested")
-            }
-        ),
-        _ => String::new(),
-    };
-    // A ready task already explains itself; a role score next to it would
-    // only look like doubt.
-    let conf = if prefix.is_empty() {
-        format!("; {} {:.0}%", if ru { "уверенность" } else { "confidence" }, s.confidence * 100.0)
-    } else {
-        String::new()
-    };
-    Some(format!("{prefix}{}: {} → {}{}{}{}{}", if ru { "Прочитано" } else { "Read as" }, source, sinks, add, when, limit, conf))
+    if let Some(n) = card_slots(&intent.raw) {
+        if wants_access(&intent.raw) && n > 255 {
+            out.push_str(&format!(
+                "; {}",
+                if ru {
+                    format!("в EEPROM Uno помещается 255 карт, запрошено {n}")
+                } else {
+                    format!("an Uno EEPROM holds 255 cards, {n} requested")
+                }
+            ));
+        }
+    }
+    // A ready task is still worth showing, but it is a resemblance, not the
+    // reading: the slots above are what decides the circuit.
+    #[cfg(feature = "book-tasks")]
+    if let Some(score) = crate::book_tasks::closest(&intent.raw).map(|(_, _, score)| score) {
+        out = format!("{} {}%; {out}", tr(lang, "похожая задача книги, совпадение", "a similar book task, match"), score);
+    }
+    out
 }
 
 /// A composition explains itself through its own recipe. The semantic roles
@@ -392,6 +426,15 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         // lesson). The trace panel carries the evidence instead.
         p.why = None;
         return Some(p);
+    }
+    if intent.task.wants_buttons_screen() {
+        let screens = intent.named.screens.unwrap_or(crate::parse::Screens {
+            kind: ScreenKind::Any,
+            count: 1,
+            matrix: false,
+            segments: false,
+        });
+        return Some(buttons_screen_plan(screens, lang));
     }
     let tid = route(intent.load, intent.input)?;
     let (title, choices, recommended) = match tid {
@@ -1084,7 +1127,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
             ],
             0,
         ),
-        Tid::Lesson(_) | Tid::Composed | Tid::TextScreens => return None,
+        Tid::Lesson(_) | Tid::Composed | Tid::TextScreens | Tid::ButtonsScreen => return None,
     };
     Some(Plan {
         tid,
@@ -1092,7 +1135,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         headline: None,
         choices,
         recommended,
-        why: explain(&intent.raw, lang),
+        why: Some(explain(intent, tid, recommended, lang)),
     })
 }
 
@@ -1132,6 +1175,66 @@ fn text_modules(screens: crate::parse::Screens) -> Vec<TextModule> {
         out.push(TEXT_LCD1602);
     }
     out
+}
+
+/// A screen that shows what the buttons do. The sentence named controls and a
+/// display, so the plan closes both slots instead of drawing an LED the user
+/// never asked for.
+fn buttons_screen_plan(screens: crate::parse::Screens, lang: Lang) -> Plan {
+    let ru = lang == Lang::Ru;
+    let modules = text_modules(screens);
+    let title = if screens.count > 1 {
+        L::new("Кнопки: счётчики на экранах", "Buttons: counters on the displays")
+    } else {
+        L::new("Кнопки: счётчик нажатий на экране", "Buttons: press counter on the display")
+    };
+    let mut choices = Vec::new();
+    for (index, m) in modules.iter().enumerate() {
+        let name = if m.oled {
+            L::new("OLED 128×64 (I2C)", "OLED 128×64 (I2C)")
+        } else if m.cols >= 20 {
+            L::new("LCD2004 20×4 (I2C)", "LCD2004 20×4 (I2C)")
+        } else {
+            L::new("LCD1602 16×2 (I2C)", "LCD1602 16×2 (I2C)")
+        };
+        choices.push(Choice {
+            name,
+            blurb: if m.oled {
+                L::new(
+                    "Графический экран: две строки по 16 символов крупным шрифтом.",
+                    "A graphic panel: two 16-character rows in a large font.",
+                )
+            } else {
+                L::new(
+                    "Символьный LCD: каждая кнопка занимает свою строку.",
+                    "A character LCD: each button gets its own row.",
+                )
+            },
+            pros: vec![L::new("Две линии питания и I2C", "Two supply pins and I2C")],
+            cons: vec![L::new("Занимает A4/A5", "Uses A4/A5")],
+            specs: vec![
+                spec_line(if m.oled { "128×64" } else { "16×2" }, L::new("Знаков", "Characters")),
+                spec_line("I2C", L::new("Шина", "Bus")),
+                spec_line(&level_word(1, lang), LEVEL),
+            ],
+            level: 1,
+        });
+        if index + 1 >= modules.len().min(2) {
+            break;
+        }
+    }
+    Plan {
+        tid: Tid::ButtonsScreen,
+        title,
+        headline: None,
+        choices,
+        recommended: 0,
+        why: Some(if ru {
+            "Задача называет кнопки и экран; план закрывает оба слота и показывает счётчики нажатий.".to_string()
+        } else {
+            "The task names buttons and a display; the plan closes both slots and shows the press counts.".to_string()
+        }),
+    }
 }
 
 /// The word "приветствие", "надпись" or "текст" from the sentence, so the
@@ -1421,6 +1524,128 @@ fn text_screen_build(
     (b.finish(), code, summary, notes)
 }
 
+/// A screen with only buttons: each press increments a counter and the LCD
+/// shows the counts. The display and the buttons are the whole circuit, so
+/// no LED or motor is invented to fill the gap.
+fn buttons_screen_build(
+    lang: Lang,
+    screens: crate::parse::Screens,
+    buttons: usize,
+    choice: usize,
+) -> (Circuit, String, L, Vec<L>) {
+    let modules = text_modules(screens);
+    let module = modules[choice.min(modules.len() - 1)];
+    let count = buttons.clamp(1, 4);
+    let pins = ["D2", "D3", "D4", "D5"];
+    let mut b = B::new(lang);
+    let gnd = b.gnd(52.0);
+    let disp = b.breakout("DS1", module.name, Pt::new(2.0, 122.0));
+    if let Some(m) = crate::modules::find(module.name) {
+        for (pin, dx, _) in m.pins.iter().copied() {
+            match pin {
+                "GND" => b.w(b.mp(disp, pin), gnd, NetClass::Gnd),
+                "VCC" | "+5V" | "3V3" | "+" => {
+                    b.w(b.mp(disp, pin), b.vcc(2.0 + dx), NetClass::Vcc)
+                }
+                "SDA" => b.w(b.mp(disp, pin), b.uno_pin("A4"), NetClass::Signal),
+                "SCL" => b.w(b.mp(disp, pin), b.uno_pin("A5"), NetClass::Signal),
+                _ => {}
+            }
+        }
+    }
+    for n in 0..count {
+        let label = format!("B{}", n + 1);
+        let btn = b.button(&label, 14 + n as u8 * 7, Row::E);
+        b.w(b.uno_pin(pins[n]), btn[3], NetClass::Signal);
+        b.w(btn[0], gnd, NetClass::Gnd);
+    }
+    feeds(&mut b);
+    let code = buttons_screen_code(lang, module, count);
+    let summary = if count == 1 {
+        L::new(
+            "Каждое нажатие увеличивает счётчик, экран показывает его по I2C.",
+            "Every press increments a counter, and the display shows it over I2C.",
+        )
+    } else {
+        L::new(
+            "У каждой кнопки свой счётчик; экран показывает все счётчики по I2C.",
+            "Each button has its own counter; the display shows all of them over I2C.",
+        )
+    };
+    let mut notes = vec![L::new(
+        "Кнопки включены между пином и землёй: подтяжка INPUT_PULLUP внутри МК, дребезг гасится 30 мс.",
+        "The buttons sit between a pin and ground: the MCU's INPUT_PULLUP does the pull-up, and 30 ms debounce removes chatter.",
+    )];
+    if module.oled {
+        notes.push(L::new(
+            "Адрес SSD1306 — 0x3C или 0x3D; перемычка SA0 выбирает его.",
+            "An SSD1306 answers at 0x3C or 0x3D; the SA0 jumper chooses.",
+        ));
+    } else {
+        notes.push(L::new(
+            "Адрес переходника LCD — 0x27 или 0x3F; его покажет сканер I2C.",
+            "The LCD backpack answers at 0x27 or 0x3F; an I2C scanner tells which.",
+        ));
+    }
+    (b.finish(), code, summary, notes)
+}
+
+fn buttons_screen_code(lang: Lang, module: TextModule, count: usize) -> String {
+    let ru = lang == Lang::Ru;
+    let pins = &["2", "3", "4", "5"][..count];
+    let pins = pins.join(", ");
+    let cleared = (0..count)
+        .map(|n| format!("  pressed[{n}] = false;\n  lastEdge[{n}] = 0;\n  count[{n}] = 0;\n"))
+        .collect::<String>();
+    let mut includes = String::from("#include <Wire.h>\n");
+    let mut objects = String::new();
+    let mut setup = String::from("  Wire.begin();\n");
+    let mut show = String::new();
+    if module.oled {
+        includes.push_str("#include <Adafruit_GFX.h>\n#include <Adafruit_SSD1306.h>\n");
+        objects.push_str("Adafruit_SSD1306 lcd(128, 64, &Wire, -1);\n");
+        setup.push_str(
+            "  lcd.begin(SSD1306_SWITCHCAPVCC, 0x3C);\n  lcd.clearDisplay();\n  lcd.setTextSize(2);\n  lcd.setTextColor(SSD1306_WHITE);\n",
+        );
+        for n in 0..count {
+            show.push_str(&format!(
+                "  lcd.setCursor(0, {});\n  lcd.print(F(\"B{}=\"));\n  lcd.print(count[{}]);\n",
+                n * 24,
+                n + 1,
+                n
+            ));
+        }
+        show.push_str("  lcd.display();\n");
+    } else {
+        includes.push_str("#include <LiquidCrystal_I2C.h>\n");
+        objects.push_str(&format!(
+            "LiquidCrystal_I2C lcd(0x27, {}, {});\n",
+            module.cols, module.rows
+        ));
+        setup.push_str("  lcd.init();\n  lcd.backlight();\n");
+        for n in 0..count {
+            show.push_str(&format!(
+                "  lcd.setCursor(0, {n});\n  lcd.print(F(\"B{}={{}}\"));\n  lcd.print(count[{n}]);\n",
+                n + 1
+            ));
+        }
+    }
+    let mut loop_body = String::new();
+    for n in 0..count {
+        loop_body.push_str(&format!(
+            "    bool now{n} = digitalRead(BUTTONS[{n}]) == LOW;\n    if (now{n} != pressed[{n}] && millis() - lastEdge[{n}] > DEBOUNCE_MS) {{\n      lastEdge[{n}] = millis();\n      pressed[{n}] = now{n};\n      if (now{n}) {{\n        count[{n}]++;\n        changed = true;\n      }}\n    }}\n"
+        ));
+    }
+    let comment = if ru {
+        "// Кнопки на D2..D5, экран по I2C: SDA — A4, SCL — A5."
+    } else {
+        "// Buttons on D2..D5, display over I2C: SDA on A4, SCL on A5."
+    };
+    format!(
+        "{comment}\n{includes}{objects}\nconst uint8_t BUTTONS[] = {{{pins}}};\nconst uint8_t BUTTON_COUNT = {count};\nconst uint16_t DEBOUNCE_MS = 30;\nbool pressed[{count}] = {{false}};\nuint32_t lastEdge[{count}] = {{0}};\nuint32_t count[{count}] = {{0}};\n\nvoid setup() {{\n{setup}  for (uint8_t i = 0; i < BUTTON_COUNT; i++) pinMode(BUTTONS[i], INPUT_PULLUP);\n{cleared}}}\n\nvoid loop() {{\n  bool changed = false;\n{loop_body}  if (changed) {{\n{show}  }}\n  delay(20);\n}}\n"
+    )
+}
+
 /// A sketch that prints one message on every display. The address of each
 /// board is printed under the message on a character LCD, so a second board
 /// that answers at another address is easy to spot.
@@ -1527,6 +1752,7 @@ fn lesson_build(
     i: usize,
     screens: Option<crate::parse::Screens>,
     choice: usize,
+    spoken_pin: Option<u8>,
 ) -> (Circuit, String, L, Vec<L>) {
     use crate::lessons::{Extra, LoadKind};
 
@@ -1578,16 +1804,31 @@ fn lesson_build(
 
     // Signal wiring from the table. A board pin that the table names but the
     // module does not have is a data bug; skip it instead of panicking.
-    for (pin, target) in l.wires {
+    // A pin the sentence named ("к пину D5") moves the lesson's first digital
+    // signal there: the lesson is a starting point, not an excuse to ignore
+    // the wiring the user asked for.
+    let mut moved_pin = false;
+    for (pin_name, target) in l.wires {
         let source = boards.iter().copied().find(|&p| {
             b.c.parts[p]
                 .pins
                 .iter()
-                .any(|&q| b.c.pins[q].name == *pin)
+                .any(|&q| b.c.pins[q].name == *pin_name)
         });
         let Some(part) = source else { continue };
-        let a = b.mp(part, pin);
-        let z = b.target(target);
+        let a = b.mp(part, pin_name);
+        let is_digital = target
+            .strip_prefix('D')
+            .is_some_and(|n| n.parse::<u8>().is_ok());
+        let moved = spoken_pin.is_some() && is_digital && !moved_pin;
+        if moved {
+            moved_pin = true;
+        }
+        let z = if moved {
+            b.uno_pin(&format!("D{}", spoken_pin.unwrap()))
+        } else {
+            b.target(target)
+        };
         let class = match *target {
             "GND" => NetClass::Gnd,
             "5V" | "VCC" | "3V3" => NetClass::Vcc,
@@ -3227,7 +3468,8 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         let screens = intent.named.screens;
         let plan = display_lesson_plan(i, screens, lang);
         let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
-        let (circuit, code, summary, notes) = lesson_build(lang, i, screens, choice);
+        let (circuit, code, summary, notes) =
+            lesson_build(lang, i, screens, choice, intent.named.pin);
         let mut built = Built {
             tid: Tid::Lesson(i),
             title: plan.title_text(lang),
@@ -3239,6 +3481,31 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         };
         augment_built(&mut built, intent.named, lang);
         apply_spoken_numbers(&mut built.code, &intent.raw);
+        return Some(built);
+    }
+    // A screen with only buttons is its own honest circuit: count the presses
+    // on the display. The old fallback drew an LED the sentence never named.
+    if intent.task.wants_buttons_screen() {
+        let screens = intent.named.screens.unwrap_or(crate::parse::Screens {
+            kind: ScreenKind::Any,
+            count: 1,
+            matrix: false,
+            segments: false,
+        });
+        let plan = buttons_screen_plan(screens, lang);
+        let choice = choice.min(plan.choices.len() - 1);
+        let (circuit, code, summary, notes) =
+            buttons_screen_build(lang, screens, intent.named.button, choice);
+        let mut built = Built {
+            tid: Tid::ButtonsScreen,
+            title: plan.title_text(lang),
+            circuit,
+            code,
+            choice,
+            summary,
+            notes,
+        };
+        augment_built(&mut built, intent.named, lang);
         return Some(built);
     }
     // Most routes left here are LEDs, buzzers and buttons and cannot host a
@@ -3281,7 +3548,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         Tid::Gsm => gsm(lang, choice),
         Tid::Ethernet => ethernet(lang, choice),
         Tid::Composed => return crate::compose::build(intent.recipe?, choice, lang),
-        Tid::Lesson(_) | Tid::TextScreens => return None,
+        Tid::Lesson(_) | Tid::TextScreens | Tid::ButtonsScreen => return None,
     };
     let mut built = Built {
         tid,
@@ -5754,6 +6021,40 @@ mod tests {
     use super::*;
     use crate::parse::{parse, Action, Input, Load};
 
+    /// The percentage under the plan is the evidence-weighted share of the
+    /// typed task the circuit closes, not a count of matched keywords. The
+    /// open slot is named instead of hidden.
+    #[test]
+    fn the_explanation_counts_closed_slots() {
+        use crate::text::Lang;
+        let parsed = parse("светодиод и кнопка");
+        let chosen = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let why = chosen.why.expect("an explanation");
+        assert!(why.contains("покрытие слотов 100%"), "{why}");
+        assert!(!why.contains("уверенность"), "{why}");
+
+        let parsed = parse("светодиод и экран");
+        let chosen = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let why = chosen.why.expect("an explanation");
+        assert!(why.contains("не закрыто: экран"), "{why}");
+    }
+
+    /// A pin the sentence names moves the lesson's first digital signal
+    /// there. "Датчик звука к пину D5" used to leave D5 unwired.
+    #[test]
+    fn a_spoken_pin_moves_the_lesson_signal() {
+        use crate::text::Lang;
+        let parsed = parse("датчик звука к пину D5");
+        assert!(parsed.intent.lesson.is_some(), "{:?}", parsed.intent.lesson);
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let missing = crate::requirements::missing(&built, &parsed.intent);
+        assert!(
+            missing.iter().all(|m| m.name.ru != "пин"),
+            "{:?}",
+            missing.iter().map(|m| m.name.ru).collect::<Vec<_>>()
+        );
+    }
+
     /// A task that sends a sensor struct from one board to another is not the
     /// one-board test pair: it names the DHT and both roles in one sketch.
     #[test]
@@ -6197,6 +6498,7 @@ mod tests {
             let intent = Intent {
                 load,
                 input,
+                    task: Default::default(),
                 named: Default::default(),
                 transistor: false,
                 presses: false,
@@ -6461,6 +6763,7 @@ mod tests {
     fn every_lesson_of_books_one_to_three_passes_its_checks() {
         for (i, l) in crate::lessons::ALL.iter().enumerate() {
             let intent = Intent {
+                task: Default::default(),
                 load: Load::Led,
                 input: None,
                 named: Default::default(),
@@ -6511,6 +6814,7 @@ mod tests {
         use crate::model::Kind;
         for (i, l) in crate::lessons::ALL.iter().enumerate() {
             let intent = Intent {
+                task: Default::default(),
                 load: Load::Led,
                 input: None,
                 named: Default::default(),
@@ -6712,6 +7016,7 @@ mod tests {
     #[test]
     fn every_part_on_the_board_is_in_the_bill() {
         let intent = Intent {
+            task: Default::default(),
             load: Load::Motor,
             input: Some(Input::Button),
             named: Default::default(),

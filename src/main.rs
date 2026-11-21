@@ -30,6 +30,7 @@ mod semantics;
 mod spec;
 mod style;
 mod svg;
+mod task;
 mod templates;
 mod text;
 mod theme;

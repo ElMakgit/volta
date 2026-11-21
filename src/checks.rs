@@ -1226,6 +1226,7 @@ mod tests {
                 let intent = Intent {
                     load,
                     input,
+                    task: Default::default(),
                     named: Default::default(),
                     transistor: false,
                     presses: false,
@@ -1247,6 +1248,7 @@ mod tests {
     #[test]
     fn a_hand_drawn_circuit_still_gets_the_supply_checks() {
         let intent = Intent {
+            task: Default::default(),
             load: Load::Motors,
             input: None,
             named: Default::default(),
@@ -1271,6 +1273,7 @@ mod tests {
 
         // A hungry module reports its own supply even without a sketch.
         let gsm = Intent {
+            task: Default::default(),
             load: Load::Gsm,
             input: None,
             named: Default::default(),
@@ -1378,6 +1381,7 @@ mod tests {
 
     fn one_led() -> Built {
         let intent = Intent {
+            task: Default::default(),
             load: Load::Led,
             input: None,
             named: Default::default(),

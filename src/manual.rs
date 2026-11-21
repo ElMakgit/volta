@@ -2003,6 +2003,7 @@ mod tests {
     #[test]
     fn an_ai_circuit_survives_the_handover() {
         let intent = Intent {
+            task: Default::default(),
             load: crate::parse::Load::Motor,
             input: Some(crate::parse::Input::Button),
             named: Default::default(),

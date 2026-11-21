@@ -8,7 +8,7 @@
 use crate::text::L;
 
 /// A sensor the composer knows how to read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum SourceId {
     Gas,
     Alcohol,

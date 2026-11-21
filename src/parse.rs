@@ -4,9 +4,10 @@
 //! offline, it is predictable, and when it does not understand something it
 //! says so instead of inventing a circuit.
 
+use crate::task::{ControlSlot, CountKind, LinkKind, LinkRole, OutputKind, OutputSlot, ScreenSlot, SensorSlot, Task};
 use crate::text::{L, Lang};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Load {
     /// One DC motor on a transistor or relay.
     Motor,
@@ -35,7 +36,7 @@ pub enum Load {
     Ethernet,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Input {
     Button,
     Pot,
@@ -45,7 +46,7 @@ pub enum Input {
 /// What the sentence asks the circuit to do. The planner still picks the
 /// circuit by load and input; the action explains the choice to the user and
 /// feeds the "steps" flag where the words mean discrete presses.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Action {
     Blink,
     Fade,
@@ -73,6 +74,9 @@ impl Action {
 pub struct Intent {
     pub load: Load,
     pub input: Option<Input>,
+    /// The typed task behind this reading: every named part is a slot with
+    /// its evidence, and the plan is judged by the slots it closes.
+    pub task: crate::task::Task,
     /// The parts, sensors and roles the sentence names, extracted once by
     /// `named_devices`. The builder and the checklist both read this object,
     /// so they cannot disagree about what the task asked for.
@@ -528,6 +532,186 @@ fn input_label(input: Input) -> L {
     }
 }
 
+/// A template load as a typed output slot. The enum is wider because a relay
+/// and a plain LED are different outputs even though both route through the
+/// light templates.
+fn output_kind(load: Load) -> OutputKind {
+    match load {
+        Load::Led => OutputKind::Led,
+        Load::Lamp => OutputKind::Lamp,
+        Load::Motor => OutputKind::Motor,
+        Load::Motors => OutputKind::Motors,
+        Load::Stepper => OutputKind::Stepper,
+        Load::Servo => OutputKind::Servo,
+        Load::Buzzer => OutputKind::Buzzer,
+        Load::Rfid => OutputKind::Rfid,
+        Load::Radio433 => OutputKind::Radio433,
+        Load::RadioNrf => OutputKind::RadioNrf,
+        Load::Bluetooth => OutputKind::Bluetooth,
+        Load::Gsm => OutputKind::Gsm,
+        Load::Ethernet => OutputKind::Ethernet,
+    }
+}
+
+/// Evidence strength: a board or a model is stronger than a technical noun,
+/// which is stronger than an everyday synonym. The numbers are weights, not
+/// votes: "RFID" outweighs "светодиод" even when both match one keyword.
+fn output_specificity(kind: OutputKind) -> u8 {
+    match kind {
+        OutputKind::Rfid
+        | OutputKind::RadioNrf
+        | OutputKind::Bluetooth
+        | OutputKind::Gsm
+        | OutputKind::Ethernet
+        | OutputKind::Stepper
+        | OutputKind::Motors
+        | OutputKind::Lamp
+        | OutputKind::Relay => 3,
+        OutputKind::Motor
+        | OutputKind::Servo
+        | OutputKind::Buzzer
+        | OutputKind::Radio433 => 2,
+        OutputKind::Led => 1,
+    }
+}
+
+fn output_count(kind: OutputKind, named: &NamedDevices) -> usize {
+    let count = match kind {
+        OutputKind::Led => named.led.max(named.rgb).max(1),
+        OutputKind::Motor => named.motor.max(1),
+        OutputKind::Servo => named.servo.max(1),
+        OutputKind::Buzzer => named.buzzer.max(1),
+        OutputKind::Relay => named.relay.max(1),
+        OutputKind::Rfid => 1,
+        OutputKind::Radio433 | OutputKind::RadioNrf => {
+            if named.radio_pair {
+                2
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    };
+    count
+}
+
+fn control_count(kind: Input, named: &NamedDevices) -> usize {
+    match kind {
+        Input::Button => named.button.max(1),
+        Input::Pot | Input::Ldr => 1,
+    }
+}
+
+fn control_specificity(kind: Input) -> u8 {
+    match kind {
+        Input::Button => 1,
+        Input::Pot | Input::Ldr => 2,
+    }
+}
+
+/// Evidence, not a vote count. How many times a stem matched or how many
+/// synonyms a table row holds must not outrank a named board: "драйвер
+/// двигателей и мотор" says "двигател" twice, but the driver is still the
+/// subject. Counts belong to the build, not to the reading.
+fn output_score(slot: &OutputSlot) -> u32 {
+    u32::from(slot.specificity) * 10
+}
+
+fn control_score(slot: &ControlSlot) -> u32 {
+    u32::from(slot.specificity) * 10
+}
+
+/// The first token a group's keywords point at. Used only to order two equal
+/// readings by what the sentence said first; it is not a group index.
+fn first_hit(text: &str, hits: &[String]) -> usize {
+    hits.iter()
+        .filter_map(|word| match_indices(text, word).first().copied())
+        .min()
+        .unwrap_or(0)
+}
+
+fn first_word_position(text: &str, word: &str) -> usize {
+    text.split_whitespace()
+        .position(|t| crate::words::mentions(t, word))
+        .unwrap_or(0)
+}
+
+/// The measured slots. A thermistor is its own slot, not a DS18B20: they read
+/// the same quantity through different parts, and a task that names the NTC
+/// must not be answered by the digital sensor.
+fn sensor_slots(
+    named: &NamedDevices,
+    raw: &str,
+    condition: Option<crate::spec::Condition>,
+) -> Vec<SensorSlot> {
+    use crate::spec::SourceId;
+    let mut out: Vec<SensorSlot> = Vec::new();
+    let mut add = |source: SourceId, count: usize, words: Vec<String>| {
+        if count == 0 || out.iter().any(|s| s.source == source) {
+            return;
+        }
+        out.push(SensorSlot {
+            source,
+            count,
+            words,
+            condition,
+            at: 0,
+        });
+    };
+    let thermistor = crate::compose::source_in_text(raw)
+        .is_some_and(|s| s.id == SourceId::Thermistor);
+    if thermistor {
+        add(SourceId::Thermistor, named.temperature.max(1), vec!["термистор".into()]);
+    } else if named.temperature > 0 {
+        add(SourceId::Temperature, named.temperature, vec!["температура".into()]);
+    }
+    add(SourceId::Humidity, named.humidity, vec!["влажность".into()]);
+    add(SourceId::Soil, named.soil, vec!["почва".into()]);
+    add(SourceId::Pressure, named.pressure, vec!["давление".into()]);
+    add(SourceId::Light, named.light, vec!["свет".into()]);
+    add(SourceId::Range, named.range, vec!["расстояние".into()]);
+    add(SourceId::Gas, named.gas, vec!["газ".into()]);
+    out
+}
+
+fn link_slots(outputs: &[OutputSlot], named: &NamedDevices) -> Vec<(LinkKind, LinkRole)> {
+    let mut out = Vec::new();
+    let mut add = |kind: LinkKind, role: LinkRole| {
+        if !out.iter().any(|(k, _)| *k == kind) {
+            out.push((kind, role));
+        }
+    };
+    for slot in outputs {
+        match slot.kind {
+            OutputKind::Rfid => add(LinkKind::Rfid, LinkRole::Reader),
+            OutputKind::Radio433 => add(
+                LinkKind::Radio433,
+                if named.radio_pair {
+                    LinkRole::Peer
+                } else {
+                    LinkRole::Transmitter
+                },
+            ),
+            OutputKind::RadioNrf => add(
+                LinkKind::RadioNrf,
+                if named.radio_pair {
+                    LinkRole::Peer
+                } else {
+                    LinkRole::Transmitter
+                },
+            ),
+            OutputKind::Bluetooth => add(LinkKind::Bluetooth, LinkRole::Peer),
+            OutputKind::Gsm => add(LinkKind::Gsm, LinkRole::Gateway),
+            OutputKind::Ethernet => add(LinkKind::Ethernet, LinkRole::Gateway),
+            _ => {}
+        }
+    }
+    if named.tsop {
+        add(LinkKind::Ir, LinkRole::Receiver);
+    }
+    out
+}
+
 /// A short name for what a load-plus-input pair builds, used on the buttons
 /// that offer another reading of an ambiguous sentence.
 fn plan_label(load: Load, input: Option<Input>) -> L {
@@ -612,7 +796,7 @@ fn sd_storage(text: &str) -> bool {
 
 /// A display asked for in words. A book task names the lesson's sensor, but
 /// the reader still has to honour "на любой тип дисплея" or "два экрана".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScreenKind {
     Any,
     Lcd,
@@ -1603,45 +1787,27 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     let mut understood = Vec::new();
     let mut trace = vec![format!("text: {text}")];
 
-    // Specific boards come before the generic word "мотор", otherwise an
-    // L298N task would be read as a single-transistor motor switch.
+    // The keyword tables name parts. The decision is made by the typed slots
+    // below: each slot carries its own pointing evidence, and the array order
+    // is vocabulary order, never a tie-break.
     let load_groups = [
         &STEPPER, &MOTORS, &RFID, &RADIO_NRF, &RADIO433, &BLUETOOTH, &GSM, &ETHERNET,
         &MOTOR, &SERVO, &BUZZER, &LAMP, &LED,
     ];
     let load_votes = votes(&text, &load_groups);
-    for (i, h) in &load_votes {
-        trace.push(format!(
-            "load group {}: [{}]",
-            load_groups[*i].label.ru,
-            h.join(", ")
-        ));
-    }
-    let (mut load, mut load_hits) = match load_votes.first() {
-        Some((i, h)) => (load_at(*i), h.clone()),
-        None => (Load::Led, Vec::new()),
-    };
-    // A named board is the subject of the sentence; an LED next to it is the
-    // indicator it drives. "RFID и светодиод" is an RFID task, not a blink,
-    // and the LED is then added to the RFID circuit instead of replacing it.
-    if load == Load::Led {
-        if let Some((i, h)) = load_votes.iter().find(|(i, _)| {
-            matches!(
-                load_at(*i),
-                Load::Rfid
-                    | Load::Radio433
-                    | Load::RadioNrf
-                    | Load::Bluetooth
-                    | Load::Gsm
-                    | Load::Ethernet
-                    | Load::Stepper
-                    | Load::Motors
-            )
-        }) {
-            load = load_at(*i);
-            load_hits = h.clone();
-        }
-    }
+    let mut outputs: Vec<OutputSlot> = load_votes
+        .iter()
+        .map(|(i, h)| {
+            let kind = output_kind(load_at(*i));
+            OutputSlot {
+                kind,
+                count: output_count(kind, &named),
+                words: h.clone(),
+                specificity: output_specificity(kind),
+                at: first_hit(&text, h),
+            }
+        })
+        .collect();
     // An incandescent lamp is a heavy load, not an LED, although the LED
     // group also knows the word "лампа". It only overrides a plain light: a
     // named board still wins, and a light-sensor task that merely mentions a
@@ -1662,61 +1828,133 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         && !text.contains("инкубатор")
         && !text.contains("термостат")
         && !text.contains("светодиодн");
-    if lamp_task && (load == Load::Led || load_hits.is_empty()) {
-        load = Load::Lamp;
-        load_hits = hits(&text, &LAMP);
-        if load_hits.is_empty() {
-            load_hits.push("лампа".to_string());
-        }
-    }
-    // A driver is a named board, not a single transistor switch. "Драйвер
-    // двигателей и мотор" names the driver twice, and the generic "мотор"
-    // wins the vote on its own; the named board is still the subject.
-    if load == Load::Motor {
-        if let Some((_, h)) = load_votes
-            .iter()
-            .find(|(i, _)| matches!(load_at(*i), Load::Motors))
-        {
-            load = Load::Motors;
-            load_hits = h.clone();
+    if lamp_task {
+        outputs.retain(|s| s.kind != OutputKind::Led);
+        if !outputs.iter().any(|s| s.kind == OutputKind::Lamp) {
+            outputs.push(OutputSlot {
+                kind: OutputKind::Lamp,
+                count: 1,
+                words: vec!["лампа накаливания".to_string()],
+                specificity: output_specificity(OutputKind::Lamp),
+                at: 0,
+            });
         }
     }
     // "Приёмник" is also an IR receiver, and "карта" is also an SD card. Both
     // have their own lessons; letting the radio or RFID group win on the
-    // shared word builds a plausible but wrong circuit. Drop the group and
-    // let the lesson lookup name the real part.
-    if load == Load::Radio433 && ir_part(&text) && !radio_433_context(&text) {
-        trace.push("context: IR receiver is not a 433 MHz radio".to_string());
-        load = Load::Led;
-        load_hits.clear();
+    // shared word builds a plausible but wrong circuit. Drop the slot and let
+    // the lesson lookup name the real part.
+    if ir_part(&text) && !radio_433_context(&text) {
+        if outputs.iter().any(|s| s.kind == OutputKind::Radio433) {
+            trace.push("context: IR receiver is not a 433 MHz radio".to_string());
+        }
+        outputs.retain(|s| s.kind != OutputKind::Radio433);
     }
-    if load == Load::Rfid && sd_storage(&text) {
-        trace.push("context: SD card is not an RFID tag".to_string());
-        load = Load::Led;
-        load_hits.clear();
+    if sd_storage(&text) {
+        if outputs.iter().any(|s| s.kind == OutputKind::Rfid) {
+            trace.push("context: SD card is not an RFID tag".to_string());
+        }
+        outputs.retain(|s| s.kind != OutputKind::Rfid);
     }
-    let named_load = !load_hits.is_empty();
+    // A relay is a real output, but it has no template route of its own: it
+    // is a sink of a composition or an added part. Keep it as a slot so a
+    // plan that ignores it is visible, but never let it outrank a routable
+    // load in the primary reading.
+    if named.relay > 0 && !outputs.iter().any(|s| s.kind == OutputKind::Relay) {
+        outputs.push(OutputSlot {
+            kind: OutputKind::Relay,
+            count: named.relay,
+            words: vec!["реле".to_string()],
+            specificity: 3,
+            at: first_word_position(&text, "реле"),
+        });
+    }
+    // Rank by evidence, then by what the sentence said first. Two equal
+    // readings stay equal: that is an ambiguity to show, not a table index to
+    // break.
+    outputs.sort_by(|a, b| {
+        output_score(b)
+            .cmp(&output_score(a))
+            .then(a.at.cmp(&b.at))
+    });
+    for slot in &outputs {
+        trace.push(format!(
+            "output: {} (evidence {}, first at {}) [{}]",
+            slot.kind.label().ru,
+            slot.specificity,
+            slot.at,
+            slot.words.join(", ")
+        ));
+    }
+    let named_load = outputs.iter().any(|s| s.kind.load().is_some());
     if !named_load {
         trace.push("load: default (no load word)".to_string());
     }
+    let mut load = outputs
+        .iter()
+        .find_map(|s| s.kind.load())
+        .unwrap_or(Load::Led);
+    let load_hits: Vec<String> = outputs
+        .iter()
+        .find(|s| s.kind.load() == Some(load))
+        .map(|s| s.words.clone())
+        .unwrap_or_default();
+    if outputs.len() > 1 {
+        let top = output_score(&outputs[0]);
+        let second = output_score(&outputs[1]);
+        if top.saturating_sub(second) <= 5 {
+            trace.push(format!(
+                "output: near tie, readings offered ({} vs {})",
+                outputs[0].kind.label().ru, outputs[1].kind.label().ru
+            ));
+        }
+    }
     trace.push(format!("load: {:?} [{}]", load, load_hits.join(", ")));
-    matched.extend(load_hits);
+    matched.extend(load_hits.clone());
     if named_load {
         understood.push(load_label(load));
     }
 
     let input_groups = [&BUTTON, &POT, &LDR];
     let input_votes = votes(&text, &input_groups);
-    let (input, input_hits) = match input_votes.first() {
-        Some((i, h)) => (Some(input_at(*i)), h.clone()),
-        None => (None, Vec::new()),
-    };
+    let mut controls: Vec<ControlSlot> = input_votes
+        .iter()
+        .map(|(i, h)| {
+            let kind = input_at(*i);
+            ControlSlot {
+                kind,
+                count: control_count(kind, &named),
+                words: h.clone(),
+                specificity: control_specificity(kind),
+                at: first_hit(&text, h),
+            }
+        })
+        .collect();
+    controls.sort_by(|a, b| {
+        control_score(b)
+            .cmp(&control_score(a))
+            .then(a.at.cmp(&b.at))
+    });
+    let mut input = controls.first().map(|c| c.kind);
+    let input_hits: Vec<String> = controls
+        .first()
+        .map(|c| c.words.clone())
+        .unwrap_or_default();
     let named_input = !input_hits.is_empty();
     trace.push(format!(
         "input: {:?} [{}]",
         input,
         input_hits.join(", ")
     ));
+    for slot in &controls {
+        trace.push(format!(
+            "control: {:?} (evidence {}, first at {}) [{}]",
+            slot.kind,
+            slot.specificity,
+            slot.at,
+            slot.words.join(", ")
+        ));
+    }
     matched.extend(input_hits);
     if let Some(i) = input {
         understood.push(input_label(i));
@@ -1748,7 +1986,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         .find_map(|(a, g)| (!hits(&text, g).is_empty()).then_some(*a));
     trace.push(format!("action: {:?}", action));
 
-    let semantic = crate::templates::route(load, input);
+    let mut semantic = crate::templates::route(load, input);
     // A clock is a noun ("часы"), not a duration ("каждый час"). The
     // distinction matters: "часы и пьезо" is an alarm clock, while "мигать
     // каждый час" is just a timer.
@@ -1930,6 +2168,89 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         understood = crate::compose::recipe_words(r);
     }
 
+    // Layer 4: every named part becomes a typed slot with its evidence. The
+    // template and the checklist both read this object, so "the plan closes
+    // what the sentence asked for" is a check on data, not on a vote count.
+    let mut task = Task::new(raw);
+    task.outputs = outputs.clone();
+    task.controls = controls.clone();
+    if let Some(screens) = named.screens {
+        let words: Vec<String> = screens_in(raw)
+            .map(|_| {
+                ["дисплей", "экран", "lcd", "oled", "матричн", "семисегмент"]
+                    .iter()
+                    .filter(|w| text.contains(*w))
+                    .map(|w| (*w).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        task.screens
+            .push(ScreenSlot::from_screens(screens, words, 0));
+    }
+    if let Some(c) = condition {
+        task.conditions.push(c);
+    }
+    if let Some(a) = action {
+        task.behaviors.push(a);
+    }
+    task.named = named;
+    task.lesson = lesson;
+    task.recipe = recipe;
+    task.text_screens = text_screens;
+    task.transistor = transistor;
+    task.presses = presses;
+    task.primary = outputs
+        .iter()
+        .find(|s| s.kind.load() == Some(load))
+        .map(|s| s.kind);
+    task.primary_control = input;
+    task.sensors = sensor_slots(&named, raw, condition);
+    task.links = link_slots(&outputs, &named);
+    task.counts.set(CountKind::Led, named.led);
+    task.counts.set(CountKind::Rgb, named.rgb);
+    task.counts.set(CountKind::Button, named.button);
+    task.counts.set(CountKind::Motor, named.motor);
+    task.counts.set(CountKind::Servo, named.servo);
+    task.counts.set(CountKind::Buzzer, named.buzzer);
+    task.counts.set(CountKind::Relay, named.relay);
+    task.counts
+        .set(CountKind::Screen, named.screens.map(|s| s.count).unwrap_or(0));
+    for slot in &task.sensors {
+        task.counts.set(CountKind::Sensor(slot.source), slot.count);
+    }
+    trace.push(format!(
+        "task: outputs {:?}, controls {:?}, sensors {:?}, screens {}, links {:?}",
+        task.outputs.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        task.controls.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        task.sensors.iter().map(|s| s.source).collect::<Vec<_>>(),
+        task.screens.len(),
+        task.links
+    ));
+
+    // The template is chosen by the slots it closes, not by which keyword
+    // group won. A lesson or a composition is already a complete reading;
+    // only the built-in templates go through this comparison.
+    if lesson.is_none() && recipe.is_none() && text_screens.is_none() && !task.outputs.is_empty()
+    {
+        if let Some((chosen_load, chosen_input)) = task.best_route() {
+            if chosen_load != load || chosen_input != input {
+                trace.push(format!(
+                    "route: coverage picks {:?} + {:?}, was {:?} + {:?}",
+                    chosen_load, chosen_input, load, input
+                ));
+                load = chosen_load;
+                input = chosen_input;
+                semantic = crate::templates::route(load, input);
+                task.primary = task
+                    .outputs
+                    .iter()
+                    .find(|s| s.kind.load() == Some(load))
+                    .map(|s| s.kind);
+                task.primary_control = input;
+            }
+        }
+    }
+
     // A sentence that names only an input still builds when the plan really
     // uses that input: a button switches the LED, a photoresistor makes the
     // night light. A knob that the plan would ignore is not a plan.
@@ -1963,68 +2284,94 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         Some(ref msg) => format!("unsupported: {}", msg.ru),
         None => "unsupported: none".to_string(),
     });
-    // Ambiguity is answered with one-click readings instead of a silent
-    // coin toss: two loads named with equal force, or two inputs.
-    let intent_of = |load: Load, input: Option<Input>| Intent {
-        load,
-        input,
-        named,
-        transistor,
-        presses,
-        lesson: None,
-        action,
-        condition,
-        recipe,
-        text_screens,
-        raw: raw.to_string(),
+    // Ambiguity is answered with one-click readings instead of a silent coin
+    // toss. The alternatives are the other slots the sentence actually
+    // named, never an unrelated load the parser happened to know.
+    let intent_of = |load: Load, input: Option<Input>| {
+        let mut reading = task.clone();
+        reading.primary = reading
+            .outputs
+            .iter()
+            .find(|s| s.kind.load() == Some(load))
+            .map(|s| s.kind);
+        reading.primary_control = input;
+        Intent {
+            load,
+            input,
+            task: reading,
+            named,
+            transistor,
+            presses,
+            lesson: None,
+            action,
+            condition,
+            recipe,
+            text_screens,
+            raw: raw.to_string(),
+        }
     };
     let mut alternatives = Vec::new();
-    // A tie is a tie, but so is a one-vote lead on a short match: "реле и
-    // мотор" should not silently build a relay switch when the sentence names
-    // both. A real lesson or recipe is specific enough to stand alone.
-    let top_load = load_votes.first().map(|(_, h)| h.len()).unwrap_or(0);
-    let second_load = load_votes.get(1).map(|(_, h)| h.len()).unwrap_or(0);
-    let tied = load_votes.len() > 1 && second_load == top_load;
-    let near_tie = load_votes.len() > 1
-        && top_load <= 3
-        && second_load + 1 >= top_load
-        && lesson.is_none()
-        && recipe.is_none()
-        && text_screens.is_none();
-    if tied || near_tie {
-        if near_tie && !tied {
-            trace.push("load: near tie, offering readings".to_string());
-        }
-        for (i, h) in load_votes.iter().skip(1).take(2) {
-            let other = load_at(*i);
-            if h.len() + 1 < top_load {
+    // Alternatives are the other readings of this sentence: each one is
+    // another output or control the words actually named. A phrase that
+    // names an LED and a button never gets a motor or a servo offered: those
+    // are different questions, not a different reading of this one.
+    if outputs.len() > 1 && lesson.is_none() && recipe.is_none() && text_screens.is_none() {
+        for slot in outputs.iter().filter(|s| s.kind.load() != Some(load)) {
+            let Some(kind) = slot.kind.load() else {
+                continue;
+            };
+            if crate::templates::route(kind, input).is_none() {
                 continue;
             }
-            if other != load
-                && crate::templates::route(other, input).is_some()
-                && alternatives.len() < 2
-            {
-                alternatives.push(Alternative {
-                    label: plan_label(other, input),
-                    intent: intent_of(other, input),
-                    note: None,
-                });
+            // A reading that silently drops a named screen is not an
+            // alternative: it is the same "similar circuit" this layer
+            // exists to stop. The access scene is the exception, because its
+            // screen is part of the lock.
+            if named.screens.is_some() && !matches!(kind, Load::Rfid) {
+                continue;
             }
+            if alternatives.len() >= 2 {
+                break;
+            }
+            alternatives.push(Alternative {
+                label: plan_label(kind, input),
+                intent: intent_of(kind, input),
+                note: Some(format!("другое прочтение: {}", slot.words.join(", "))),
+            });
+        }
+        if !alternatives.is_empty() {
+            trace.push(format!(
+                "output: readings offered: {}",
+                alternatives
+                    .iter()
+                    .map(|a| a.label.ru)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            ));
         }
     }
-    if input_votes.len() > 1 && input_votes[1].1.len() == input_votes[0].1.len() {
-        for (i, _) in input_votes.iter().skip(1).take(2) {
-            let other = Some(input_at(*i));
-            if other != input
-                && crate::templates::route(load, other).is_some()
-                && alternatives.len() < 2
-            {
-                alternatives.push(Alternative {
-                    label: input_label(input_at(*i)),
-                    intent: intent_of(load, other),
-                    note: None,
-                });
+    // The other control is a different reading only when the named output can
+    // actually use it and the sentence really named that control. A button
+    // the user never mentioned is not an alternative to a potentiometer.
+    if named_load
+        && controls.len() > 1
+        && lesson.is_none()
+        && recipe.is_none()
+        && text_screens.is_none()
+    {
+        for slot in controls.iter().filter(|c| Some(c.kind) != input) {
+            let other = Some(slot.kind);
+            if crate::templates::route(load, other).is_none() {
+                continue;
             }
+            if alternatives.len() >= 2 {
+                break;
+            }
+            alternatives.push(Alternative {
+                label: plan_label(load, other),
+                intent: intent_of(load, other),
+                note: Some(format!("другое прочтение: {}", slot.words.join(", "))),
+            });
         }
     }
     // "По радио" names a link, not its band. Offer the 2.4 GHz board next to
@@ -2043,26 +2390,13 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         alternatives.push(Alternative {
             label: plan_label(Load::RadioNrf, input),
             intent: intent_of(Load::RadioNrf, input),
-            note: None,
+            note: Some("другой диапазон: 2.4 ГГц".to_string()),
         });
     }
-    // Nothing was named as a load but an input was: offer the circuits that
-    // can use that input instead of guessing one.
-    if !named_load && named_input && alternatives.is_empty() {
-        for candidate in [load, Load::Motor, Load::Servo, Load::Buzzer] {
-            if candidate == load || crate::templates::route(candidate, input).is_none() {
-                continue;
-            }
-            if alternatives.len() >= 2 {
-                break;
-            }
-            alternatives.push(Alternative {
-                label: plan_label(candidate, input),
-                intent: intent_of(candidate, input),
-                note: None,
-            });
-        }
-    }
+    // Nothing is invented for an input-only phrase: a button with no output
+    // is either the LED reading the template already offers or a genuinely
+    // unsupported sentence. The old list (motor, servo, buzzer) was the
+    // parser guessing loads the user never said.
 
     // The printed task is a suggestion, not a silent replacement: the
     // sentence as written is what gets built, and the book reading waits one
@@ -2097,6 +2431,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         intent: Intent {
             load,
             input,
+            task,
             named,
             transistor,
             presses,
@@ -2442,16 +2777,46 @@ mod tests {
         assert_eq!(report.failed(), 0);
     }
 
-    /// A near-tie is not a decision: the second reading is offered too.
+    /// A phrase that names several outputs offers the other named outputs as
+    /// readings. It never offers a load the sentence did not name.
     #[test]
-    fn a_one_vote_lead_still_offers_the_other_reading() {
+    fn a_second_named_output_is_a_reading() {
         let p = parse("светодиод и лампа и мотор");
         assert!(!p.alternatives.is_empty(), "understood {:?}", p.understood);
+        let labels: Vec<&str> = p
+            .alternatives
+            .iter()
+            .map(|a| a.label.ru)
+            .collect();
         assert!(
-            p.trace.iter().any(|line| line.contains("near tie")),
+            labels.iter().any(|l| l.contains("двигатель") || l.contains("светодиод")),
+            "{labels:?}"
+        );
+        assert!(
+            p.trace.iter().any(|line| line.contains("readings offered")),
             "{:?}",
             p.trace
         );
+    }
+
+    /// An output the sentence never named is not an alternative. "Две кнопки
+    /// и дисплей" used to offer a motor and a servo; those are different
+    /// questions, not other readings.
+    #[test]
+    fn alternatives_never_invent_an_output() {
+        for task in ["две кнопки и дисплей", "кнопка и дисплей"] {
+            let p = parse(task);
+            assert!(
+                p.alternatives.iter().all(|a| {
+                    !matches!(
+                        a.intent.load,
+                        Load::Motor | Load::Servo | Load::Buzzer | Load::Motors | Load::Stepper
+                    )
+                }),
+                "{task}: {:?}",
+                p.alternatives.iter().map(|a| a.label.ru.clone()).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// A printed task that never mentions the part the user typed is a

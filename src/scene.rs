@@ -1991,6 +1991,7 @@ mod tests {
                 let intent = Intent {
                     load,
                     input,
+                    task: Default::default(),
                     named: Default::default(),
                     transistor: false,
                     presses: false,
@@ -2050,6 +2051,7 @@ mod tests {
     fn every_lesson_scene_fits_its_frame() {
         for (i, l) in crate::lessons::ALL.iter().enumerate() {
             let intent = Intent {
+                task: Default::default(),
                 load: crate::parse::Load::Led,
                 input: None,
                 named: Default::default(),
