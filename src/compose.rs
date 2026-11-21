@@ -78,7 +78,17 @@ pub fn detect(
     // A named output plus a spoken threshold is a request too: "цвет выше
     // 300, светодиод" has no verb, but it is plainly a lamp on a condition.
     let asks_condition = named_load && condition.is_some();
-    if !asks_action && !explicit_sink && !asks_condition {
+    // A sensor named on its own is a request to read it: the serial monitor
+    // is the natural output and occupies no pin. Without this, "термометр на
+    // термисторе" had no lesson that fit the named part and fell back to
+    // "не нашёл, чем управлять". A lesson the book already answers keeps the
+    // book's own build, unless that build draws a different part: lesson 10
+    // pairs a thermistor with the DS18B20 but its drawing is the DS18B20
+    // alone, so a thermistor sentence is composed from the NTC instead.
+    let source_text = source_scope(&text);
+    let sensor_only = source_in(&source_text)
+        .is_some_and(|s| lesson.is_none() || s.id == SourceId::Thermistor);
+    if !asks_action && !explicit_sink && !asks_condition && !sensor_only {
         return None;
     }
     // A sensor named with an everyday word ("температура", "давление") is
@@ -91,10 +101,12 @@ pub fn detect(
     // a request for a current sensor. Likewise "по алгоритму движения" is a
     // motion program, not the HC-SR501. Both readings come from word stems,
     // so the words are dropped before the source table looks at them.
-    let source_text = source_scope(&text);
-    let source = lesson
-        .and_then(source_for_lesson)
-        .or_else(|| source_in(&source_text))?;
+    // The words the sentence uses name the part; the lesson hint fills in
+    // only when they say nothing. "Термометр на термисторе" used to take the
+    // DS18B20 because lesson 10 was consulted first, even though the source
+    // table has an NTC that matches the word exactly.
+    let source = source_in(&source_text)
+        .or_else(|| lesson.and_then(source_for_lesson))?;
     // A lesson that teaches a screen is about the screen itself: "цветной
     // дисплей 1.44" is a screen, not a colour sensor with an OLED readout.
     // "Давление на OLED" stays a recipe: its sensor is not the word "цвет".
@@ -113,7 +125,15 @@ pub fn detect(
             return None;
         }
     }
-    let sink = if text.contains("реле") || text.contains("relay") {
+    // A matrix or a seven-segment board is not an I2C text screen. The
+    // composition table has no sink for it, so it must not quietly choose an
+    // LCD instead; the lesson route owns those boards.
+    if crate::parse::screens_in(raw).is_some_and(|s| s.matrix || s.segments) {
+        return None;
+    }
+    let sink = if !explicit_sink && !asks_action && !asks_condition {
+        SinkId::Serial
+    } else if text.contains("реле") || text.contains("relay") {
         SinkId::Relay
     } else if text.contains("пищал")
         || text.contains("пьезо")
@@ -239,6 +259,7 @@ pub fn behavior_for(sink: SinkId, action: Option<Action>) -> Behavior {
         SinkId::Servo => Behavior::Turn,
         SinkId::Motor => Behavior::Spin,
         SinkId::Rgb => Behavior::Color,
+        SinkId::Serial => Behavior::Show,
     }
 }
 
@@ -271,8 +292,25 @@ pub fn source_in_text(raw: &str) -> Option<&'static SourceSpec> {
 fn source_in(text: &str) -> Option<&'static SourceSpec> {
     // "Влажность почвы" is a resistive probe, not the DHT humidity sensor.
     // The words share "влажность", so the soil probe has to win by name.
-    if crate::words::mentions(text, "почв") {
+    // "Грунт" and "земля" mean the same probe and used to fall through to the
+    // DHT22 branch.
+    if crate::words::mentions(text, "почв")
+        || crate::words::mentions(text, "грунт")
+        || crate::words::mentions(text, "soil")
+        || (crate::words::mentions(text, "влажност") && crate::words::mentions(text, "земл"))
+    {
         if let Some(s) = SOURCES.iter().find(|s| s.id == SourceId::Soil) {
+            return Some(s);
+        }
+    }
+    // "Термометр" and "термистор" are both nine letters, so the generic
+    // longest-key tie-break kept the DS18B20 for a thermistor sentence. The
+    // part named by its own word wins over the word that describes it.
+    if crate::words::mentions(text, "термистор")
+        || crate::words::mentions(text, "терморезистор")
+        || crate::words::mentions(text, "thermistor")
+    {
+        if let Some(s) = SOURCES.iter().find(|s| s.id == SourceId::Thermistor) {
             return Some(s);
         }
     }
@@ -372,6 +410,7 @@ fn action_phrase(sink: SinkId, behavior: Behavior, lang: Lang) -> &'static str {
         (SinkId::Servo, _) => tr(lang, "серво по условию", "a servo on condition"),
         (SinkId::Motor, _) => tr(lang, "мотор по условию", "a motor on condition"),
         (SinkId::Rgb, _) => tr(lang, "цвет по условию", "a colour on condition"),
+        (SinkId::Serial, _) => tr(lang, "монитор порта", "the serial monitor"),
     }
 }
 
@@ -410,7 +449,19 @@ fn choice(r: &Resolved, lang: Lang) -> Choice {
         &level_name(r.variant.level, lang),
         L::new("Сложность", "Effort"),
     );
-    let (pros, specs) = if r.behavior == Behavior::Show {
+    let (pros, specs) = if r.sink == SinkId::Serial {
+        (
+            vec![L::new(
+                "Значение видно в мониторе порта: ни одного пина не занято",
+                "The value goes to the serial monitor, using no pins",
+            )],
+            vec![
+                templates::spec_line(&r.variant.name.get(lang), L::new("Чтение", "Reading")),
+                templates::spec_line("9600", L::new("Порт", "Port")),
+                effort,
+            ],
+        )
+    } else if r.behavior == Behavior::Show {
         let screen = sink(r.sink).title.get(lang);
         let screen = if r.screens > 1 {
             format!("{screen} ×{}", r.screens)
@@ -553,6 +604,10 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
             "Мотор включает MOSFET низкой стороны; диод гасит выброс обмотки.",
             "A low-side MOSFET switches the motor; the diode absorbs the coil's kickback.",
         ),
+        SinkId::Serial => L::new(
+            "Скетч печатает значение в монитор порта на 9600 бод; ни один пин не занят.",
+            "The sketch prints the value to the serial monitor at 9600 baud; no pin is used.",
+        ),
         SinkId::Rgb => L::new(
             "RGB-светодиод: красный и зелёный с общим катодом, по резистору на канал.",
             "The RGB LED has red and green channels and a common cathode, one resistor each.",
@@ -677,6 +732,11 @@ fn place_source(b: &mut B, source: &SourceSpec, v: &Variant) -> Option<()> {
 }
 
 fn place_sink(b: &mut B, r: &Resolved) -> Option<()> {
+    // The serial monitor is an output inside the board: it has no part and
+    // no pin to place.
+    if r.sink == SinkId::Serial {
+        return Some(());
+    }
     let pin = r.sink_pins.first().copied()?;
     match r.sink {
         SinkId::Led => {
@@ -741,6 +801,7 @@ fn place_sink(b: &mut B, r: &Resolved) -> Option<()> {
             }
             b.w(led[3], b.gnd(52.0), NetClass::Gnd);
         }
+        SinkId::Serial => {}
         SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled => {
             let spec = sink(r.sink);
             let name = spec.module?;
@@ -891,6 +952,7 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
             // Screens are handled by the branch above; this keeps the match
             // exhaustive without pretending a display has a threshold.
             (SinkId::Lcd | SinkId::Lcd2004 | SinkId::Oled, _) => ("", ""),
+            (SinkId::Serial, _) => ("", ""),
         };
         (format!("{persist}{extra}"), active, action.to_string())
     };
@@ -1379,5 +1441,127 @@ mod tests {
         let p = parse("измерить температуру");
         assert!(p.intent.recipe.is_none());
         assert!(crate::templates::plan(&p.intent, Lang::Ru).is_some());
+    }
+
+    /// A named thermistor is its own part: an NTC divider. The DS18B20 reads
+    /// the same quantity, but it is a different circuit, so it must not stand
+    /// in for the part the sentence named.
+    #[test]
+    fn a_named_thermistor_keeps_its_own_part() {
+        let p = parse("термометр на термисторе с выводом на экран");
+        assert!(
+            p.unsupported.is_none(),
+            "{:?}",
+            p.unsupported.map(|u| u.ru)
+        );
+        let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert!(
+            built.circuit.parts().any(|q| q.value == "NTC 10 кОм"),
+            "the thermistor must be drawn"
+        );
+        assert!(
+            !built
+                .circuit
+                .parts()
+                .any(|q| q.value.starts_with("DS18B20")),
+            "a thermistor is not a DS18B20"
+        );
+        assert!(built.circuit.parts().any(|q| q.value.starts_with("LCD")));
+        assert_eq!(
+            crate::checks::run_with(&built, Lang::Ru, &p.intent).failed(),
+            0
+        );
+    }
+
+    /// A sensor named with no lesson behind it is still a request to read it.
+    /// The serial monitor takes no pin, so the answer is a real circuit rather
+    /// than "не нашёл, чем управлять".
+    #[test]
+    fn a_bare_sensor_gets_a_serial_readout() {
+        for task in [
+            "термометр на термисторе",
+            "Составить программу термометра на термисторе.",
+        ] {
+            let p = parse(task);
+            let recipe = p.intent.recipe.unwrap_or_else(|| panic!("{task} composes"));
+            assert_eq!(recipe.source, SourceId::Thermistor, "{task}");
+            assert_eq!(recipe.sink, SinkId::Serial, "{task}");
+            let built = build(recipe, 0, Lang::Ru).unwrap();
+            assert!(built.code.contains("Serial.println"), "{task}");
+            assert_eq!(crate::checks::run(&built, Lang::Ru).failed(), 0);
+        }
+    }
+
+    /// The screen the sentence names is the screen that is drawn. A matrix
+    /// display used to become an LCD plus an OLED that the sketch never
+    /// touched.
+    #[test]
+    fn a_matrix_display_is_not_an_lcd() {
+        let p = parse("матричный дисплей без книги");
+        let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert!(
+            built.circuit.parts().any(|q| q.value == "MAX7219"),
+            "the matrix must be drawn"
+        );
+        assert!(
+            !built
+                .circuit
+                .parts()
+                .any(|q| q.value.starts_with("LCD") || q.value.starts_with("OLED")),
+            "a matrix is not an LCD or an OLED"
+        );
+        assert_eq!(
+            crate::checks::run_with(&built, Lang::Ru, &p.intent).failed(),
+            0
+        );
+    }
+
+    /// A screen sentence that no lesson, recipe or text scene can build is
+    /// refused. It used to be answered with a button and an LED: a plausible
+    /// circuit for a different question.
+    #[test]
+    fn three_screens_are_not_a_button_and_led() {
+        let p = parse("три экрана и кнопка");
+        assert!(
+            crate::templates::build(&p.intent, 0, Lang::Ru).is_none(),
+            "a screen task must not fall through to the button template"
+        );
+    }
+
+    /// A period spoken in the task belongs in the sketch: "каждые 200 мс"
+    /// used to keep the half-second of the first-program lesson.
+    #[test]
+    fn a_spoken_blink_period_reaches_the_sketch() {
+        let p = parse("мигать каждые 200 мс");
+        let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert!(
+            built.code.contains("const uint16_t HALF_MS = 200;"),
+            "{}",
+            built.code
+        );
+    }
+
+    /// A pin named by the sentence is a requirement: wiring the LED to D9
+    /// does not answer "к пину 7".
+    #[test]
+    fn a_named_pin_is_checked() {
+        let p = parse("светодиод к пину 7");
+        let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        let missing = crate::requirements::missing(&built, &p.intent);
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.extra.as_deref() == Some("D7")),
+            "{}",
+            missing
+                .iter()
+                .map(|m| m.name.ru.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let p = parse("светодиод к пину 9");
+        let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
     }
 }

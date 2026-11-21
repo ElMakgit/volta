@@ -1991,6 +1991,7 @@ mod tests {
                 let intent = Intent {
                     load,
                     input,
+                    named: Default::default(),
                     transistor: false,
                     presses: false,
                     lesson: None,
@@ -2051,6 +2052,7 @@ mod tests {
             let intent = Intent {
                 load: crate::parse::Load::Led,
                 input: None,
+                named: Default::default(),
                 transistor: false,
                 presses: false,
                 lesson: Some(i),

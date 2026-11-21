@@ -258,11 +258,33 @@ fn rfid_plan(lang: Lang, raw: &str) -> (L, Vec<Choice>, usize) {
             4,
         ),
     ];
-    let recommended = if wants_access(raw) { 3 } else { 0 };
-    let title = if recommended == 3 {
-        L::new("RFID RC522: карты в EEPROM", "RFID RC522: cards in EEPROM")
+    let text = crate::words::normalize(raw);
+    // A named screen or relay must be on the recommended build, not only in a
+    // choice the user has to find: the checklist would rightly report it
+    // missing while the plan itself ignored the word.
+    let screen = text.contains("диспле")
+        || text.contains("экран")
+        || text.contains("oled")
+        || text.contains("lcd");
+    let lock = text.contains("реле")
+        || text.contains("замок")
+        || text.contains("lock")
+        || text.contains("турникет")
+        || text.contains("домофон");
+    let recommended = if wants_access(raw) {
+        3
+    } else if screen {
+        1
+    } else if lock {
+        2
     } else {
-        L::new("RFID RC522: чтение метки", "RFID RC522: reading a tag")
+        0
+    };
+    let title = match recommended {
+        3 => L::new("RFID RC522: карты в EEPROM", "RFID RC522: cards in EEPROM"),
+        2 => L::new("RFID RC522: замок на реле", "RFID RC522: relay lock"),
+        1 => L::new("RFID RC522: UID на экран", "RFID RC522: UID on a screen"),
+        _ => L::new("RFID RC522: чтение метки", "RFID RC522: reading a tag"),
     };
     (title, choices, recommended)
 }
@@ -364,7 +386,7 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
         return Some(p);
     }
     if let Some(i) = intent.lesson {
-        let mut p = display_lesson_plan(i, crate::parse::named_devices(&intent.raw).screens, lang);
+        let mut p = display_lesson_plan(i, intent.named.screens, lang);
         // The lesson title is already the first choice; a role guess from
         // `semantics` would argue with it ("не назван → radio" under the IR
         // lesson). The trace panel carries the evidence instead.
@@ -1092,6 +1114,11 @@ const TEXT_OLED: TextModule = TextModule { name: "OLED 0.96", cols: 128, rows: 6
 /// addresses, so three or more screens are built on character LCDs instead.
 fn text_modules(screens: crate::parse::Screens) -> Vec<TextModule> {
     use crate::parse::ScreenKind;
+    // The parser routes a matrix or a seven-segment board to its lesson;
+    // this scene never receives one. The fallback keeps the table total.
+    if screens.matrix || screens.segments {
+        return vec![TEXT_LCD1602];
+    }
     let mut out = match screens.kind {
         ScreenKind::Oled => vec![TEXT_OLED],
         ScreenKind::Lcd => vec![TEXT_LCD1602],
@@ -1193,6 +1220,12 @@ fn text_screen_plan(raw: &str, screens: crate::parse::Screens, lang: Lang) -> Pl
 /// model. `choice` picks one; a second and third screen reuse it.
 fn display_modules(screens: crate::parse::Screens) -> Vec<(&'static str, &'static str)> {
     use crate::parse::ScreenKind;
+    if screens.segments {
+        return vec![("Четырёхразрядный индикатор (I2C)", "7SEG-4")];
+    }
+    if screens.matrix {
+        return vec![("Матрица 8×8 на MAX7219", "MAX7219")];
+    }
     match screens.kind {
         ScreenKind::Oled => vec![("OLED 128×64 (I2C)", "OLED 0.96")],
         ScreenKind::Lcd => vec![("LCD1602 16×2 (I2C)", "LCD1602")],
@@ -1210,6 +1243,18 @@ fn display_modules(screens: crate::parse::Screens) -> Vec<(&'static str, &'stati
 fn display_lesson_plan(i: usize, screens: Option<crate::parse::Screens>, lang: Lang) -> Plan {
     let base = lesson_plan(i, lang);
     let Some(screens) = screens else { return base };
+    // The lesson already draws its screen: TV OUT, MAX7219, Nokia 5110 and
+    // the rest must not gain a second I2C OLED that the sketch never talks
+    // to. A matrix asked on a non-matrix lesson is not promised either: the
+    // build has no driver for it, and the checklist will say so.
+    if crate::lessons::display_count(i) > 0 || screens.matrix {
+        return base;
+    }
+    // Seven segments belong to the clock lesson; another lesson would draw a
+    // board its sketch does not use.
+    if screens.segments && !crate::lessons::ALL[i].keys.contains(&"ds3231") {
+        return base;
+    }
     let level = base.choices[0].level;
     let choices = display_modules(screens)
         .into_iter()
@@ -1664,16 +1709,31 @@ fn lesson_build(
     // A sentence that names a screen adds it even when the rest of the task
     // routes to a lesson: "часы ... на любой тип дисплея" is a clock *with* a
     // display, and "два экрана" means two of them.
+    let mut added_segments = false;
     if let Some(wish) = screens {
-        // A display lesson already placed the screen it teaches: "LCD1602"
-        // must not draw a second one. Only the shortfall is added, so the
-        // schematic matches the plan's "Экранов: 1".
-        let present = l
-            .boards
-            .iter()
-            .filter(|b| b.name.starts_with("LCD") || b.name.starts_with("OLED"))
-            .count();
-        let want = wish.count.saturating_sub(present);
+        // A display lesson already placed the screen it teaches: TV OUT,
+        // MAX7219 and Nokia must not gain a second, unused OLED. Only a
+        // lesson with no screen of its own gets one added.
+        let present = crate::lessons::display_count(i);
+        let want = if present > 0 {
+            0
+        } else if wish.segments {
+            // The clock lesson is the only one whose sketch can drive four
+            // digits: it shows time on them, not "Privet!".
+            if i == 31 {
+                added_segments = true;
+                1
+            } else {
+                0
+            }
+        } else if wish.matrix {
+            // No composition or lesson sketch drives a matrix here; drawing
+            // it would be a part the code never uses. The checklist reports
+            // the missing screen instead.
+            0
+        } else {
+            wish.count
+        };
         let modules = display_modules(wish);
         let module = modules[choice.min(modules.len() - 1)].1;
         let top = b.c.bbox().bottom() + 8.0;
@@ -1705,14 +1765,58 @@ fn lesson_build(
         notes.push(m);
     }
     let base_code = l.code.render(l.title.get(lang));
-    let code = if i == 31 && screens.is_some() {
+    let code = if added_segments {
+        clock_segments_code(lang)
+    } else if i == 31
+        && screens.is_some_and(|s| !s.matrix && !s.segments)
+    {
         clock_display_code(lang, screens.unwrap(), choice.min(display_modules(screens.unwrap()).len() - 1))
-    } else if screens.is_some() {
+    } else if screens.is_some_and(|s| !s.matrix && !s.segments) {
         format!("{}\n// Экран по I2C: SDA A4, SCL A5\n{}", base_code, display_note(screens.unwrap(), lang))
     } else {
         base_code
     };
     (b.finish(), code, l.summary, notes)
+}
+
+/// The clock lesson with four seven-segment digits on a TM1650, both devices
+/// on the same I2C bus. The DS3231 keeps the time and the display shows it;
+/// neither half is dropped.
+fn clock_segments_code(lang: Lang) -> String {
+    let ru = lang == Lang::Ru;
+    let comment = if ru {
+        "// DS3231 и четырёхразрядный индикатор TM1650 на общей шине I2C"
+    } else {
+        "// A DS3231 and a four-digit TM1650 display on the shared I2C bus"
+    };
+    format!(
+        r#"{comment}
+#include <Wire.h>
+#include <RTClib.h>
+#include <TM1650.h>
+RTC_DS3231 rtc;
+TM1650 display;
+const uint16_t PERIOD_MS = 1000;
+uint32_t last = 0;
+
+void setup() {{
+  Wire.begin();
+  Serial.begin(9600);
+  if (!rtc.begin()) Serial.println(F("no RTC"));
+  display.init();
+  display.setBrightness(5, true);
+}}
+
+void loop() {{
+  if (millis() - last < PERIOD_MS) return;
+  last = millis();
+  DateTime now = rtc.now();
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%02u%02u", now.hour(), now.minute());
+  display.displayString(String(buf));
+}}
+"#
+    )
 }
 
 fn display_note(screens: crate::parse::Screens, lang: Lang) -> &'static str {
@@ -3063,14 +3167,19 @@ fn apply_spoken_numbers(code: &mut String, raw: &str) {
         *code = code.replace("STEPS = 6", &format!("STEPS = {}", presses.min(255)));
     }
     if let Some(ms) = sem.period_ms {
-        *code = code.replace("PERIOD_MS = 1000", &format!("PERIOD_MS = {ms}"));
+        // Lessons name the same interval differently: the first sketch uses
+        // HALF_MS, a sensor loop uses PERIOD_MS. Both must follow the spoken
+        // number, or "каждые 200 мс" still blinks twice a second.
+        let ms = ms.min(65_535);
+        for constant in ["PERIOD_MS = 1000", "PERIOD_MS = 500", "HALF_MS = 500", "HALF_MS = 1000"] {
+            *code = code.replace(constant, &format!("{} = {ms}", constant.split(" = ").next().unwrap_or("PERIOD_MS")));
+        }
     }
 }
 
 /// Honour the parts the sentence named but the base circuit does not have.
 /// Shared by lessons, templates and compositions, so every route adds them.
-fn augment_built(built: &mut Built, raw: &str, lang: Lang) {
-    let named = crate::parse::named_devices(raw);
+fn augment_built(built: &mut Built, named: crate::parse::NamedDevices, lang: Lang) {
     let mut ledger = crate::resources::Resources::new(&built.circuit);
     let added = augment_devices(&mut built.circuit, named, &mut ledger);
     if added.parts.is_empty() {
@@ -3104,18 +3213,18 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             summary,
             notes,
         };
-        augment_built(&mut built, &intent.raw, lang);
+        augment_built(&mut built, intent.named, lang);
         apply_spoken_numbers(&mut built.code, &intent.raw);
         return Some(built);
     }
     if let Some(recipe) = intent.recipe {
         let mut built = crate::compose::build(recipe, choice, lang)?;
-        augment_built(&mut built, &intent.raw, lang);
+        augment_built(&mut built, intent.named, lang);
         apply_spoken_numbers(&mut built.code, &intent.raw);
         return Some(built);
     }
     if let Some(i) = intent.lesson {
-        let screens = crate::parse::named_devices(&intent.raw).screens;
+        let screens = intent.named.screens;
         let plan = display_lesson_plan(i, screens, lang);
         let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
         let (circuit, code, summary, notes) = lesson_build(lang, i, screens, choice);
@@ -3128,11 +3237,21 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             summary,
             notes,
         };
-        augment_built(&mut built, &intent.raw, lang);
+        augment_built(&mut built, intent.named, lang);
         apply_spoken_numbers(&mut built.code, &intent.raw);
         return Some(built);
     }
+    // Most routes left here are LEDs, buzzers and buttons and cannot host a
+    // screen: drawing one of those for "три экрана и кнопка" is the "similar
+    // circuit" this checklist exists to catch. The access scene is the
+    // exception: a screen named there is part of the lock, so it is drawn.
     let tid = route(intent.load, intent.input)?;
+    if intent.named.screens.is_some()
+        && !intent.named.phone
+        && !matches!(tid, Tid::Rfid)
+    {
+        return None;
+    }
     let plan = plan(intent, lang)?;
     let choice = choice.min(plan.choices.len() - 1);
     let mut notes = Vec::new();
@@ -3176,7 +3295,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     built.notes.extend(extra);
     // Named parts the template did not draw are added here, so a sentence
     // like "RFID + светодиод" keeps both halves.
-    augment_built(&mut built, &intent.raw, lang);
+    augment_built(&mut built, intent.named, lang);
     apply_spoken_numbers(&mut built.code, &intent.raw);
     Some(built)
 }
@@ -6078,6 +6197,7 @@ mod tests {
             let intent = Intent {
                 load,
                 input,
+                named: Default::default(),
                 transistor: false,
                 presses: false,
                 lesson: None,
@@ -6195,6 +6315,17 @@ mod tests {
         ] {
             assert!(!wants_access(text), "{text}");
         }
+    }
+
+    /// A screen named by the task is on the recommended RFID build, not in a
+    /// choice the user has to find first.
+    #[test]
+    fn a_named_screen_leads_the_rfid_plan() {
+        let p = crate::parse::parse("контроль доступа по карте на 49 карт с экраном");
+        let plan = plan(&p.intent, Lang::Ru).expect("plans");
+        assert_eq!(plan.recommended, 1);
+        let built = build(&p.intent, plan.recommended, Lang::Ru).expect("builds");
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
     }
 
     /// A screen named by the task replaces the default OLED, so the scene
@@ -6332,6 +6463,7 @@ mod tests {
             let intent = Intent {
                 load: Load::Led,
                 input: None,
+                named: Default::default(),
                 transistor: false,
                 presses: false,
                 lesson: Some(i),
@@ -6381,6 +6513,7 @@ mod tests {
             let intent = Intent {
                 load: Load::Led,
                 input: None,
+                named: Default::default(),
                 transistor: false,
                 presses: false,
                 lesson: Some(i),
@@ -6581,6 +6714,7 @@ mod tests {
         let intent = Intent {
             load: Load::Motor,
             input: Some(Input::Button),
+            named: Default::default(),
             transistor: true,
             presses: true,
             lesson: None,

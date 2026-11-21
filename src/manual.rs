@@ -2005,6 +2005,7 @@ mod tests {
         let intent = Intent {
             load: crate::parse::Load::Motor,
             input: Some(crate::parse::Input::Button),
+            named: Default::default(),
             transistor: true,
             presses: true,
             lesson: None,

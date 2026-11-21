@@ -2094,6 +2094,10 @@ const ALIASES: &[(&str, usize)] = &[
     ("кольцо", 32),
     ("клавиатур", 34),
     ("карта памяти", 35),
+    ("флешк", 35),
+    ("флеш", 35),
+    ("usb flash", 35),
+    ("накопител", 35),
     ("плеер", 37),
     ("наклон", 44),
     ("акселерометр", 44),
@@ -2142,6 +2146,31 @@ pub const RANGE: usize = 15;
 pub const SOUND: usize = 36;
 /// The TSOP1838 IR receiver lesson.
 pub const TSOP: usize = 17;
+
+/// How many display boards the lesson itself draws. A lesson about a screen
+/// already has one: adding an OLED because the sentence said "экран" is how
+/// a TV OUT or MAX7219 build ended up with a second, unused screen.
+pub fn display_count(i: usize) -> usize {
+    use crate::modules::Look;
+    ALL.get(i)
+        .map(|lesson| {
+            lesson
+                .boards
+                .iter()
+                .filter(|b| {
+                    crate::modules::find(b.name)
+                        .map(|m| {
+                            matches!(
+                                m.look,
+                                Look::Lcd | Look::Display | Look::Segments | Look::Matrix | Look::Panel
+                            )
+                        })
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
 
 /// Whether the lesson is an I2C text display, so a task that asks for its own
 /// text can take over the display instead of building the lesson's demo.

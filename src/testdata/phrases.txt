@@ -350,7 +350,7 @@ mq-2 включает светодиод при газе | lesson:13
 газ выше 400 реле | compose:Gas/Relay/Switch
 датчик света мигает | compose:Light/Led/Blink
 фоторезистор включает светодиод | compose:Light/Led/Solid
-термистор выше 40 пищалка | compose:Temperature/Buzzer/Beep
+термистор выше 40 пищалка | compose:Thermistor/Buzzer/Beep
 температура ниже 18 реле | compose:Temperature/Relay/Switch
 влажность выше 60 реле | compose:Humidity/Relay/Switch
 давление ниже 740 реле | compose:Pressure/Relay/Switch

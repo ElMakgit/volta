@@ -268,11 +268,11 @@ pub fn run(built: &Built, lang: Lang) -> Report {
 /// The same checks plus the sentence-level requirement list. A build can be
 /// electrically valid and still have lost the DHT22 or the `struct` the task
 /// named; `run` cannot know the sentence, so callers that have it use this.
-pub fn run_with(built: &Built, lang: Lang, raw: &str) -> Report {
+pub fn run_with(built: &Built, lang: Lang, intent: &crate::parse::Intent) -> Report {
     let mut report = run(built, lang);
     report
         .checks
-        .extend(crate::requirements::check(built, raw, lang));
+        .extend(crate::requirements::check(built, intent, lang));
     report
 }
 
@@ -1226,6 +1226,7 @@ mod tests {
                 let intent = Intent {
                     load,
                     input,
+                    named: Default::default(),
                     transistor: false,
                     presses: false,
                     lesson: None,
@@ -1248,6 +1249,7 @@ mod tests {
         let intent = Intent {
             load: Load::Motors,
             input: None,
+            named: Default::default(),
             transistor: false,
             presses: false,
             lesson: None,
@@ -1271,6 +1273,7 @@ mod tests {
         let gsm = Intent {
             load: Load::Gsm,
             input: None,
+            named: Default::default(),
             transistor: false,
             presses: false,
             lesson: None,
@@ -1377,6 +1380,7 @@ mod tests {
         let intent = Intent {
             load: Load::Led,
             input: None,
+            named: Default::default(),
             transistor: false,
             presses: false,
             lesson: None,

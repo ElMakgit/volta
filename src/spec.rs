@@ -28,6 +28,9 @@ pub enum SourceId {
     Color,
     /// Soil moisture: a resistive probe, not the DHT humidity sensor.
     Soil,
+    /// An NTC divider. The DS18B20 reads temperature digitally; a sentence
+    /// that names a thermistor is a different part with a different circuit.
+    Thermistor,
 }
 
 /// How the source is put on the bench. Boards come from the module table;
@@ -36,9 +39,7 @@ pub enum SourceId {
 pub enum Place {
     Board { name: &'static str, at: (f32, f32) },
     Ldr,
-    /// An NTC divider. The table reads temperature through the DS18B20
-    /// today; the NTC path stays here for the cheap variant.
-    #[allow(dead_code)]
+    /// An NTC divider. A thermistor is its own source, not the DS18B20.
     Thermistor,
 }
 
@@ -129,6 +130,9 @@ pub enum SinkId {
     Servo,
     Motor,
     Rgb,
+    /// The serial monitor: no part and no pin, but a real output for a bare
+    /// "прочитать температуру" request.
+    Serial,
 }
 
 /// How a sink reaches the Uno. A single pin is allocated from the free list;
@@ -935,7 +939,7 @@ pub const SOURCES: &[SourceSpec] = &[
         // No book lesson teaches this probe yet: the sensor is a bench part,
         // not a page of the course.
         lesson: usize::MAX,
-        keys: &["почв", "soil", "fc-28", "yl-69", "yl-38", "датчик влажности почвы"],
+        keys: &["почв", "грунт", "soil", "fc-28", "yl-69", "yl-38", "датчик влажности почвы", "влажност земли"],
         period_ms: 1000,
         place: Place::Board { name: "SOIL", at: (2.0, 54.0) },
         summary: L::new(
@@ -963,6 +967,47 @@ pub const SOURCES: &[SourceSpec] = &[
             note: L::new(
                 "Сухой воздух и сухая почва дают разные числа: откалибруй порог на своей земле, полив и насухо.",
                 "Dry air and dry soil read differently: calibrate the threshold on your own soil, wet and dry.",
+            ),
+        }],
+    },
+    SourceSpec {
+        id: SourceId::Thermistor,
+        title: L::new("Термометр на термисторе", "A thermistor thermometer"),
+        short: L::new("температура", "temperature"),
+        lesson: 10,
+        keys: &[
+            "термистор",
+            "терморезистор",
+            "ntc",
+            "thermistor",
+        ],
+        period_ms: 500,
+        place: Place::Thermistor,
+        summary: L::new(
+            "NTC 10 кОм и резистор 10 кОм: делитель на A0, температура считается по бета-формуле.",
+            "An NTC 10 kΩ and a 10 kΩ resistor: a divider on A0, with temperature from the beta formula.",
+        ),
+        variants: &[Variant {
+            name: L::new("Делитель 10 кОм", "10 kΩ divider"),
+            blurb: L::new(
+                "NTC сверху, 10 кОм снизу: A0 читает падение напряжения на резисторе.",
+                "The NTC on top, 10 kΩ below: A0 reads the drop across the resistor.",
+            ),
+            logic: Logic::Number,
+            pins: &["A0"],
+            signals: &[],
+            includes: "#include <math.h>\n",
+            globals: "const float NTC_NOMINAL = 10000.0;\nconst float NTC_BETA = 3950.0;\n",
+            setup: "",
+            sample: "  float raw = analogRead(A0);\n  float r = NTC_NOMINAL * raw / (1023.0 - raw);\n  float value = 1.0 / (log(r / NTC_NOMINAL) / NTC_BETA + 1.0 / 298.15) - 273.15;\n",
+            print: "  Serial.println(value, 1);\n",
+            unit: L::new("°C", "°C"),
+            decimals: 1,
+            condition: Condition::Above(30.0),
+            level: 1,
+            note: L::new(
+                "Номинал и бета у каждого термистора свои: без них формула даёт ошибку в несколько градусов.",
+                "Every thermistor has its own nominal and beta; without them the formula is off by several degrees.",
             ),
         }],
     },
@@ -1096,6 +1141,20 @@ pub const SINKS: &[SinkSpec] = &[
         setup: "",
         show: "",
     },
+    SinkSpec {
+        id: SinkId::Serial,
+        title: L::new("монитор порта", "the serial monitor"),
+        pins: &[],
+        take: 0,
+        current_ma: 0,
+        wiring: SinkWiring::Pin,
+        module: None,
+        at: (0.0, 0.0),
+        includes: "",
+        globals: "",
+        setup: "",
+        show: "",
+    },
 ];
 
 pub fn source(id: SourceId) -> &'static SourceSpec {
@@ -1127,7 +1186,11 @@ mod tests {
         for (i, s) in SINKS.iter().enumerate() {
             assert_eq!(s.id as usize, i, "{} is out of order", s.title.ru);
             assert_eq!(sink(s.id).id, s.id);
-            assert!(!s.pins.is_empty());
+            assert!(
+                !s.pins.is_empty() || s.id == SinkId::Serial,
+                "{} has no pins",
+                s.title.ru
+            );
         }
     }
 

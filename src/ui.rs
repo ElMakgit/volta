@@ -862,9 +862,10 @@ impl App {
     }
 
     fn ai_report(&self) -> Option<Report> {
+        let parsed = self.parsed.as_ref()?;
         self.built
             .as_ref()
-            .map(|b| checks::run_with(b, self.lang, &self.task))
+            .map(|b| checks::run_with(b, self.lang, &parsed.intent))
     }
 
     // -------------------------------------------------------------- projects

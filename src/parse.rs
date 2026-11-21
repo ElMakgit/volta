@@ -73,6 +73,10 @@ impl Action {
 pub struct Intent {
     pub load: Load,
     pub input: Option<Input>,
+    /// The parts, sensors and roles the sentence names, extracted once by
+    /// `named_devices`. The builder and the checklist both read this object,
+    /// so they cannot disagree about what the task asked for.
+    pub named: NamedDevices,
     /// The sentence asked for a transistor, which narrows the driver choice.
     pub transistor: bool,
     /// Asked for repeated presses / discrete steps rather than a hold.
@@ -549,7 +553,7 @@ fn plan_label(load: Load, input: Option<Input>) -> L {
 /// keyboard layout. Everything is matched against this one string, so
 /// "Моторчиком!" and "rjyrf" are both understood.
 fn search_text(raw: &str) -> String {
-    let norm = crate::words::normalize(raw);
+    let norm = crate::words::normalize(&without_negated_parts(raw));
     let mut out = norm.clone();
     for fixed in crate::words::layout_fixes(&norm) {
         out.push(' ');
@@ -606,15 +610,6 @@ fn sd_storage(text: &str) -> bool {
     card && !access
 }
 
-/// A seven-segment indicator keeps its own lesson. "Часы на семисегментном
-/// индикаторе" must not be turned into the DS3231 demo just because the word
-/// "часы" is present.
-fn seven_segment(text: &str) -> bool {
-    ["семисегмент", "7seg", "7-сегмент", "tm1650", "tm1637"]
-        .iter()
-        .any(|k| text.contains(k))
-}
-
 /// A display asked for in words. A book task names the lesson's sensor, but
 /// the reader still has to honour "на любой тип дисплея" or "два экрана".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +624,11 @@ pub enum ScreenKind {
 pub struct Screens {
     pub kind: ScreenKind,
     pub count: usize,
+    /// "Матричный дисплей" is a MAX7219, not an LCD: the words name a kind
+    /// the I2C display list cannot express by `kind` alone.
+    pub matrix: bool,
+    /// "Семисегментный индикатор" is a 7-segment board, not an I2C screen.
+    pub segments: bool,
 }
 
 /// Everything the user named outright. A ready-made lesson or a template is
@@ -644,48 +644,184 @@ pub struct NamedDevices {
     pub servo: usize,
     pub button: usize,
     pub hourly: bool,
+    /// Measured quantities, counted the same way as parts: "два датчика
+    /// температуры" is two sensors, not one.
+    pub temperature: usize,
+    pub humidity: usize,
+    pub soil: usize,
+    pub pressure: usize,
+    pub light: usize,
+    pub range: usize,
+    pub gas: usize,
+    pub dht11: usize,
+    pub dht22: usize,
+    /// Named boards and displays that have no `Kind` of their own.
+    pub fs1000a: bool,
+    pub xy_mk: bool,
+    pub rc522: bool,
+    pub tsop: bool,
+    /// Storage, not access: "записать на флешку" wants the SD lesson, while
+    /// "доступ по SD-карте" is an RFID reader task.
+    pub sd: bool,
+    pub segments: usize,
+    pub sound: usize,
+    /// A clock is a part and a purpose: "часы на семисегментном индикаторе"
+    /// needs the DS3231, not a lesson that merely counts digits.
+    pub clock: bool,
+    /// An explicit Uno pin from "к пину 9", if the sentence gave one.
+    pub pin: Option<u8>,
+    /// The sentence asks for both halves of a radio link.
+    pub radio_pair: bool,
+    /// A phone screen is an SMS, not an LCD to wire.
+    pub phone: bool,
 }
 
+/// A spoken count from zero to twenty, or its digits. The books use "10
+/// светодиодов" as often as "три", so stopping at four silently turned a
+/// ten-LED task into a one-LED blink.
 fn number_word(word: &str) -> Option<usize> {
-    match word {
-        "четыре" | "четырёх" | "4" => Some(4),
-        "три" | "трёх" | "3" => Some(3),
-        "два" | "две" | "двух" | "2" => Some(2),
-        _ => None,
-    }
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    Some(match word {
+        "0" | "ноль" => 0,
+        "1" | "один" | "одна" | "одно" | "одного" | "одной" => 1,
+        "2" | "два" | "две" | "двух" | "пара" | "пару" => 2,
+        "3" | "три" | "трех" => 3,
+        "4" | "четыре" | "четырех" => 4,
+        "5" | "пять" | "пяти" => 5,
+        "6" | "шесть" | "шести" => 6,
+        "7" | "семь" | "семи" => 7,
+        "8" | "восемь" | "восьми" => 8,
+        "9" | "девять" | "девяти" => 9,
+        "10" | "десять" | "десяти" => 10,
+        "11" | "одиннадцать" | "одиннадцати" => 11,
+        "12" | "двенадцать" | "двенадцати" => 12,
+        "13" | "тринадцать" | "тринадцати" => 13,
+        "14" | "четырнадцать" | "четырнадцати" => 14,
+        "15" | "пятнадцать" | "пятнадцати" => 15,
+        "16" | "шестнадцать" | "шестнадцати" => 16,
+        "17" | "семнадцать" | "семнадцати" => 17,
+        "18" | "восемнадцать" | "восемнадцати" => 18,
+        "19" | "девятнадцать" | "девятнадцати" => 19,
+        "20" | "двадцать" | "двадцати" => 20,
+        "one" => 1,
+        "two" | "pair" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        _ => return None,
+    })
 }
 
-/// Whether a token names a part. Used to stop a number from applying to the
-/// next part in the list: in "два светодиода, реле" the relay is one part,
-/// not two.
-fn names_a_part(token: &str) -> bool {
-    const PARTS: &[&str] = &[
-        "светодиод", "led", "реле", "relay", "пьезо", "пищал", "зуммер", "сирен",
-        "buzzer", "серво", "servo", "sg90", "мотор", "motor", "двигател",
-        "вентилятор", "насос", "кулер", "кнопк", "button", "rgb", "экран",
-        "диспле", "oled", "lcd",
+/// Words that may sit between a count and the part it counts: "два красных
+/// светодиода", "по 3 штуки". A sensor word counts as filler only when the
+/// thing being counted is a sensor: "два датчика температуры" is two, while
+/// "два датчика и светодиод" is still one LED.
+fn is_count_filler(token: &str, sensor: bool) -> bool {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+    if matches!(t, "и" | "по" | "с" | "из")
+        || t.starts_with("штук")
+        || (sensor && t.starts_with("датчик"))
+    {
+        return true;
+    }
+    // "4 разрядный семисегментный" is one display with four digits, not four
+    // displays: the numeral belongs to the digit count, so the scan stops
+    // here instead of carrying the 4 over to the module.
+    if t.starts_with("разряд") {
+        return false;
+    }
+    const ENDINGS: &[&str] = &[
+        "ый", "ий", "ой", "ая", "яя", "ое", "ее", "ые", "ие", "ых", "их",
+        "ого", "его", "ому", "ему", "ым", "им", "ую", "юю", "ыми", "ими",
     ];
-    PARTS.iter().any(|w| crate::words::mentions(token, w))
+    ENDINGS
+        .iter()
+        .any(|ending| t.chars().count() > ending.chars().count() && t.ends_with(ending))
 }
 
-fn count_of(text: &str, words: &[&str]) -> usize {
+/// Count the parts a sentence names, summing split groups: "3 красных и 2
+/// зелёных светодиода" is five LEDs, not the first number the scan meets.
+/// Adjacent synonyms ("пьезо пищалка") are one part, not two.
+pub(crate) fn count_of(text: &str, words: &[&str]) -> usize {
+    count_of_inner(text, words, false)
+}
+
+/// The same count for sensors, where "датчик" may sit between the number and
+/// the measured quantity: "два датчика температуры".
+pub(crate) fn count_sensors(text: &str, words: &[&str]) -> usize {
+    count_of_inner(text, words, true)
+}
+
+/// Count only the numerals written next to the words: a mention with no
+/// number of its own adds nothing. "Два экрана" is two, "экран и дисплей"
+/// is one screen described twice, not two boards.
+fn number_of(text: &str, words: &[&str]) -> usize {
     let tokens: Vec<&str> = text.split_whitespace().collect();
-    let Some(at) = tokens
-        .iter()
-        .position(|t| words.iter().any(|w| crate::words::mentions(t, w)))
-    else {
-        return 0;
-    };
-    // A numeral two words back still counts ("два красных светодиода"), but
-    // never across another named part.
-    for j in (at.saturating_sub(2)..at).rev() {
-        let Some(n) = number_word(tokens[j]) else { continue };
-        if tokens[j + 1..at].iter().any(|t| names_a_part(t)) {
-            break;
+    let mut total = 0;
+    let mut last: Option<usize> = None;
+    for (i, token) in tokens.iter().enumerate() {
+        if !words.iter().any(|w| crate::words::mentions(token, w)) {
+            continue;
         }
-        return n;
+        if last.is_some_and(|prev| i <= prev + 1) {
+            continue;
+        }
+        last = Some(i);
+        let mut sum = 0;
+        let mut i = i;
+        while i > 0 {
+            i -= 1;
+            let token = tokens[i];
+            if let Some(n) = number_word(token) {
+                sum += n;
+            } else if is_count_filler(token, false) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        total += sum;
     }
-    1
+    total
+}
+
+fn count_of_inner(text: &str, words: &[&str], sensor: bool) -> usize {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if !words.iter().any(|w| crate::words::mentions(token, w)) {
+            continue;
+        }
+        if starts.last().is_some_and(|&prev| i <= prev + 1) {
+            continue;
+        }
+        starts.push(i);
+    }
+    let mut total = 0;
+    for start in starts {
+        let mut sum = 0;
+        let mut found = false;
+        let mut i = start;
+        while i > 0 {
+            i -= 1;
+            let token = tokens[i];
+            if let Some(n) = number_word(token) {
+                sum += n;
+                found = true;
+            } else if is_count_filler(token, sensor) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        total += if found { sum } else { 1 };
+    }
+    total
 }
 
 /// "Шаговый двигатель" is a stepper, not a DC motor: the word "двигатель"
@@ -711,16 +847,347 @@ fn motor_count(text: &str) -> usize {
     )
 }
 
+/// Text with the parts the sentence explicitly refuses removed. Negation is
+/// handled once, here, so the drawing, the plan and the checklist all agree
+/// that "реле не нужно" names no relay.
+fn without_negated_parts(raw: &str) -> String {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let mut drop = vec![false; tokens.len()];
+    for (i, token) in tokens.iter().enumerate() {
+        if !is_part_token(token) || !is_negated(&tokens, i) {
+            continue;
+        }
+        drop[i] = true;
+        // "датчик температуры не нужен": drop the measured word too, or the
+        // count would still see it. The noun is inflected ("датчика",
+        // "датчиков"), so compare the stem. A refused list loses every
+        // quantity in it: "без датчика температуры и влажности" is neither.
+        if bare(token).starts_with("датчик") {
+            let mut j = i + 1;
+            while let Some(next) = tokens.get(j) {
+                let word = bare(next);
+                if is_measure_word(next) {
+                    drop[j] = true;
+                    j += 1;
+                    continue;
+                }
+                if matches!(word, "и" | "или")
+                    && tokens.get(j + 1).is_some_and(|t| is_measure_word(t))
+                {
+                    drop[j] = true;
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    if !drop.iter().any(|d| *d) {
+        return raw.to_string();
+    }
+    // Drop the refusal next to the refused part as well. Otherwise "не" is
+    // left in the sentence and can catch the part in the next clause:
+    // "датчик не нужен, нужен светодиод" must keep the LED.
+    for i in 0..tokens.len() {
+        if drop[i] {
+            continue;
+        }
+        let near = (i.saturating_sub(3)..=(i + 3).min(tokens.len() - 1)).any(|j| drop[j]);
+        if near
+            && (is_negation(tokens[i])
+                || is_refusal_verb(tokens[i])
+                || matches!(bare(tokens[i]), "без" | "кроме"))
+        {
+            drop[i] = true;
+        }
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !drop[*i])
+        .map(|(_, token)| *token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A token without the punctuation that came with it.
+fn bare(token: &str) -> &str {
+    token.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+}
+
+/// A comma, a full stop or a semicolon ends a clause: a refusal on one side
+/// does not reach a part on the other.
+fn ends_clause(token: &str) -> bool {
+    token.ends_with(',')
+        || token.ends_with('.')
+        || token.ends_with(';')
+        || token.ends_with('!')
+        || token.ends_with('?')
+        || token.ends_with(':')
+}
+
+/// Words that name a part on the bench. Only these can be refused: dropping
+/// "не" or "без" alone would let "не мигает светодиод" lose the LED.
+fn is_part_token(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+    const PARTS: &[&str] = &[
+        "светодиод", "led", "реле", "relay", "пьезо", "пищал", "зуммер", "сирен",
+        "buzzer", "gong", "серво", "servo", "sg90", "мотор", "motor", "двигател",
+        "вентилятор", "насос", "кулер", "кнопк", "button", "переключател",
+        "потенциометр", "экран", "диспле", "oled", "lcd", "screen", "display",
+        "датчик", "термометр", "термистор", "фоторезистор", "ldr", "дальномер",
+        "барометр", "dht11", "dht22", "ds18b20", "bmp180", "bmp280", "bme280",
+        "hc-sr04", "fs1000a", "xy-mk", "rc522", "tsop", "семисегмент", "7seg",
+        "флешк", "флеш", "sd", "microsd", "карта", "клавиатур", "динамик",
+        "спикер",
+    ];
+    PARTS.iter().any(|p| t.starts_with(p))
+}
+
+fn is_negation(token: &str) -> bool {
+    matches!(bare(token), "не" | "нет" | "ни")
+}
+
+/// A verb that turns "не" into a refusal: "не нужно", "не использовать".
+fn is_refusal_verb(token: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "нуж", "над", "понад", "треб", "использ", "подключ", "став", "ставить",
+        "будем", "надо", "обойтись", "обойдемся",
+    ];
+    let t = bare(token);
+    VERBS.iter().any(|v| t.starts_with(v))
+}
+
+fn is_negated(tokens: &[&str], i: usize) -> bool {
+    // A refusal belongs to the nearest part and stays inside its clause: in
+    // "светодиод, реле не нужно" it rules out the relay, not the LED before.
+    let mut start = i;
+    while start > 0 {
+        let token = tokens[start - 1];
+        if is_part_token(token) || ends_clause(token) {
+            break;
+        }
+        start -= 1;
+    }
+    let before = &tokens[start..i];
+    // "без реле", "кроме реле".
+    if before.iter().any(|t| matches!(bare(t), "без" | "кроме")) {
+        return true;
+    }
+    // "не использовать реле": refusal before the part.
+    if before.iter().any(|t| is_negation(t)) && before.iter().any(|t| is_refusal_verb(t)) {
+        return true;
+    }
+    // "реле не нужно": refusal after the part, up to the clause end or the
+    // next part. A plain "не мигает" is not a refusal: no verb of the list
+    // follows the "не".
+    let mut end = i + 1;
+    while end < tokens.len() {
+        let token = tokens[end];
+        if is_part_token(token) {
+            break;
+        }
+        end += 1;
+        if ends_clause(token) {
+            break;
+        }
+    }
+    let after = &tokens[i + 1..end];
+    after.iter().any(|t| is_negation(t)) && after.iter().any(|t| is_refusal_verb(t))
+}
+
+/// The word after "датчик" that names what it measures. Dropped together
+/// with a refused "датчик", so "датчик температуры не нужен" leaves neither.
+/// The stems are chosen not to swallow parts: "свет" would eat the LED in
+/// "без датчика температуры, светодиод", so only "света" is a measurement.
+fn is_measure_word(token: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "температур", "влажност", "давлен", "освещ", "света", "расстоян", "движен",
+        "газ", "дым", "звук", "почв", "грунт", "ток", "уровн",
+    ];
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric());
+    WORDS.iter().any(|w| t.starts_with(w))
+}
+
+/// A short Latin word is a whole token: "sd" must not match inside another
+/// word, while "microsd" and "sd-карта" still name the card.
+fn names_card(text: &str) -> bool {
+    text.split_whitespace().any(|t| {
+        let t = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        t == "sd" || t.starts_with("sd-") || t == "microsd" || t == "sd card"
+    }) || text.contains("карта памяти")
+        || text.contains("флеш")
+        || text.contains("накопител")
+}
+
+/// Everyday words for heat. "Символы термометра" on a screen are a drawing,
+/// not a sensor; DS3231 has a temperature register, but that is the
+/// checklist's business, not the parser's.
+fn count_temperature(text: &str) -> usize {
+    // "Термометр на термисторе" is one probe, not a thermometer plus a
+    // thermistor. The named part wins; the ordinary word only describes it.
+    let probe = count_sensors(
+        text,
+        &["термистор", "терморезистор", "ntc", "thermistor"],
+    );
+    if probe > 0 {
+        return probe;
+    }
+    let mut n = count_sensors(
+        text,
+        &["температур", "термодатч", "temperature", "thermometer"],
+    );
+    if !text.contains("символ") {
+        n += count_sensors(text, &["термометр"]);
+    }
+    n
+}
+
+/// A clock is a noun ("часы"), not a duration ("два часа"). The same
+/// distinction the parser makes for the routing table is needed by the
+/// checklist, so it lives here with the other named parts.
+fn names_clock(text: &str) -> bool {
+    let chip = text.contains("clock")
+        || text.contains("ds3231")
+        || text.contains("ds1307")
+        || text.contains("ds1302")
+        || text.contains("rtc")
+        || text.contains("часы реальн");
+    // "Часы, минуты и секунды" are the fields of a time, not a clock part:
+    // a task that prints them does not have to carry an RTC.
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty() && *t != "и")
+        .collect();
+    let time_fields = words
+        .windows(2)
+        .any(|w| w[0].starts_with("час") && w[1].starts_with("минут"));
+    if time_fields && !chip {
+        return false;
+    }
+    let noun = [
+        "часы", "часов", "часам", "часами", "часах", "часики", "будильник",
+    ]
+    .iter()
+    .any(|w| text.split_whitespace().any(|t| t == *w));
+    noun || chip
+}
+
+/// The Uno pin from "к пину 9", "на пин 9", "pin 9" or "D9". Only the
+/// number next to a pin word counts: "9 светодиодов" is a count, not a pin.
+fn named_pin(text: &str) -> Option<u8> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let number = |t: &str| -> Option<u8> {
+        let t = t.trim_matches(|c: char| !c.is_alphanumeric());
+        let t = t.strip_prefix('d').or_else(|| t.strip_prefix('D')).unwrap_or(t);
+        t.parse::<u8>().ok().filter(|n| *n <= 19)
+    };
+    for (i, token) in tokens.iter().enumerate() {
+        let clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+        if clean.len() > 1 && (clean.starts_with('d') || clean.starts_with('D')) {
+            if let Some(n) = number(clean) {
+                return Some(n);
+            }
+        }
+        let is_pin = crate::words::mentions(clean, "пин")
+            || crate::words::mentions(clean, "pin")
+            || crate::words::mentions(clean, "вывод");
+        if is_pin {
+            if let Some(n) = tokens.get(i + 1).and_then(|t| number(t)) {
+                return Some(n);
+            }
+            if let Some(n) = i.checked_sub(1).and_then(|j| number(tokens[j])) {
+                return Some(n);
+            }
+        }
+        // "к пину 9": the pin word is the previous token.
+        if let Some(n) = number(clean) {
+            let prev = i.checked_sub(1).and_then(|j| tokens.get(j));
+            if prev.is_some_and(|p| crate::words::mentions(p, "пин") || crate::words::mentions(p, "pin")) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Soil moisture is a different part, not a DHT reading. "Грунт" and
+/// "влажность земли" mean the same probe as "почва".
+fn names_soil(text: &str) -> bool {
+    text.contains("почв")
+        || text.contains("грунт")
+        || text.contains("soil")
+        || (text.contains("влажност") && text.contains("земл"))
+}
+
+fn count_humidity(text: &str) -> usize {
+    if names_soil(text) {
+        return 0;
+    }
+    // "Термистор от влажности в комнате" names a cause, not a sensor: the
+    // probe is the thermistor, and demanding a humidity board would be wrong.
+    if text.contains("от влажност") || text.contains("зависит от влажност") {
+        return 0;
+    }
+    count_sensors(text, &["влажност", "humidity"])
+}
+
+fn count_light(text: &str) -> usize {
+    let named = count_sensors(
+        text,
+        &["фоторезистор", "ldr", "освещ", "light", "photoresistor"],
+    );
+    if named > 0 {
+        return named;
+    }
+    // "Датчик света" is a phrase: a bare "свет" in "выключатель света" is the
+    // lamp being switched, not a photoresistor.
+    if text.contains("датчик света") {
+        return count_sensors(text, &["света"]);
+    }
+    0
+}
+
 pub fn named_devices(raw: &str) -> NamedDevices {
-    let text = crate::words::normalize(raw);
+    let text = crate::words::normalize(&without_negated_parts(raw));
     let rgb = count_of(&text, &["rgb", "трёхцвет", "трехцвет", "цветной светодиод"]);
+    // The keys of a telephone are not parts on the bench: "все 16 кнопок
+    // телефона" is a DTMF decoder task, not sixteen tact switches.
+    let phone_keypad = text.contains("кнопок телефона")
+        || text.contains("кнопки телефона")
+        || text.contains("клавиш телефона");
+    let radio_words = text.contains("радио")
+        || text.contains("433")
+        || text.contains("nrf")
+        || text.contains("fs1000")
+        || text.contains("xy-mk");
+    let dht22 = count_sensors(&text, &["dht22"]);
+    let dht11 = count_sensors(&text, &["dht11"]);
+    let soil = if names_soil(&text) {
+        count_sensors(&text, &["почв", "грунт", "soil", "fc-28", "yl-69", "yl-38"])
+            .max(1)
+    } else {
+        0
+    };
     NamedDevices {
         screens: screens_in(raw),
         buzzer: count_of(&text, &["пьезо", "пищал", "зуммер", "сирен", "buzzer", "gong"]),
         relay: count_of(&text, &["реле", "relay"]),
         // "RGB" is a light-emitting diode too, but it is one part with three
-        // channels: counting it twice would draw a second, needless LED.
-        led: if rgb > 0 {
+        // channels: counting it twice would draw a second, needless LED. A
+        // seven-segment or matrix indicator is a screen, not an LED either.
+        led: if rgb > 0
+            || (!text.contains("светодиод")
+                && (text.contains("семисегмент")
+                    || text.contains("7seg")
+                    || text.contains("матричн")
+                    || text.contains("max7219")
+                    || text.contains("дисплей")
+                    || text.contains("экран")
+                    || text.contains("lcd")
+                    || text.contains("oled")))
+        {
             0
         } else {
             count_of(
@@ -739,20 +1206,67 @@ pub fn named_devices(raw: &str) -> NamedDevices {
                 "towerpro",
             ],
         ),
-        button: count_of(&text, &["кнопк", "button", "переключател"]),
+        button: if phone_keypad {
+            0
+        } else {
+            count_of(&text, &["кнопк", "button", "переключател"])
+        },
         hourly: text.contains("каждый час") || text.contains("раз в час")
             || text.contains("hourly") || text.contains("every hour"),
+        temperature: count_temperature(&text),
+        humidity: count_humidity(&text),
+        soil,
+        pressure: count_sensors(
+            &text,
+            &["давлен", "барометр", "bmp180", "bmp280", "bme280", "pressure", "barometer"],
+        ),
+        light: count_light(&text),
+        range: count_sensors(
+            &text,
+            &["расстоян", "дальномер", "ультразвук", "hc-sr04", "distance", "ranger", "ultrasonic"],
+        ),
+        gas: count_sensors(&text, &["газ", "дым", "mq-2", "mq2", "gas"]),
+        dht11,
+        dht22,
+        fs1000a: text.contains("fs1000a"),
+        xy_mk: text.contains("xy-mk"),
+        rc522: text.contains("rc522") || text.contains("rfid") || text.contains("метк"),
+        tsop: text.contains("tsop")
+            || text.contains("ик приемник")
+            || text.contains("ик-приемник"),
+        sd: names_card(&text) && !text.contains("доступ"),
+        segments: count_sensors(&text, &["семисегмент", "7seg", "tm1650", "tm1637"]),
+        sound: count_sensors(&text, &["хлоп", "хлопк"]),
+        clock: names_clock(&text),
+        pin: named_pin(&text),
+        radio_pair: radio_words
+            && (text.contains("передатчик") || text.contains("transmitter"))
+            && (text.contains("приемник")
+                || text.contains("приёмник")
+                || text.contains("receiver")),
+        phone: text.contains("телефон") || text.contains("сотов"),
     }
 }
 
 pub fn screens_in(raw: &str) -> Option<Screens> {
-    let text = crate::words::normalize(raw);
-    let named = ["диспле", "экран", "табло", "lcd", "oled", "display", "128x64", "128 64", "16x2", "2004"];
+    let text = crate::words::normalize(&without_negated_parts(raw));
+    let named = [
+        "диспле", "экран", "табло", "lcd", "oled", "display", "screen", "128x64", "128 64",
+        "16x2", "2004", "матричн", "max7219", "семисегмент", "7seg", "tm1650", "tm1637",
+    ];
     let is_screen = named.iter().any(|k| text.contains(k));
     if !is_screen || (text.contains("порт") && !text.contains("диспле") && !text.contains("экран")) {
         return None;
     }
-    let kind = if text.contains("oled") || text.contains("128x64") || text.contains("128 64") {
+    let matrix = (text.contains("матричн") || text.contains("max7219"))
+        && !text.contains("клавиатур");
+    let segments = text.contains("семисегмент")
+        || text.contains("7seg")
+        || text.contains("tm1650")
+        || text.contains("tm1637");
+    let kind = if matrix || segments {
+        ScreenKind::Any
+    } else if text.contains("oled") || text.contains("128x64") || text.contains("128 64") {
         ScreenKind::Oled
     } else if text.contains("2004") || text.contains("20 4") {
         ScreenKind::Lcd2004
@@ -761,25 +1275,21 @@ pub fn screens_in(raw: &str) -> Option<Screens> {
     } else {
         ScreenKind::Any
     };
-    let count = if ["два", "две", "двух", "2", "two", "pair"]
-        .iter()
-        .any(|w| text.split_whitespace().any(|t| t == *w))
-    {
-        2
-    } else if ["три", "трёх", "трех", "3", "three"]
-        .iter()
-        .any(|w| text.split_whitespace().any(|t| t == *w))
-    {
-        3
-    } else if ["четыре", "четырёх", "четырех", "4", "four"]
-        .iter()
-        .any(|w| text.split_whitespace().any(|t| t == *w))
-    {
-        4
-    } else {
-        1
-    };
-    Some(Screens { kind, count })
+    // The number belongs to the screen, not to any earlier noun: "две кнопки
+    // и дисплей" is one display, while "два экрана" is two. A second mention
+    // without its own number is the same screen said twice: "вывода на
+    // дисплей ... на матричный дисплей" asks for one board, not two.
+    let count = number_of(&text, &[
+        "дисплей", "экран", "табло", "screen", "display", "lcd", "oled",
+        "матричн", "max7219", "семисегмент", "7seg", "tm1650", "tm1637",
+    ])
+    .max(1);
+    Some(Screens {
+        kind,
+        count,
+        matrix,
+        segments,
+    })
 }
 
 /// A sentence that asks to show a text message on a display and names no
@@ -787,8 +1297,8 @@ pub fn screens_in(raw: &str) -> Option<Screens> {
 /// scene: the displays are the whole circuit, so the parser must not pull a
 /// motion sensor out of a similar-looking word.
 pub fn text_screen_task(raw: &str) -> Option<Screens> {
-    let text = crate::words::normalize(raw);
-    let screens = match screens_in(raw) {
+    let text = crate::words::normalize(&without_negated_parts(raw));
+    let screens = match screens_in(&text) {
         Some(screens) => screens,
         // "Текст и светодиод" names no display type, but a bare message next
         // to an output is still a text scene. On its own ("переведи текст")
@@ -798,10 +1308,20 @@ pub fn text_screen_task(raw: &str) -> Option<Screens> {
                 .iter()
                 .any(|w| text.contains(w)) =>
         {
-            Screens { kind: ScreenKind::Any, count: 1 }
+            Screens {
+                kind: ScreenKind::Any,
+                count: 1,
+                matrix: false,
+                segments: false,
+            }
         }
         None => return None,
     };
+    // A matrix or a seven-segment board is a lesson with its own driver, not
+    // the I2C text scene: printing "Privet!" on it would be a different task.
+    if screens.matrix || screens.segments {
+        return None;
+    }
     let message = [
         "приветств", "привет", "надпис", "сообщен", "greeting", "hello", "caption",
     ]
@@ -844,6 +1364,14 @@ pub fn parse(raw: &str) -> Parse {
     parse_inner(raw, true)
 }
 
+/// The same parser without the printed-task table. Tests use it to measure
+/// how much of the book corpus the parser itself understands, instead of the
+/// exact lookup answering for it.
+#[cfg(test)]
+pub(crate) fn parse_without_books(raw: &str) -> Parse {
+    parse_inner(raw, false)
+}
+
 /// A task copied word for word is answered by its ready-made solution
 /// instead of being guessed from a few keywords.
 #[cfg(feature = "book-tasks")]
@@ -881,10 +1409,107 @@ fn specific_parts(raw: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "book-tasks")]
+fn lesson_fits_named(i: usize, named: &NamedDevices) -> bool {
+    let Some(lesson) = crate::lessons::ALL.get(i) else {
+        return false;
+    };
+    let keys = |words: &[&str]| lesson.keys.iter().any(|k| words.iter().any(|w| k.contains(w)));
+    let boards = |names: &[&str]| {
+        lesson
+            .boards
+            .iter()
+            .any(|b| names.iter().any(|n| b.name.starts_with(n)))
+    };
+    // A storage lesson keeps readings; it does not read them. "Записать
+    // дневную влажность в EEPROM" is the EEPROM lesson even though that
+    // lesson has no humidity sensor of its own, and the checklist still
+    // demands the sensor from the build.
+    let storage = keys(&["eeprom", "sd", "карта памяти", "флеш"]);
+    // A display lesson shows whatever the code sends it: the printed rows
+    // that put a clock on an LCD, a matrix, a Nokia panel or a TV are the
+    // book's own answer, and the clock word describes the picture, not a
+    // chip the lesson must draw. The checklist still counts the clock, so a
+    // build without one is a recorded loss.
+    let display = keys(&[
+        "дисплей", "экран", "матриц", "nokia", "oled", "телевизор", "p10", "lcd", "tft",
+    ]);
+    if !storage && named.temperature > 0
+        && !(keys(&[
+            "температур",
+            "термистор",
+            "терморезистор",
+            "ds18b20",
+            "dht11",
+            "dht22",
+            "давлен",
+            "bmp",
+        ]) || boards(&["DS18B20", "DHT", "BMP", "BME"]))
+    {
+        return false;
+    }
+    if !storage && named.humidity > 0
+        && !(keys(&["влажност", "dht"]) || boards(&["DHT", "BME", "BMP"]))
+    {
+        return false;
+    }
+    if !storage && named.soil > 0 && !(keys(&["почв", "грунт", "soil"]) || boards(&["SOIL"])) {
+        return false;
+    }
+    if !storage && named.pressure > 0
+        && !(keys(&["давлен", "bmp"]) || boards(&["BMP", "BME"]))
+    {
+        return false;
+    }
+    if !storage && named.light > 0
+        && !(keys(&["фоторезистор", "ldr", "освещ", "свет"])
+            || boards(&["GL5528"]))
+    {
+        return false;
+    }
+    if !storage && named.range > 0 && !keys(&["дальномер", "ультразвук", "hc-sr04", "расстоян"]) {
+        return false;
+    }
+    if !storage && named.gas > 0 && !(keys(&["газ", "дым", "mq-2"]) || boards(&["MQ-2"])) {
+        return false;
+    }
+    if !storage
+        && !display
+        && named.clock
+        && !(keys(&["часы реальн", "ds3231", "ds1307", "rtc"]) || boards(&["DS3231"]))
+    {
+        return false;
+    }
+    // A named segment display is added to the lesson by the builder, so it
+    // does not have to be in the lesson's own keys: "измерение тока ... на
+    // 4 разрядный семисегментный дисплей" stays the current-sensor lesson
+    // and gets the display drawn beside it.
+    if named.sd && !keys(&["sd", "карта памяти"]) {
+        return false;
+    }
+    if named.rc522 && !keys(&["rc522", "rfid", "метк"]) {
+        return false;
+    }
+    if named.tsop && !keys(&["tsop", "ик приемник", "ик-приемник"]) {
+        return false;
+    }
+    true
+}
+
+#[cfg(feature = "book-tasks")]
 fn from_book_solution(raw: &str, solution: crate::book_tasks::Solution) -> Parse {
     use crate::book_tasks::Solution;
     match solution {
         Solution::Lesson(i) => {
+            let named = named_devices(raw);
+            // The printed table maps a rounded-off sentence to a lesson. That
+            // entry can be worse than the ordinary reading: "термометр на
+            // термисторе ... на экран" was filed under the TV OUT lesson.
+            // When the lesson does not contain the sensor the sentence names,
+            // the parser's own reading wins; a lookup is never allowed to
+            // answer a different question.
+            if !lesson_fits_named(i, &named) {
+                return parse_inner(raw, false);
+            }
             let mut parsed = parse_inner(crate::lessons::ALL[i].title.ru, false);
             // A bare title such as "Кнопка" is also an everyday word, so the
             // title alone may route elsewhere. The book already says which
@@ -893,6 +1518,7 @@ fn from_book_solution(raw: &str, solution: crate::book_tasks::Solution) -> Parse
             parsed.unsupported = None;
             parsed.alternatives.clear();
             parsed.intent.raw = raw.to_string();
+            parsed.intent.named = named_devices(raw);
             parsed
         }
         Solution::Seed(seed) => {
@@ -916,6 +1542,7 @@ fn from_book_solution(raw: &str, solution: crate::book_tasks::Solution) -> Parse
             } else {
                 let mut parsed = seeded;
                 parsed.intent.raw = raw.to_string();
+                parsed.intent.named = named_devices(raw);
                 parsed
             }
         }
@@ -935,9 +1562,13 @@ fn fuzzy_book_task(_raw: &str) -> Option<(Parse, usize, u8)> {
 fn parse_inner(raw: &str, books: bool) -> Parse {
     let _ = books;
     // The user's own sentence stays in `raw`, so numbers in it ("на 49 карт")
-    // still reach the sketch.
+    // still reach the sketch. A refused part is removed before any reading,
+    // so the plan and the checklist never see "реле" in "реле не нужно".
+    let norm = crate::words::normalize(raw);
+    let clean = crate::words::normalize(&without_negated_parts(raw));
+    let negated = clean != norm;
     let mut book_hint: Option<(Parse, usize, u8)> = None;
-    if books {
+    if books && !negated {
         if let Some(mut parsed) = exact_book_task(raw) {
             parsed.trace.insert(0, "book: exact task".to_string());
             return parsed;
@@ -947,7 +1578,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         // demo. A copied task still wins above, and a fuzzy match to a
         // sensor, radio or storage keeps its own circuit.
         if let Some((parsed, index, score)) = fuzzy_book_task(raw) {
-            let own_text = text_screen_task(raw).is_some()
+            let own_text = text_screen_task(&clean).is_some()
                 && parsed
                     .intent
                     .lesson
@@ -966,6 +1597,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             }
         }
     }
+    let named = named_devices(raw);
     let text = search_text(raw);
     let mut matched = Vec::new();
     let mut understood = Vec::new();
@@ -1135,7 +1767,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // the displays are the circuit. A named LED, relay or buzzer next to the
     // screen is an output, not a different reading, and is added to it later.
     let text_screens = if !named_input && !transistor {
-        text_screen_task(raw)
+        text_screen_task(&clean)
     } else {
         None
     };
@@ -1161,8 +1793,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // not the buzzer lesson.
     if clock_object
         && !board_load
-        && !seven_segment(&text)
-        && (screens_in(raw).is_some() || named_load)
+        && (screens_in(&clean).is_some() || named_load || named.segments > 0)
     {
         if let Some(rtc) = crate::lessons::ALL
             .iter()
@@ -1185,10 +1816,25 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // word. The sensor the sentence itself names is the stronger evidence:
     // when the lesson teaches a different sensor, it is the wrong lesson.
     let lesson_source = lesson.and_then(crate::spec::source_for_lesson);
-    let named_source = crate::compose::source_in_text(raw);
+    let named_source = crate::compose::source_in_text(&clean);
+    // A DHT board reports both temperature and humidity, so a task that asks
+    // for either one is not a different lesson. A thermistor and the DS18B20
+    // read the same quantity through different parts, and the lesson teaches
+    // both: the part is the sentence's choice, not a different question.
+    let same_reading = |a: crate::spec::SourceId, b: crate::spec::SourceId| {
+        use crate::spec::SourceId::{Humidity, Temperature, Thermistor};
+        a == b
+            || matches!(
+                (a, b),
+                (Humidity, Temperature)
+                    | (Temperature, Humidity)
+                    | (Temperature, Thermistor)
+                    | (Thermistor, Temperature)
+            )
+    };
     let wrong_source = lesson_source
         .zip(named_source)
-        .is_some_and(|(a, b)| a.id != b.id);
+        .is_some_and(|(a, b)| !same_reading(a.id, b.id));
     if named_load && board_load {
         if let Some(i) = lesson {
             let l = &crate::lessons::ALL[i];
@@ -1259,7 +1905,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     let recipe = if clock_tick && beeper {
         None
     } else {
-        crate::compose::detect(raw, load, named_load, lesson, action, condition)
+        crate::compose::detect(&clean, load, named_load, lesson, action, condition)
     };
     let mut refusal = None;
     if let Some(r) = recipe {
@@ -1291,7 +1937,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         input.is_some() && semantic != crate::templates::route(load, None);
     let unsupported = if let Some(r) = refusal {
         Some(r)
-    } else if lesson.is_some() || text_screens.is_some() {
+    } else if lesson.is_some() || text_screens.is_some() || recipe.is_some() {
         None
     } else if !named_load && !input_matters {
         Some(L::new(
@@ -1322,6 +1968,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     let intent_of = |load: Load, input: Option<Input>| Intent {
         load,
         input,
+        named,
         transistor,
         presses,
         lesson: None,
@@ -1450,6 +2097,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         intent: Intent {
             load,
             input,
+            named,
             transistor,
             presses,
             lesson,
@@ -1577,14 +2225,33 @@ mod tests {
             crate::lessons::ALL[lesson].title
         );
 
-        // A clock on a seven-segment display is not the DS3231 demo.
+        // A clock on a seven-segment display is a clock: the RTC keeps the
+        // time and the segments show it. The segment lesson (counting digits)
+        // used to win because its words matched better, and the clock was
+        // silently dropped.
         let p = parse("часы на семисегментном индикаторе");
-        let lesson = p.intent.lesson.expect("the segment lesson wins");
+        let lesson = p.intent.lesson.expect("the clock lesson wins");
         assert!(
-            !crate::lessons::ALL[lesson].keys.contains(&"ds3231"),
+            crate::lessons::ALL[lesson].keys.contains(&"ds3231"),
             "picked {:?}",
             crate::lessons::ALL[lesson].title
         );
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the clock builds");
+        assert!(built.circuit.parts().any(|part| part.value == "DS3231"));
+        assert!(
+            built.circuit.parts().any(|part| part.value == "7SEG-4"),
+            "the segments the sentence names must be drawn"
+        );
+        assert!(
+            !built
+                .circuit
+                .parts
+                .iter()
+                .any(|part| part.kind == crate::model::Kind::Led),
+            "a segment display is not an LED"
+        );
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
     }
 
     #[test]
@@ -1607,9 +2274,147 @@ mod tests {
             .iter()
             .any(|part| part.kind == crate::model::Kind::Motor));
         assert_eq!(
-            crate::checks::run_with(&built, crate::text::Lang::Ru, &p.intent.raw).failed(),
+            crate::checks::run_with(&built, crate::text::Lang::Ru, &p.intent).failed(),
             0
         );
+    }
+
+    /// "Влажность грунта" and "влажность земли" are the same probe as
+    /// "влажность почвы". They used to fall through to the DHT22 lesson, and
+    /// a measurement with a display was refused outright even when the recipe
+    /// was found.
+    #[test]
+    fn soil_moisture_is_not_humidity_and_a_readout_is_enough() {
+        for task in [
+            "Измерить влажность грунта и вывести на экран",
+            "Измерить влажность земли и вывести на LCD1602",
+        ] {
+            let p = parse(task);
+            assert!(p.unsupported.is_none(), "{task}: {}", p.unsupported.as_ref().map(|u| &u.ru).cloned().unwrap_or_default());
+            let recipe = p.intent.recipe.expect("the soil probe composes");
+            assert_eq!(recipe.source, crate::spec::SourceId::Soil, "{task}");
+            let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+                .expect("the soil readout builds");
+            assert!(
+                built.circuit.parts().any(|part| part.value == "SOIL"),
+                "{task} must wire the soil probe"
+            );
+            assert!(
+                !built.circuit.parts().any(|part| part.value.starts_with("DHT")),
+                "{task} is not a DHT22 question"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_part_is_not_named_or_built() {
+        let p = parse("кнопка и светодиод, реле не нужно");
+        assert_eq!(p.intent.named.relay, 0, "the relay was refused");
+        assert_eq!(p.intent.named.led, 1, "the LED is still asked for");
+        assert!(
+            p.understood.iter().all(|l| !l.ru.contains("Реле")),
+            "a refused part must not be understood: {:?}",
+            p.understood.iter().map(|l| &l.ru).collect::<Vec<_>>()
+        );
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the button and LED build");
+        assert!(
+            !built
+                .circuit
+                .parts
+                .iter()
+                .any(|part| part.kind == crate::model::Kind::Relay),
+            "a refused relay must not be drawn"
+        );
+        assert!(
+            crate::requirements::missing(&built, &p.intent).is_empty(),
+            "the checklist must not demand the refused relay"
+        );
+    }
+
+    /// "Без датчика температуры и влажности" refuses both readings, and the
+    /// LED after the comma is still a request. The word "свет" is a quantity
+    /// only as "света": otherwise the LED itself would be eaten as one.
+    #[test]
+    fn a_refused_sensor_list_leaves_the_rest() {
+        let p = parse("без датчика температуры и влажности, светодиод");
+        assert_eq!(p.intent.named.temperature, 0);
+        assert_eq!(p.intent.named.humidity, 0);
+        assert_eq!(p.intent.named.led, 1);
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the LED still builds");
+        assert!(
+            !built.circuit.parts().any(|part| part.value.starts_with("DS18B20")
+                || part.value.starts_with("DHT")),
+            "a refused sensor must not be drawn"
+        );
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
+    }
+
+    /// A flash drive is storage, not an unknown load: the SD lesson answers
+    /// "записать на флешку" instead of refusing the whole sentence.
+    #[test]
+    fn a_flash_drive_is_storage() {
+        let p = parse("записать на флешку");
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported.map(|u| u.ru));
+        assert!(p.intent.named.sd, "the flash drive is storage");
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the storage task builds");
+        assert!(built.circuit.parts().any(|part| part.value == "SD"));
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
+    }
+
+    /// The parser extracts the sensors once, and the checklist reads that
+    /// same object: two DHT22 and two temperature sensors are four readings,
+    /// not one.
+    #[test]
+    fn sensor_counts_come_from_the_same_parse() {
+        let p = parse("два DHT22 и два датчика температуры с выводом на экран");
+        assert_eq!(p.intent.named.dht22, 2);
+        assert_eq!(p.intent.named.temperature, 2);
+        let p = parse("влажность грунта и насос");
+        assert_eq!(p.intent.named.soil, 1);
+        assert_eq!(p.intent.named.humidity, 0);
+    }
+
+    /// The refusal belongs to its clause. "Датчик температуры не нужен,
+    /// нужен светодиод" asks for an LED and no sensor.
+    #[test]
+    fn a_refusal_does_not_reach_the_next_clause() {
+        let p = parse("датчик температуры не нужен, нужен светодиод");
+        assert_eq!(p.intent.named.temperature, 0);
+        assert_eq!(p.intent.named.led, 1);
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported.map(|u| u.ru));
+        let p = parse("не нужен датчик температуры, нужен светодиод");
+        assert_eq!(p.intent.named.temperature, 0);
+        assert_eq!(p.intent.named.led, 1);
+    }
+
+    /// "Не мигает, а горит" is how the lamp behaves, not a refusal: dropping
+    /// the LED there would lose the part the sentence is about.
+    #[test]
+    fn a_negative_verb_is_not_a_refusal() {
+        let p = parse("светодиод не мигает, а горит");
+        assert_eq!(p.intent.named.led, 1);
+    }
+
+    /// "Термистор от влажности в комнате" names a cause, not a humidity
+    /// board: the checklist must not demand a sensor the task never asked for.
+    #[test]
+    fn a_humidity_word_can_name_a_cause() {
+        let p = parse("Терменвокс на пьезопищалке и термисторе от влажности в комнате.");
+        assert_eq!(p.intent.named.humidity, 0);
+    }
+
+    /// A humidity board reports temperature too, so asking for both readings
+    /// keeps the DHT lesson instead of refusing the sentence as a mismatch.
+    #[test]
+    fn humidity_and_temperature_share_one_board() {
+        let p = parse("датчик влажности и датчик температуры");
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported.map(|u| u.ru));
+        let built = crate::templates::build(&p.intent, 0, crate::text::Lang::Ru)
+            .expect("the DHT lesson answers both readings");
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
     }
 
     #[test]
@@ -1633,7 +2438,7 @@ mod tests {
         let count = |kind| built.circuit.parts.iter().filter(|x| x.kind == kind).count();
         assert_eq!(count(crate::model::Kind::Button), 2);
         assert_eq!(count(crate::model::Kind::Led), 2);
-        let report = crate::checks::run_with(&built, crate::text::Lang::Ru, &p.intent.raw);
+        let report = crate::checks::run_with(&built, crate::text::Lang::Ru, &p.intent);
         assert_eq!(report.failed(), 0);
     }
 
@@ -1965,5 +2770,36 @@ mod tests {
         assert_eq!(named_devices("датчик движения и два светодиода").led, 2);
         assert_eq!(named_devices("два светодиода, реле").relay, 1);
         assert_eq!(named_devices("два красных светодиода").led, 2);
+    }
+
+    /// Counts must reach the numbers the books use and stay with their noun.
+    /// A ten-LED task that becomes a one-LED blink is exactly the silent
+    /// "similar, but not that" the checklist is meant to catch.
+    #[test]
+    fn counts_go_past_four_and_stay_with_their_noun() {
+        let n = named_devices("10 светодиодов и 5 кнопок");
+        assert_eq!(n.led, 10);
+        assert_eq!(n.button, 5);
+
+        let n = named_devices("3 красных и 2 зелёных светодиода");
+        assert_eq!(n.led, 5);
+
+        let n = named_devices("две кнопки и три светодиода");
+        assert_eq!(n.button, 2);
+        assert_eq!(n.led, 3);
+
+        assert_eq!(named_devices("пьезо пищалка").buzzer, 1);
+        assert_eq!(named_devices("3 раза мигнуть светодиодом").led, 1);
+        assert_eq!(named_devices("два датчика и светодиод").led, 1);
+        assert_eq!(named_devices("16 кнопок телефона").button, 0);
+    }
+
+    #[test]
+    fn a_number_belongs_to_the_screen_it_counts() {
+        assert_eq!(screens_in("две кнопки и дисплей").unwrap().count, 1);
+        assert_eq!(screens_in("три режима и экран").unwrap().count, 1);
+        assert_eq!(screens_in("два экрана").unwrap().count, 2);
+        assert_eq!(screens_in("три OLED").unwrap().count, 3);
+        assert_eq!(screens_in("экран 16x2").unwrap().count, 1);
     }
 }

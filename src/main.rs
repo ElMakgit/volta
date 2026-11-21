@@ -49,7 +49,7 @@ volta — схема из текста: макетка, скетч, скринш
   volta --help
 
 Ключи для render:
-  --choice N      вариант деталей, 0..2 (по умолчанию 0)
+  --choice N      вариант деталей, 0..2 (по умолчанию рекомендованный)
   --out DIR       куда писать файлы (по умолчанию ~/Pictures/volta)
   --lang ru|en    язык скетча и подписей (по умолчанию из Omarchy)
   --labels        подписать детали на скриншоте
@@ -83,6 +83,10 @@ fn main() {
 struct Flags {
     task: String,
     choice: usize,
+    /// Whether the user picked a variant. Without a pick the render follows
+    /// the plan's recommendation, the same way the window does: a title that
+    /// promises a screen must not be paired with a circuit that has none.
+    choice_set: bool,
     out: PathBuf,
     lang: text::Lang,
     labels: bool,
@@ -95,6 +99,7 @@ fn flags(args: &[String]) -> Flags {
     let mut f = Flags {
         task: String::new(),
         choice: 0,
+        choice_set: false,
         out: png::default_dir(),
         lang: crate::config::lang(),
         labels: false,
@@ -108,6 +113,7 @@ fn flags(args: &[String]) -> Flags {
             "--choice" => {
                 i += 1;
                 f.choice = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                f.choice_set = true;
             }
             "--out" => {
                 i += 1;
@@ -336,7 +342,14 @@ fn cmd_render(args: &[String]) {
         }
         std::process::exit(1);
     }
-    let Some(built) = templates::build(&parsed.intent, f.choice, lang) else {
+    let choice = if f.choice_set {
+        f.choice
+    } else {
+        templates::plan(&parsed.intent, lang)
+            .map(|p| p.recommended)
+            .unwrap_or(0)
+    };
+    let Some(built) = templates::build(&parsed.intent, choice, lang) else {
         let msg = parsed
             .unsupported
             .map(|l| l.get(lang).to_string())
@@ -348,7 +361,7 @@ fn cmd_render(args: &[String]) {
         }
         std::process::exit(1);
     };
-    let report = checks::run_with(&built, lang, &f.task);
+    let report = checks::run_with(&built, lang, &parsed.intent);
 
     let th = theme::Theme::load();
     let sc = scene::draw(
