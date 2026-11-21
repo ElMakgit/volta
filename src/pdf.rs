@@ -3,7 +3,6 @@
 //! A page is the same rasterised scene as the PNG, wrapped in a minimal PDF
 //! with a JPEG image XObject. No print driver or external converter is needed.
 
-use std::io::Cursor;
 use std::path::Path;
 
 use image::codecs::jpeg::JpegEncoder;
@@ -90,7 +89,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let out = dir.join("test.pdf");
         let scene = Scene {
-            prims: vec![PrimRect()],
+            prims: vec![prim_rect()],
             owners: vec![],
             bg: Rgba::rgb(240, 240, 240),
             w: 10.0,
@@ -104,7 +103,7 @@ mod tests {
         let _ = std::fs::remove_file(out);
     }
 
-    fn PrimRect() -> crate::scene::Prim {
+    fn prim_rect() -> crate::scene::Prim {
         crate::scene::Prim::Rect {
             r: Rect::new(1.0, 1.0, 8.0, 4.0),
             radius: 0.0,

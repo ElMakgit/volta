@@ -1861,8 +1861,9 @@ impl App {
                 .id_salt("why-this")
                 .show(ui, |ui| {
                     for line in &p.trace {
+                        let shown = crate::text::localize_trace(line, self.lang);
                         ui.label(
-                            RichText::new(line)
+                            RichText::new(shown)
                                 .size(10.0)
                                 .monospace()
                                 .color(muted),

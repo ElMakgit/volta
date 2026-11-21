@@ -593,6 +593,38 @@ impl Coverage {
     pub fn full(&self) -> bool {
         self.total > 0 && self.missing.is_empty()
     }
+
+    /// The same sentence in the plan header and in a lesson's `why`: how much
+    /// of the typed task the plan closes and what it leaves open.
+    pub fn describe(&self, lang: Lang) -> String {
+        let mut out = String::new();
+        if self.total > 0 {
+            out.push_str(&format!(
+                "{} {}% ({} {}/{})",
+                crate::text::tr(lang, "покрытие слотов", "slot coverage"),
+                self.percent(),
+                crate::text::tr(lang, "закрыто", "closed"),
+                self.closed,
+                self.total
+            ));
+        }
+        if !self.missing.is_empty() {
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            let missing: Vec<String> = self
+                .missing
+                .iter()
+                .map(|s| s.label().get(lang).to_string())
+                .collect();
+            out.push_str(&format!(
+                "{}: {}",
+                crate::text::tr(lang, "не закрыто", "left open"),
+                missing.join(", ")
+            ));
+        }
+        out
+    }
 }
 
 /// The slots a built-in template closes. Kept next to the task model so a

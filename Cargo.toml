@@ -1,6 +1,6 @@
 [package]
 name = "volta"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "Offline breadboard, Arduino sketch and checks from a task sentence"
 license = "MIT"
@@ -13,6 +13,11 @@ authors = ["ElMak <89011639+ElMakgit@users.noreply.github.com>"]
 # for a minimal build that recognises only topics and keywords.
 default = ["book-tasks"]
 book-tasks = []
+
+[profile.release]
+# The release archives carry no crash-report symbols, only the program: this
+# halves the Windows download and keeps the Linux one small.
+strip = true
 
 [dependencies]
 chrono = "0.4"

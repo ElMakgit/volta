@@ -236,7 +236,18 @@ pub const SOURCES: &[SourceSpec] = &[
         title: L::new("Датчик газа MQ-2", "The MQ-2 gas sensor"),
         short: L::new("газ", "gas"),
         lesson: 13,
-        keys: &["газ", "дым", "mq-2", "mq2", "утечк", "gas", "smoke", "leak"],
+        keys: &[
+            "газ",
+            "дым",
+            "mq-2",
+            "mq2",
+            "утечк",
+            "gas",
+            "smoke",
+            "leak",
+            "газоанализатор",
+            "газосигнализатор",
+        ],
         period_ms: 250,
         place: Place::Board { name: "MQ-2", at: (2.0, 54.0) },
         summary: L::new(
@@ -698,7 +709,7 @@ pub const SOURCES: &[SourceSpec] = &[
         title: L::new("Влажность DHT22", "DHT22 humidity"),
         short: L::new("влажность", "humidity"),
         lesson: 11,
-        keys: &["влажност", "dht11", "dht22", "dht", "humidity"],
+        keys: &["влажност", "dht11", "dht22", "dht", "humidity", "гигрометр", "влагомер"],
         period_ms: 2000,
         place: Place::Board { name: "DHT22", at: (2.0, 54.0) },
         summary: L::new(

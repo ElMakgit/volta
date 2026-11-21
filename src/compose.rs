@@ -1121,7 +1121,7 @@ mod tests {
     fn every_declared_combination_builds_and_passes() {
         let mut checked = 0;
         for source in SOURCES {
-            for variant in 0..source.variants.len() {
+            for _variant in 0..source.variants.len() {
                 for (sink, behavior) in [
                     (SinkId::Led, Behavior::Blink),
                     (SinkId::Led, Behavior::Solid),
@@ -1555,7 +1555,7 @@ mod tests {
             "{}",
             missing
                 .iter()
-                .map(|m| m.name.ru.clone())
+                .map(|m| m.name.ru)
                 .collect::<Vec<_>>()
                 .join(", ")
         );

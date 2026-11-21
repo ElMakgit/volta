@@ -330,27 +330,10 @@ fn explain(intent: &Intent, tid: Tid, choice: usize, lang: Lang) -> String {
         read.push(tr(lang, "не назван", "unnamed").to_string());
     }
     let mut out = format!("{}: {}", tr(lang, "Прочитано", "Read as"), read.join(" + "));
-    if coverage.total > 0 {
-        out.push_str(&format!(
-            "; {} {:.0}% ({} {}/{})",
-            tr(lang, "покрытие слотов", "slot coverage"),
-            (coverage.closed as f32 / coverage.total as f32) * 100.0,
-            tr(lang, "закрыто", "closed"),
-            coverage.closed,
-            coverage.total
-        ));
-    }
-    let missing: Vec<String> = coverage
-        .missing
-        .iter()
-        .map(|s| s.label().get(lang).to_string())
-        .collect();
-    if !missing.is_empty() {
-        out.push_str(&format!(
-            "; {}: {}",
-            tr(lang, "не закрыто", "left open"),
-            missing.join(", ")
-        ));
+    let coverage_text = coverage.describe(lang);
+    if !coverage_text.is_empty() {
+        out.push_str("; ");
+        out.push_str(&coverage_text);
     }
     let extra: Vec<String> = coverage
         .extra
@@ -395,6 +378,30 @@ fn explain(intent: &Intent, tid: Tid, choice: usize, lang: Lang) -> String {
     out
 }
 
+/// Why a printed lesson answers this sentence: the same coverage arithmetic
+/// as the built-in templates, with the lesson's own parts as the plan.
+fn lesson_why(i: usize, intent: &Intent, lang: Lang) -> String {
+    let task = &intent.task;
+    let mut cover = crate::task::lesson_cover(i);
+    for slot in &task.outputs {
+        if !cover.outputs.contains(&slot.kind) {
+            cover.outputs.push(slot.kind);
+        }
+    }
+    let coverage = task.coverage(&cover);
+    let lesson = crate::lessons::ALL
+        .get(i)
+        .map(|l| l.title.get(lang))
+        .unwrap_or(tr(lang, "урок", "lesson"));
+    let mut out = format!("{}: {lesson}", tr(lang, "Урок", "Lesson"));
+    let coverage_text = coverage.describe(lang);
+    if !coverage_text.is_empty() {
+        out.push_str("; ");
+        out.push_str(&coverage_text);
+    }
+    out
+}
+
 /// A composition explains itself through its own recipe. The semantic roles
 /// are a guess about the sentence; the recipe is what was actually built, so
 /// the two must not disagree on screen.
@@ -421,10 +428,10 @@ pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
     }
     if let Some(i) = intent.lesson {
         let mut p = display_lesson_plan(i, intent.named.screens, lang);
-        // The lesson title is already the first choice; a role guess from
-        // `semantics` would argue with it ("не назван → radio" under the IR
-        // lesson). The trace panel carries the evidence instead.
-        p.why = None;
+        // A lesson is a real answer, so it explains itself like a template:
+        // which slots it closes and what stays open. The old `None` left the
+        // "why" panel empty precisely where the user needs it most.
+        p.why = Some(lesson_why(i, intent, lang));
         return Some(p);
     }
     if intent.task.wants_buttons_screen() {
@@ -1731,7 +1738,9 @@ fn lesson_plan(i: usize, lang: Lang) -> Plan {
     Plan {
         tid: Tid::Lesson(i),
         title: L::new("Готовый урок", "A ready-made lesson"),
-        headline: None,
+        // The header names the lesson, not the generic page title: a user
+        // reading the panel should see which lesson answered the sentence.
+        headline: Some(l.title.get(lang).to_string()),
         choices: vec![Choice {
             name: l.title,
             blurb: l.summary,

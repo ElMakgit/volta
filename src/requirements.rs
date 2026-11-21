@@ -435,6 +435,21 @@ pub fn check(built: &Built, intent: &crate::parse::Intent, lang: Lang) -> Vec<Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ratchet floor from the data file, not a literal buried in a test.
+    fn baseline(key: &str) -> usize {
+        include_str!("testdata/book_baseline.txt")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(k, v)| {
+                (k.trim() == key).then(|| {
+                    v.trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("baseline {key} is not a number"))
+                })
+            })
+            .unwrap_or_else(|| panic!("baseline {key} is missing"))
+    }
     use crate::templates;
 
     #[test]
@@ -555,8 +570,9 @@ mod tests {
     /// must never grow. Skips are printed too: a task that never built is a
     /// loss the old count did not include.
     #[test]
+    #[ignore = "slow: full book corpus, run in CI with --include-ignored"]
     fn the_checklist_does_not_lose_more_parts_than_today() {
-        let known = 67;
+        let known = baseline("checklist_losing");
         let mut bad = 0;
         let mut skipped = 0;
         for (task, _) in crate::book_tasks::TASKS {
@@ -593,23 +609,20 @@ mod tests {
     /// without the table and prints what the parser alone can do: understood,
     /// refused, built, and how many builds lose a part the task named.
     #[test]
+    #[ignore = "slow: full book corpus, run in CI with --include-ignored"]
     fn the_parser_alone_is_measured_against_the_book_corpus() {
-        // Measured 2026-11-21. Raise the floor when the parser improves; a
-        // drop means a phrase that used to be understood is now refused.
-        //
+        // The numbers live in `testdata/book_baseline.txt`, so raising a
+        // floor is a visible data change, not a magic constant in a test.
         // The build floor fell from 574 to 567 on purpose: eight tasks that
         // name a screen yet route to an LED, button or buzzer template are
-        // now refused instead of drawn as a look-alike ("будильник с выводом
-        // на дисплей" was an LED blink). The loss count rose from 57 to 66
-        // because the checklist now counts the display the task names
-        // (matrix, seven-segment, OLED) and a named clock, which the old
-        // numbers could not see. The new losses are honest: a sensor lesson
-        // with no matrix drawable for it, an SD or RTC lesson that lacks the
-        // other part, a clock test built as a serial readout.
-        const KNOWN_UNDERSTOOD: usize = 575;
-        const KNOWN_RECIPE: usize = 145;
-        const KNOWN_BUILT: usize = 567;
-        const KNOWN_LOSING: usize = 66;
+        // now refused instead of drawn as a look-alike. The losses are
+        // honest: a sensor lesson with no matrix drawable for it, an SD or
+        // RTC lesson that lacks the other part, a clock test built as a
+        // serial readout.
+        let known_understood = baseline("parser_understood");
+        let known_recipe = baseline("parser_recipe");
+        let known_built = baseline("parser_built");
+        let known_losing = baseline("parser_losing");
         let mut refused = 0;
         let mut no_plan = 0;
         let mut no_build = 0;
@@ -663,20 +676,20 @@ mod tests {
             crate::book_tasks::TASKS.len()
         );
         assert!(
-            understood >= KNOWN_UNDERSTOOD,
-            "parser-only understanding fell to {understood}, was {KNOWN_UNDERSTOOD}"
+            understood >= known_understood,
+            "parser-only understanding fell to {understood}, was {known_understood}"
         );
         assert!(
-            recipe >= KNOWN_RECIPE,
-            "parser-only compositions fell to {recipe}, was {KNOWN_RECIPE}"
+            recipe >= known_recipe,
+            "parser-only compositions fell to {recipe}, was {known_recipe}"
         );
         assert!(
-            built_count >= KNOWN_BUILT,
-            "parser-only builds fell to {built_count}, was {KNOWN_BUILT}"
+            built_count >= known_built,
+            "parser-only builds fell to {built_count}, was {known_built}"
         );
         assert!(
-            losing <= KNOWN_LOSING,
-            "parser-only drops rose to {losing}, was {KNOWN_LOSING}"
+            losing <= known_losing,
+            "parser-only drops rose to {losing}, was {known_losing}"
         );
     }
 }

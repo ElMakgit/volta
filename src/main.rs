@@ -4,6 +4,11 @@
 //! The GUI is the default; the same engine answers without a display so an
 //! agent can plan and render circuits too.
 
+// Data tables and platform paths are shared by the GUI and the CLI; each
+// binary build sees a different subset as "used". Dead code is reviewed in
+// the modules, not reported as noise on every build.
+#![allow(dead_code)]
+
 #[cfg(feature = "book-tasks")]
 mod book_tasks;
 mod checks;
@@ -46,8 +51,13 @@ volta — схема из текста: макетка, скетч, скринш
   volta plan <текст>            разобрать задачу и показать три варианта деталей
   volta explain <текст>         показать, какие слова что решили
   volta render <текст> [ключи]  собрать схему, скетч и PNG без окна
+  volta feedback [--json]       показать сохранённые кнопкой «Это не то» случаи
   volta list                    что вообще умеет
   volta --help
+
+Ключи для feedback:
+  --json          машинный вывод
+  --corpus        напечатать фразы в формате src/testdata/phrases.txt
 
 Ключи для render:
   --choice N      вариант деталей, 0..2 (по умолчанию рекомендованный)
@@ -71,6 +81,7 @@ fn main() {
         Some("plan") => cmd_plan(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
         Some("render") => cmd_render(&args[1..]),
+        Some("feedback") => cmd_feedback(&args[1..]),
         Some("list") => cmd_list(),
         Some("help") | Some("-h") | Some("--help") => print!("{HELP}"),
         Some(other) => {
@@ -163,7 +174,7 @@ fn cmd_plan(args: &[String]) {
     let lang = f.lang;
     if f.trace {
         for line in &parsed.trace {
-            eprintln!("{line}");
+            eprintln!("{}", text::localize_trace(line, lang));
         }
     }
     if let Some(msg) = parsed.unsupported {
@@ -290,11 +301,12 @@ fn cmd_explain(args: &[String]) {
         return;
     }
     for line in &parsed.trace {
-        println!("{line}");
+        println!("{}", text::localize_trace(line, lang));
     }
     if !parsed.understood.is_empty() {
         println!(
-            "understood: {}",
+            "{}: {}",
+            text::tr(lang, "понято", "understood"),
             parsed
                 .understood
                 .iter()
@@ -304,19 +316,104 @@ fn cmd_explain(args: &[String]) {
         );
     }
     if let Some(msg) = parsed.unsupported {
-        println!("error: {}", msg.get(lang));
+        println!("{}: {}", text::tr(lang, "ошибка", "error"), msg.get(lang));
     }
     for alt in &parsed.alternatives {
-        println!("alternative: {}", alt.label.get(lang));
+        println!(
+            "{}: {}",
+            text::tr(lang, "вариант", "alternative"),
+            alt.label.get(lang)
+        );
     }
     if let Some(plan) = plan {
-        println!("title: {}", plan.title_text(lang));
+        println!(
+            "{}: {}",
+            text::tr(lang, "заголовок", "title"),
+            plan.title_text(lang)
+        );
         if let Some(why) = &plan.why {
-            println!("why: {why}");
+            println!("{}: {why}", text::tr(lang, "почему", "why"));
         }
         for (i, c) in plan.choices.iter().enumerate() {
             let mark = if i == plan.recommended { "*" } else { " " };
             println!("{mark} [{i}] {}", c.name.get(lang));
+        }
+    }
+}
+
+/// The "Это не то" button writes one text file per wrong build. This command
+/// makes those files visible from a terminal and can print the sentences in
+/// the corpus format, so a mismatch can become a regression test instead of
+/// staying in a hidden folder.
+fn cmd_feedback(args: &[String]) {
+    let json = args.iter().any(|a| a == "--json");
+    let corpus = args.iter().any(|a| a == "--corpus");
+    let dir = crate::paths::data_dir().join("feedback");
+    let mut entries = Vec::new();
+    if let Ok(read) = std::fs::read_dir(&dir) {
+        for item in read.flatten() {
+            let path = item.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .map(|v| v.trim().to_string())
+            };
+            if let Some(task) = field("task: ") {
+                entries.push((
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    task,
+                    field("plan: ").unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    if json {
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|(file, task, plan)| {
+                serde_json::json!({"file": file, "task": task, "plan": plan})
+            })
+            .collect();
+        println!("{}", serde_json::json!({"dir": dir.to_string_lossy(), "cases": rows}));
+        return;
+    }
+    if corpus {
+        // `keep` means "still understood, not refused". A saved case is by
+        // definition a wrong build, so the plan is printed above the line for
+        // the human to turn into `refuse`, `lesson:N` or `load:X`; pasting it
+        // as is would only lock in the wrong reading.
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, task, plan) in &entries {
+            if !seen.insert(task.clone()) {
+                continue;
+            }
+            if !plan.is_empty() {
+                println!("# было: {plan}");
+            }
+            println!("{task} | keep");
+        }
+        return;
+    }
+    if entries.is_empty() {
+        println!("feedback: {} — {}", dir.display(), "пусто");
+        return;
+    }
+    println!("feedback: {} ({})", dir.display(), entries.len());
+    for (file, task, plan) in &entries {
+        if plan.is_empty() {
+            println!("{file}  {task}");
+        } else {
+            println!("{file}  {task}  [{plan}]");
         }
     }
 }
@@ -331,7 +428,7 @@ fn cmd_render(args: &[String]) {
     let parsed = parse::parse(&f.task);
     if f.trace {
         for line in &parsed.trace {
-            eprintln!("{line}");
+            eprintln!("{}", text::localize_trace(line, lang));
         }
     }
     if let Some(msg) = parsed.unsupported {

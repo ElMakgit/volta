@@ -1098,6 +1098,42 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
                 )
             });
         }
+        // A 3.3 V board's signal pins are not 5 V tolerant on the bare
+        // module. The drawing cannot know whether a breakout has a level
+        // shifter, so this is a warning with the exact pins, not a fail.
+        if m.three_three {
+            let direct: Vec<usize> = m
+                .pins
+                .iter()
+                .filter(|(name, _, _)| !matches!(*name, "VCC" | "GND" | "3V3" | "+5V" | "+"))
+                .filter_map(|(name, _, _)| {
+                    part.pins.iter().copied().find(|&i| c.pins[i].name == *name)
+                })
+                .filter(|&i| {
+                    let r = roots[i];
+                    c.parts[uno].pins.iter().any(|&q| {
+                        roots[q] == r
+                            && (c.pins[q].name.starts_with('D')
+                                || c.pins[q].name.starts_with('A'))
+                    })
+                })
+                .collect();
+            if !direct.is_empty() {
+                checks.push(Check::warn_at(
+                    L::new("Логика 3.3 В", "3.3 V logic"),
+                    format!(
+                        "{} {}",
+                        m.name,
+                        tr(
+                            lang,
+                            "сигнальные выводы идут прямо в 5-вольтовую логику: проверь согласователь уровней на плате.",
+                            "its signal pins meet 5 V logic directly: check for a level shifter on the board."
+                        )
+                    ),
+                    focus_on_pins(c, &direct),
+                ));
+            }
+        }
     }
 
     // 14. The rails used by the build are bridged across the middle gap.
@@ -1144,7 +1180,8 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
 }
 
 /// Discrete-time model of the generated behaviour, so the UI can show what the
-/// sketch actually does with repeated presses.
+/// sketch actually does. A normalized 0..255 output is enough for a lamp, an
+/// LED, a servo angle or a buzzer envelope; the step says how often it moves.
 fn simulate(built: &Built) -> Option<Sim> {
     match built.tid {
         Tid::MotorSteps => {
@@ -1165,6 +1202,49 @@ fn simulate(built: &Built) -> Option<Sim> {
             }
             Some(Sim { points, step_ms })
         }
+        Tid::LedToggle => {
+            let mut level = 0.0;
+            let mut points = Vec::new();
+            for press in 0..6 {
+                if press > 0 {
+                    level = if level > 0.0 { 0.0 } else { 255.0 };
+                }
+                points.extend(std::iter::repeat_n(level, 8));
+            }
+            Some(Sim { points, step_ms: 100.0 })
+        }
+        Tid::LedBlink => {
+            let mut points = Vec::new();
+            for _ in 0..6 {
+                points.extend(std::iter::repeat_n(255.0, 10));
+                points.extend(std::iter::repeat_n(0.0, 10));
+            }
+            Some(Sim { points, step_ms: 50.0 })
+        }
+        Tid::Lamp => Some(Sim {
+            points: vec![255.0; 20],
+            step_ms: 100.0,
+        }),
+        Tid::ServoSweep => {
+            let mut points = Vec::new();
+            for _ in 0..2 {
+                for angle in (0..=180).step_by(15) {
+                    points.push(angle as f32 * 255.0 / 180.0);
+                }
+                for angle in (0..=180).rev().step_by(15) {
+                    points.push(angle as f32 * 255.0 / 180.0);
+                }
+            }
+            Some(Sim { points, step_ms: 20.0 })
+        }
+        Tid::BuzzerTone => {
+            let mut points = Vec::new();
+            for _ in 0..4 {
+                points.extend(std::iter::repeat_n(255.0, 8));
+                points.extend(std::iter::repeat_n(0.0, 8));
+            }
+            Some(Sim { points, step_ms: 25.0 })
+        }
         _ => None,
     }
 }
@@ -1173,6 +1253,25 @@ fn simulate(built: &Built) -> Option<Sim> {
 mod tests {
     use super::*;
     use crate::parse::{Intent, Load, Input};
+
+    /// The simulator used to cover only the stepper. A button-driven LED and
+    /// a servo sweep are just as visible in the panel.
+    #[test]
+    fn the_simulation_is_not_only_the_stepper() {
+        for (task, tid) in [
+            ("кнопка и светодиод", crate::templates::Tid::LedToggle),
+            ("светодиод", crate::templates::Tid::LedBlink),
+            ("сервопривод", crate::templates::Tid::ServoSweep),
+            ("пьезо пищалка", crate::templates::Tid::BuzzerTone),
+        ] {
+            let parsed = crate::parse::parse(task);
+            let built = crate::templates::build(&parsed.intent, 0, crate::text::Lang::Ru)
+                .unwrap_or_else(|| panic!("{task} builds"));
+            assert_eq!(built.tid, tid, "{task}");
+            let report = run_with(&built, crate::text::Lang::Ru, &parsed.intent);
+            assert!(report.sim.is_some(), "{task}");
+        }
+    }
 
     #[test]
     fn a_bench_without_an_uno_is_still_checked() {

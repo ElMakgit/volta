@@ -1314,7 +1314,7 @@ fn count_humidity(text: &str) -> usize {
     if text.contains("от влажност") || text.contains("зависит от влажност") {
         return 0;
     }
-    count_sensors(text, &["влажност", "humidity"])
+    count_sensors(text, &["влажност", "humidity", "гигрометр", "влагомер"])
 }
 
 fn count_light(text: &str) -> usize {
@@ -1409,7 +1409,18 @@ pub fn named_devices(raw: &str) -> NamedDevices {
             &text,
             &["расстоян", "дальномер", "ультразвук", "hc-sr04", "distance", "ranger", "ultrasonic"],
         ),
-        gas: count_sensors(&text, &["газ", "дым", "mq-2", "mq2", "gas"]),
+        gas: count_sensors(
+            &text,
+            &[
+                "газ",
+                "дым",
+                "mq-2",
+                "mq2",
+                "gas",
+                "газоанализатор",
+                "газосигнализатор",
+            ],
+        ),
         dht11,
         dht22,
         fs1000a: text.contains("fs1000a"),
@@ -1868,6 +1879,15 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             specificity: 3,
             at: first_word_position(&text, "реле"),
         });
+    }
+    // "Шаговый двигатель" is one part: the shared word "двигатель" must not
+    // add a second, transistor-driven motor next to the stepper. A separately
+    // named motor ("шаговый двигатель и мотор") still counts.
+    if named.motor == 0 && outputs.iter().any(|s| s.kind == OutputKind::Stepper) {
+        if outputs.iter().any(|s| s.kind == OutputKind::Motor) {
+            trace.push("context: stepper is not a second DC motor".to_string());
+        }
+        outputs.retain(|s| s.kind != OutputKind::Motor);
     }
     // Rank by evidence, then by what the sentence said first. Two equal
     // readings stay equal: that is an ambiguity to show, not a table index to
@@ -2814,7 +2834,7 @@ mod tests {
                     )
                 }),
                 "{task}: {:?}",
-                p.alternatives.iter().map(|a| a.label.ru.clone()).collect::<Vec<_>>()
+                p.alternatives.iter().map(|a| a.label.ru).collect::<Vec<_>>()
             );
         }
     }
@@ -2962,6 +2982,48 @@ mod tests {
         }
     }
 
+    /// Two ways to say one thing must read the same way. The corpus catches
+    /// drift between synonyms that the keyword tables treat separately.
+    #[test]
+    fn paraphrases_read_the_same_way() {
+        for (n, line) in include_str!("testdata/paraphrases.txt").lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (a, b) = line
+                .split_once('|')
+                .unwrap_or_else(|| panic!("line {}: no | in {line:?}", n + 1));
+            let (a, b) = (a.trim(), b.trim());
+            let pa = parse(a);
+            let pb = parse(b);
+            assert_eq!(
+                pa.unsupported.is_some(),
+                pb.unsupported.is_some(),
+                "{a:?} vs {b:?}"
+            );
+            assert_eq!(pa.intent.load, pb.intent.load, "{a:?} vs {b:?}");
+            let sensors = |p: &Parse| {
+                p.intent
+                    .task
+                    .sensors
+                    .iter()
+                    .map(|s| s.source)
+                    .collect::<Vec<_>>()
+            };
+            let outputs = |p: &Parse| {
+                p.intent
+                    .task
+                    .outputs
+                    .iter()
+                    .map(|s| s.kind)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(sensors(&pa), sensors(&pb), "{a:?} vs {b:?}");
+            assert_eq!(outputs(&pa), outputs(&pb), "{a:?} vs {b:?}");
+        }
+    }
+
     /// The corpus is the contract: every line says what the sentence must
     /// become. It covers cases, synonyms, slang, typos, the wrong keyboard
     /// layout, English, refusals and ambiguity.
@@ -2998,6 +3060,13 @@ mod tests {
                     !p.alternatives.is_empty(),
                     "line {at}: {phrase:?} should offer readings, understood {:?}",
                     p.understood
+                ),
+                // Written by `volta feedback --corpus`: the case is still
+                // understood, even though it was marked as a wrong build.
+                "keep" => assert!(
+                    p.unsupported.is_none(),
+                    "line {at}: {phrase:?} should still be understood: {:?}",
+                    p.unsupported
                 ),
                 _ => {
                     assert!(
