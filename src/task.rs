@@ -188,6 +188,7 @@ impl ScreenSlot {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum CountKind {
     Led,
+    Lamp,
     Rgb,
     Button,
     Motor,

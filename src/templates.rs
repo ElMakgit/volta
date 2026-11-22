@@ -3286,6 +3286,46 @@ fn augment_devices(
         added.parts.push(AddedPart { part, pins: vec![pin_num(&pin)] });
     }
 
+    // An extra incandescent lamp is a heavy load, so it gets its own relay
+    // and a load on the contact: another bare lamp would be an open circuit.
+    for _ in 0..named.lamp.saturating_sub(count_kinds(c, &[Kind::Lamp])) {
+        let Some(pin) = ledger.claim_pin(&signals) else { break };
+        if !ledger.claim_current(30) {
+            break;
+        }
+        let mains = c
+            .parts()
+            .any(|p| p.kind == Kind::Lamp && p.value.contains("220"));
+        let at = row.take(64.0, 36.0);
+        let k_label = free_label(c, "K");
+        let relay = bench_part(c, Kind::Relay, &k_label, "SRD-05VDC", at);
+        let h_label = free_label(c, "H");
+        let value = if mains { "220 В, 60 Вт" } else { "12 В, 21 Вт" };
+        let lamp = bench_part(
+            c,
+            Kind::Lamp,
+            &h_label,
+            value,
+            Pt::new(at.x + 20.0, at.y + 18.0),
+        );
+        let inn = c.pin(relay, "IN");
+        let vcc_pin = c.pin(relay, "VCC");
+        let gnd_pin = c.pin(relay, "GND");
+        let contact = c.pin(relay, "COM");
+        let normally_open = c.pin(relay, "NO");
+        let plus = c.pin(lamp, "+");
+        let minus = c.pin(lamp, "-");
+        c.wire(End::Pin(inn), End::Pin(c.pin(uno, &pin)), NetClass::Signal);
+        c.wire(End::Pin(vcc_pin), End::Pin(vcc), NetClass::Vcc);
+        c.wire(End::Pin(gnd_pin), End::Pin(gnd), NetClass::Gnd);
+        // The lamp sits between VIN and the normally open contact; the
+        // contact closes the path to ground, exactly as in the lamp lesson.
+        c.wire(End::Pin(contact), End::Pin(gnd), NetClass::Gnd);
+        c.wire(End::Pin(normally_open), End::Pin(minus), NetClass::Signal);
+        c.wire(End::Pin(plus), End::Pin(c.pin(uno, "VIN")), NetClass::Vcc);
+        added.parts.push(AddedPart { part: relay, pins: vec![pin_num(&pin)] });
+    }
+
     for _ in 0..named.led.saturating_sub(count_kinds(c, &[Kind::Led])) {
         let Some(pin) = ledger.claim_pin(&signals) else { break };
         if !ledger.claim_current(15) {
@@ -6175,6 +6215,62 @@ mod tests {
         let screens = built.circuit.parts().filter(|p| p.value == "OLED 0.96").count();
         assert_eq!(screens, 2, "two screens means two boards");
         assert!(built.code.contains("screen0") && built.code.contains("screen1"));
+    }
+
+    /// A spoken count must survive the whole route: the plan, the augmented
+    /// circuit and the checklist. The screenshot case "две лампочки" drew one
+    /// LED because the count table lacked the synonym; the same test covers
+    /// every countable output so a new synonym cannot repeat the bug.
+    #[test]
+    fn every_named_output_is_drawn_as_many_times_as_asked() {
+        use crate::model::Kind;
+        use crate::text::Lang;
+        let cases: &[(&str, &[Kind], usize)] = &[
+            ("две лампочки", &[Kind::Led], 2),
+            ("две лампы", &[Kind::Led], 2),
+            ("пара лампочек", &[Kind::Led], 2),
+            ("три светодиода", &[Kind::Led], 3),
+            ("четыре светодиода", &[Kind::Led], 4),
+            ("две лампы накаливания", &[Kind::Lamp], 2),
+            ("два реле", &[Kind::Relay], 2),
+            ("две пищалки", &[Kind::Buzzer, Kind::Speaker], 2),
+            ("два динамика", &[Kind::Buzzer, Kind::Speaker], 2),
+            ("два сервопривода", &[Kind::Servo], 2),
+            ("два мотора", &[Kind::Motor], 2),
+            ("две кнопки", &[Kind::Button], 2),
+            ("две клавиши", &[Kind::Button], 2),
+        ];
+        for &(task, kinds, want) in cases {
+            let parsed = parse(task);
+            let plan = plan(&parsed.intent, Lang::Ru)
+                .unwrap_or_else(|| panic!("{task}: no plan"));
+            let built = build(&parsed.intent, plan.recommended, Lang::Ru)
+                .unwrap_or_else(|| panic!("{task}: does not build"));
+            let got = built
+                .circuit
+                .parts()
+                .filter(|p| kinds.contains(&p.kind))
+                .count();
+            assert_eq!(got, want, "{task}: {got} parts, want {want}");
+            let report = crate::checks::run(&built, Lang::Ru);
+            assert_eq!(
+                report.failed(),
+                0,
+                "{task} builds but fails: {:?}",
+                report
+                    .checks
+                    .iter()
+                    .filter(|c| c.sev == crate::checks::Sev::Fail)
+                    .map(|c| c.detail.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let parsed = parse("три кнопки и два светодиода");
+        let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
+        let count = |kind| built.circuit.parts().filter(|p| p.kind == kind).count();
+        assert_eq!(count(Kind::Button), 3);
+        assert_eq!(count(Kind::Led), 2);
     }
 
     #[test]

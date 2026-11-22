@@ -578,6 +578,7 @@ fn output_specificity(kind: OutputKind) -> u8 {
 fn output_count(kind: OutputKind, named: &NamedDevices) -> usize {
     let count = match kind {
         OutputKind::Led => named.led.max(named.rgb).max(1),
+        OutputKind::Lamp => named.lamp.max(1),
         OutputKind::Motor => named.motor.max(1),
         OutputKind::Servo => named.servo.max(1),
         OutputKind::Buzzer => named.buzzer.max(1),
@@ -823,6 +824,9 @@ pub struct NamedDevices {
     pub buzzer: usize,
     pub relay: usize,
     pub led: usize,
+    /// Incandescent lamps, counted apart from LEDs: a lamp is a heavy load
+    /// with its own switch, not a light-emitting diode.
+    pub lamp: usize,
     pub rgb: usize,
     pub motor: usize,
     pub servo: usize,
@@ -1028,6 +1032,64 @@ fn motor_count(text: &str) -> usize {
     count_of(
         &kept,
         &["двигател", "мотор", "motor", "вентилятор", "насос", "кулер"],
+    )
+}
+
+/// A lamp that is a heavy load, not a small light: "накаливания", "галоген",
+/// a dimmer or a named 12/220 V supply. The word "лампа" alone stays an LED.
+fn heavy_lamp(text: &str) -> bool {
+    text.contains("накалив")
+        || text.contains("галоген")
+        || text.contains("диммер")
+        || text.contains("симистор")
+        || text.contains("лампа на 12")
+        || text.contains("лампа на 220")
+        || text.contains("лампочка на 12")
+        || text.contains("лампочка на 220")
+        || text.contains("12 в")
+        || text.contains("220 в")
+        || text.contains("вольт")
+}
+
+/// "Две лампочки" is two lights, whether they are LEDs or incandescent
+/// lamps. The light group knows many everyday synonyms; the count must know
+/// the same ones, or a number silently collapses to one part.
+fn light_count(text: &str) -> usize {
+    if heavy_lamp(text) {
+        // A heavy lamp is not an LED, even though the word "лампа" reaches
+        // both groups. Only an explicitly named LED counts here.
+        count_of(
+            text,
+            &["светодиод", "led", "индик", "ночник", "фонар", "гирлянд"],
+        )
+    } else {
+        count_of(
+            text,
+            &[
+                "светодиод",
+                "led",
+                "индик",
+                "ночник",
+                "фонар",
+                "гирлянд",
+                "ламп",
+                "лампоч",
+                "подсветк",
+                "огонек",
+            ],
+        )
+    }
+}
+
+/// Incandescent lamps counted by their own words, with the number that sits
+/// in front of "лампа"/"лампочка": "две лампы накаливания" is two.
+fn lamp_count(text: &str) -> usize {
+    if !heavy_lamp(text) {
+        return 0;
+    }
+    count_of(
+        text,
+        &["лампа", "лампоч", "накалив", "галоген", "диммер"],
     )
 }
 
@@ -1348,6 +1410,7 @@ pub fn named_devices(raw: &str) -> NamedDevices {
         || text.contains("xy-mk");
     let dht22 = count_sensors(&text, &["dht22"]);
     let dht11 = count_sensors(&text, &["dht11"]);
+    let lamp = lamp_count(&text);
     let soil = if names_soil(&text) {
         count_sensors(&text, &["почв", "грунт", "soil", "fc-28", "yl-69", "yl-38"])
             .max(1)
@@ -1356,7 +1419,15 @@ pub fn named_devices(raw: &str) -> NamedDevices {
     };
     NamedDevices {
         screens: screens_in(raw),
-        buzzer: count_of(&text, &["пьезо", "пищал", "зуммер", "сирен", "buzzer", "gong"]),
+        // Every synonym the sound group knows must also count: "два
+        // динамика" is two parts, not one speaker and a silent second one.
+        buzzer: count_of(
+            &text,
+            &[
+                "пьезо", "пищал", "зуммер", "сирен", "buzzer", "gong", "динамик",
+                "спикер", "speaker", "колонк",
+            ],
+        ),
         relay: count_of(&text, &["реле", "relay"]),
         // "RGB" is a light-emitting diode too, but it is one part with three
         // channels: counting it twice would draw a second, needless LED. A
@@ -1374,11 +1445,9 @@ pub fn named_devices(raw: &str) -> NamedDevices {
         {
             0
         } else {
-            count_of(
-                &text,
-                &["светодиод", "led", "индик", "ночник", "фонар", "гирлянд"],
-            )
+            light_count(&text)
         },
+        lamp,
         rgb,
         motor: motor_count(&text),
         // "Поворот" alone is too vague: it also shows up in servo lessons'
@@ -1387,13 +1456,13 @@ pub fn named_devices(raw: &str) -> NamedDevices {
             &text,
             &[
                 "серво", "servo", "sg90", "sg-90", "mg90", "mg995", "mg996", "fs90",
-                "towerpro",
+                "towerpro", "машинк",
             ],
         ),
         button: if phone_keypad {
             0
         } else {
-            count_of(&text, &["кнопк", "button", "переключател"])
+            count_of(&text, &["кнопк", "button", "переключател", "клавиш"])
         },
         hourly: text.contains("каждый час") || text.contains("раз в час")
             || text.contains("hourly") || text.contains("every hour"),
@@ -1840,7 +1909,11 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         && !text.contains("термостат")
         && !text.contains("светодиодн");
     if lamp_task {
-        outputs.retain(|s| s.kind != OutputKind::Led);
+        // A separately named LED is not the lamp: only drop the LED slot when
+        // the sentence did not ask for one of its own.
+        if named.led == 0 {
+            outputs.retain(|s| s.kind != OutputKind::Led);
+        }
         if !outputs.iter().any(|s| s.kind == OutputKind::Lamp) {
             outputs.push(OutputSlot {
                 kind: OutputKind::Lamp,
@@ -2227,6 +2300,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     task.sensors = sensor_slots(&named, raw, condition);
     task.links = link_slots(&outputs, &named);
     task.counts.set(CountKind::Led, named.led);
+    task.counts.set(CountKind::Lamp, named.lamp);
     task.counts.set(CountKind::Rgb, named.rgb);
     task.counts.set(CountKind::Button, named.button);
     task.counts.set(CountKind::Motor, named.motor);
@@ -3204,6 +3278,21 @@ mod tests {
         assert_eq!(named_devices("датчик движения и два светодиода").led, 2);
         assert_eq!(named_devices("два светодиода, реле").relay, 1);
         assert_eq!(named_devices("два красных светодиода").led, 2);
+
+        // Everyday light words count too: a screenshot with two "лампочки"
+        // drew one LED because the count table did not know the synonym.
+        assert_eq!(named_devices("две лампочки").led, 2);
+        assert_eq!(named_devices("две лампы").led, 2);
+        assert_eq!(named_devices("пара лампочек").led, 2);
+        assert_eq!(named_devices("две лампы накаливания").lamp, 2);
+        assert_eq!(named_devices("две лампы накаливания").led, 0);
+        assert_eq!(named_devices("лампа накаливания и светодиод").lamp, 1);
+        assert_eq!(named_devices("лампа накаливания и светодиод").led, 1);
+        // The same gap existed for other outputs' synonyms.
+        assert_eq!(named_devices("два динамика").buzzer, 2);
+        assert_eq!(named_devices("два спикера").buzzer, 2);
+        assert_eq!(named_devices("две машинки").servo, 2);
+        assert_eq!(named_devices("две клавиши").button, 2);
     }
 
     /// Counts must reach the numbers the books use and stay with their noun.

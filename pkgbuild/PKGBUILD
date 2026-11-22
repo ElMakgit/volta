@@ -1,7 +1,7 @@
 # Maintainer: elmak
 # Personal package: builds the working tree next to this folder.
 pkgname=volta
-pkgver=0.8.0
+pkgver=0.8.1
 pkgrel=1
 pkgdesc="Breadboard schematic, Arduino sketch and checks from a task sentence"
 arch=('x86_64')

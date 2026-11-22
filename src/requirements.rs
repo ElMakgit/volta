@@ -153,6 +153,11 @@ pub fn missing(built: &Built, intent: &crate::parse::Intent) -> Vec<Missing> {
         count_kind(c, &[Kind::Led]),
     );
     need(
+        L::new("лампа накаливания", "incandescent lamp"),
+        named.lamp,
+        count_kind(c, &[Kind::Lamp]),
+    );
+    need(
         L::new("кнопка", "button"),
         named.button,
         count_kind(c, &[Kind::Button]),
