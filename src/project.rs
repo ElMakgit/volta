@@ -109,7 +109,7 @@ pub fn save(path: &Path, p: &Project) -> Result<(), String> {
     let mut body = serde_json::to_string_pretty(&to_json(p))
         .map_err(|e| e.to_string())?;
     body.push('\n');
-    std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))
+    crate::paths::write_atomic(path, &body).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 pub fn load(path: &Path) -> Result<Project, String> {
@@ -931,6 +931,29 @@ mod tests {
             assert_eq!(x.class, y.class);
             assert_eq!(x.via, y.via);
         }
+    }
+
+    #[test]
+    fn a_saved_project_is_written_atomically() {
+        let dir = std::env::temp_dir().join("volta-project-atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("project.volta.json");
+        let p = sample();
+        save(&path, &p).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.name, p.name);
+        // No half-written temporary file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        // Overwriting keeps the file valid, not truncated.
+        save(&path, &p).unwrap();
+        assert_eq!(load(&path).unwrap().name, p.name);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

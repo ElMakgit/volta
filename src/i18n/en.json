@@ -64,6 +64,7 @@
   "projects.name": "Project name",
   "projects.save": "Save project",
   "projects.saved": "Project saved.",
+  "projects.exists": "A project with that name already exists. Open it or choose another name.",
   "projects.opened": "Project opened.",
   "projects.list": "Saved projects",
   "projects.empty": "Nothing saved yet.",

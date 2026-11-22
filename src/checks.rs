@@ -738,7 +738,7 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
         .enumerate()
         .filter(|(_, p)| p.kind.is_transistor())
     {
-        let gate = q.pins[0];
+        let Some(&gate) = q.pins.first() else { continue };
         let r = roots[gate];
         let resistors = c
             .pins
@@ -750,12 +750,15 @@ pub fn run_circuit(c: &Circuit, lang: Lang, code: Option<&str>) -> Report {
             gates.push((q_idx, format!("{}: {}", q.label, tr(lang, "затвор/база без резистора", "gate/base without a resistor"))));
         }
         // The source/emitter has to reach ground.
-        let tail = q
+        let Some(tail) = q
             .pins
             .iter()
             .copied()
             .find(|&p| matches!(c.pins[p].name, "S" | "E"))
-            .unwrap_or(q.pins[q.pins.len() - 1]);
+            .or_else(|| q.pins.last().copied())
+        else {
+            continue;
+        };
         if roots[tail] != uno_gnd {
             gates.push((q_idx, format!("{}: {}", q.label, tr(lang, "исток/эмиттер не на земле", "source/emitter is not grounded"))));
         }

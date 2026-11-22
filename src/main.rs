@@ -490,7 +490,7 @@ fn cmd_render(args: &[String]) {
     let serialised = serde_json::json!({
         "ok": report.failed() == 0,
         "title": built.title,
-        "summary": built.summary.get(lang),
+        "summary": built.summary,
         "choice": built.choice,
         "parts": templates::bom(&built.circuit, lang).iter().map(|(v, k, n)| serde_json::json!({"value": v, "kind": k, "count": n})).collect::<Vec<_>>(),
         "checks": report.checks.iter().map(|c| serde_json::json!({
@@ -512,7 +512,7 @@ fn cmd_render(args: &[String]) {
         println!("{}", serialised);
     } else {
         println!("{}", built.title);
-        println!("{}", built.summary.get(lang));
+        println!("{}", built.summary);
         println!();
         for c in &report.checks {
             let mark = match c.sev {

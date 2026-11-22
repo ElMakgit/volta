@@ -73,7 +73,7 @@ impl Code {
                 let mode = if *active_low { "INPUT_PULLUP" } else { "INPUT" };
                 let level = if *active_low { "LOW" } else { "HIGH" };
                 format!(
-                    "// {title}\nconst uint8_t SENSOR = {pin};\nconst uint16_t PERIOD_MS = 250;\nuint32_t last = 0;\n\nvoid setup() {{\n  pinMode(SENSOR, {mode});\n  Serial.begin(9600);\n}}\n\nvoid loop() {{\n  if (millis() - last < PERIOD_MS) return;\n  last = millis();\n  bool active = digitalRead(SENSOR) == {level};\n  Serial.println(active ? 1 : 0);\n}}\n"
+                    "// {title}\nconst uint8_t SENSOR = {pin};\nconst uint32_t PERIOD_MS = 250;\nuint32_t last = 0;\n\nvoid setup() {{\n  pinMode(SENSOR, {mode});\n  Serial.begin(9600);\n}}\n\nvoid loop() {{\n  if (millis() - last < PERIOD_MS) return;\n  last = millis();\n  bool active = digitalRead(SENSOR) == {level};\n  Serial.println(active ? 1 : 0);\n}}\n"
                 )
             }
             Code::Sensor { pin, active_low, led } => {
@@ -84,7 +84,7 @@ impl Code {
                 )
             }
             Code::Analog { pin } => format!(
-                "// {title}\nconst uint8_t SENSE = {pin};\nconst uint16_t PERIOD_MS = 200;\nuint32_t last = 0;\n\nvoid setup() {{\n  Serial.begin(9600);\n}}\n\nvoid loop() {{\n  if (millis() - last < PERIOD_MS) return;\n  last = millis();\n  int value = analogRead(SENSE);\n  Serial.println(value);\n}}\n"
+                "// {title}\nconst uint8_t SENSE = {pin};\nconst uint32_t PERIOD_MS = 200;\nuint32_t last = 0;\n\nvoid setup() {{\n  Serial.begin(9600);\n}}\n\nvoid loop() {{\n  if (millis() - last < PERIOD_MS) return;\n  last = millis();\n  int value = analogRead(SENSE);\n  Serial.println(value);\n}}\n"
             ),
             Code::Raw(code) => (*code).to_string(),
         }
@@ -130,7 +130,7 @@ pub const ALL: &[Lesson] = &[
         code: Code::Raw(
             r#"// Светодиод мигает без delay(): плата остаётся свободной
 const uint8_t LED = 9;
-const uint16_t HALF_MS = 500;
+const uint32_t HALF_MS = 500;
 bool on = false;
 uint32_t last = 0;
 
@@ -364,7 +364,7 @@ void loop() {
         code: Code::Raw(
             r#"// Реле на D7 замыкает цепь мотора
 const uint8_t RELAY = 7;
-const uint16_t PERIOD_MS = 1500;
+const uint32_t PERIOD_MS = 1500;
 bool on = false;
 uint32_t last = 0;
 
@@ -403,7 +403,7 @@ void loop() {
         code: Code::Raw(
             r#"// Состояние кнопки уходит в порт на 9600 бод
 const uint8_t BTN = 2;
-const uint16_t PERIOD_MS = 200;
+const uint32_t PERIOD_MS = 200;
 bool was = false;
 uint32_t last = 0;
 
@@ -482,7 +482,7 @@ void loop() {
 const uint8_t SENSE = A0;
 const uint8_t LED = 9;
 const int THRESHOLD = 400;
-const uint16_t PERIOD_MS = 100;
+const uint32_t PERIOD_MS = 100;
 uint32_t last = 0;
 
 void setup() {
@@ -523,7 +523,7 @@ void loop() {
 #include <OneWire.h>
 #include <DallasTemperature.h>
 const uint8_t ONE_WIRE = 2;
-const uint16_t PERIOD_MS = 1000;
+const uint32_t PERIOD_MS = 1000;
 OneWire wire(ONE_WIRE);
 DallasTemperature sensors(&wire);
 uint32_t last = 0;
@@ -564,7 +564,7 @@ void loop() {
             r#"// DHT11/DHT22 на D2: температура и влажность
 #include <DHT.h>
 const uint8_t DATA_PIN = 2;
-const uint16_t PERIOD_MS = 2500;
+const uint32_t PERIOD_MS = 2500;
 DHT dht(DATA_PIN, DHT11);
 uint32_t last = 0;
 
@@ -608,7 +608,7 @@ void loop() {
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
 Adafruit_BMP280 bmp;
-const uint16_t PERIOD_MS = 1000;
+const uint32_t PERIOD_MS = 1000;
 uint32_t last = 0;
 
 void setup() {
@@ -651,7 +651,7 @@ void loop() {
             r#"// MQ-2: аналог на A0, порог на D2
 const uint8_t SENSE = A0;
 const uint8_t ALARM = 2;
-const uint16_t PERIOD_MS = 250;
+const uint32_t PERIOD_MS = 250;
 uint32_t last = 0;
 
 void setup() {
@@ -711,7 +711,7 @@ void loop() {
             r#"// HC-SR04: импульс на TRIG, длительность на ECHO
 const uint8_t TRIG = 9;
 const uint8_t ECHO = 10;
-const uint16_t PERIOD_MS = 100;
+const uint32_t PERIOD_MS = 100;
 uint32_t last = 0;
 
 void setup() {
@@ -972,7 +972,7 @@ void loop() {
 #include <Wire.h>
 #include <TM1650.h>
 TM1650 display;
-const uint16_t PERIOD_MS = 1000;
+const uint32_t PERIOD_MS = 1000;
 uint32_t last = 0;
 
 void setup() {
@@ -1348,7 +1348,7 @@ void loop() {
 #include <Wire.h>
 #include <RTClib.h>
 RTC_DS3231 rtc;
-const uint16_t PERIOD_MS = 1000;
+const uint32_t PERIOD_MS = 1000;
 uint32_t last = 0;
 
 void setup() {
@@ -1499,7 +1499,7 @@ void loop() {
 #include <SPI.h>
 #include <SD.h>
 const uint8_t CS = 10;
-const uint16_t PERIOD_MS = 5000;
+const uint32_t PERIOD_MS = 5000;
 uint32_t last = 0;
 
 void setup() {
@@ -1713,7 +1713,7 @@ void loop() {
 const uint8_t SENSE = A0;
 const float ZERO = 512.0;
 const float VOLTS_PER_AMP = 0.185;
-const uint16_t PERIOD_MS = 250;
+const uint32_t PERIOD_MS = 250;
 uint32_t last = 0;
 
 void setup() {
@@ -1808,7 +1808,7 @@ void loop() {
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 Adafruit_MPU6050 mpu;
-const uint16_t PERIOD_MS = 200;
+const uint32_t PERIOD_MS = 200;
 uint32_t last = 0;
 
 void setup() {
@@ -1866,7 +1866,7 @@ void loop() {
 const uint8_t DT = 2;
 const uint8_t SCK = 3;
 HX711 scale;
-const uint16_t PERIOD_MS = 500;
+const uint32_t PERIOD_MS = 500;
 uint32_t last = 0;
 
 void setup() {
@@ -1951,7 +1951,7 @@ void loop() {
         code: Code::Raw(
             r#"// Пельтье на D9 через MOSFET: полярность задаёт сторону холода
 const uint8_t GATE = 9;
-const uint16_t PERIOD_MS = 5000;
+const uint32_t PERIOD_MS = 5000;
 bool cold = false;
 uint32_t last = 0;
 
@@ -2016,7 +2016,7 @@ void loop() {
             r#"// TCS3200: частота на OUT, фильтры выбираются S2/S3
 const uint8_t OUT = 2;
 const uint8_t S0 = 3, S1 = 4, S2 = 5, S3 = 6;
-const uint16_t PERIOD_MS = 500;
+const uint32_t PERIOD_MS = 500;
 uint32_t last = 0;
 
 uint16_t readChannel(bool s2, bool s3) {
@@ -2071,7 +2071,7 @@ const ALIASES: &[(&str, usize)] = &[
     ("термодатчик", THERMISTOR),
     ("градус", THERMISTOR),
     ("temp", THERMISTOR),
-    ("освещ", PHOTORESISTOR),
+    ("освещенност", PHOTORESISTOR),
     ("люкс", PHOTORESISTOR),
     ("датчик света", PHOTORESISTOR),
     ("расстояни", RANGE),

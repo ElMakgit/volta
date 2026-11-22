@@ -285,7 +285,7 @@ const ETHERNET: Group = Group {
 const LED: Group = Group {
     words: &[
         "светодиод", "светодиот", "лед", "led", "лампоч", "лампа", "подсветк",
-        "ночник", "фонар", "гирлянд", "огонек", "индикатор", "rgb",
+        "освещени", "ночник", "фонар", "гирлянд", "огонек", "индикатор", "rgb",
         "blink", "light",
     ],
     label: L::new("светодиод", "LED"),
@@ -337,7 +337,7 @@ const POT: Group = Group {
 };
 const LDR: Group = Group {
     words: &[
-        "фоторезистор", "фотоэлемент", "светочувств", "ldr", "освещ", "темно",
+        "фоторезистор", "фотоэлемент", "светочувств", "ldr", "освещенност", "темно",
         "сумерк", "датчик свет", "свет датчик", "light sensor", "light level",
         "photoresistor", "вечер", "ночь", "рассвет", "закат", "twilight",
         "dusk", "dawn", "ночник", "night light",
@@ -818,7 +818,7 @@ pub struct Screens {
 
 /// Everything the user named outright. A ready-made lesson or a template is
 /// a starting point, not an excuse to drop parts the sentence asked for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NamedDevices {
     pub screens: Option<Screens>,
     pub buzzer: usize,
@@ -858,6 +858,9 @@ pub struct NamedDevices {
     pub clock: bool,
     /// An explicit Uno pin from "к пину 9", if the sentence gave one.
     pub pin: Option<u8>,
+    /// Every explicit pin in the order it was said: "на пины 12 и 13" names
+    /// two, and both must reach the drawing.
+    pub pins: Vec<u8>,
     /// The sentence asks for both halves of a radio link.
     pub radio_pair: bool,
     /// A phone screen is an SMS, not an LCD to wire.
@@ -911,7 +914,7 @@ fn number_word(word: &str) -> Option<usize> {
 /// "два датчика и светодиод" is still one LED.
 fn is_count_filler(token: &str, sensor: bool) -> bool {
     let t = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
-    if matches!(t, "и" | "по" | "с" | "из")
+    if matches!(t, "по" | "с" | "из")
         || t.starts_with("штук")
         || (sensor && t.starts_with("датчик"))
     {
@@ -930,6 +933,69 @@ fn is_count_filler(token: &str, sensor: bool) -> bool {
     ENDINGS
         .iter()
         .any(|ending| t.chars().count() > ending.chars().count() && t.ends_with(ending))
+}
+
+/// A word that joins two groups of parts: "3 красных и 2 зелёных светодиода".
+/// It is not filler like an adjective: a number on the far side of it needs
+/// its own agreement before it counts.
+fn is_conjunction(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric());
+    matches!(t, "и" | "или" | "либо" | "and" | "or")
+}
+
+/// A word naming a pin, a port or a terminal. A number in front of it is a
+/// pin number, not a count: "порт 3 и кнопка" asks for one button on port 3,
+/// not three buttons.
+fn is_pin_word(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric());
+    const STEMS: &[&str] = &[
+        "пин", "вывод", "порт", "контакт", "ног", "разъем", "клемм", "штыр", "pin",
+    ];
+    STEMS.iter().any(|stem| t.starts_with(stem))
+}
+
+/// How many parts the words in front of `start` count. A number belongs to
+/// the noun it stands next to, so the scan stops at another noun and at a
+/// pin name: "пин 13 и светодиод" is one LED, "3 красных и 2 зелёных
+/// светодиода" is five. `sensor` lets "датчик" sit between the number and
+/// the measured word ("два датчика температуры").
+fn spoken_count_before(tokens: &[&str], start: usize, sensor: bool) -> Option<usize> {
+    let mut sum = 0;
+    let mut found = false;
+    // A number after "и" counts only when the words between it and the
+    // conjunction agree with it: "3 красных и 2 зелёных". Without that,
+    // the number belongs to the noun before the conjunction.
+    let mut crossed = false;
+    let mut agreeing = false;
+    let mut i = start;
+    while i > 0 {
+        i -= 1;
+        let token = tokens[i];
+        if let Some(n) = number_word(token) {
+            if crossed && !agreeing {
+                break;
+            }
+            sum += n;
+            found = true;
+            agreeing = false;
+            continue;
+        }
+        if is_pin_word(token) {
+            break;
+        }
+        if is_conjunction(token) {
+            crossed = true;
+            continue;
+        }
+        if is_count_filler(token, sensor) {
+            if crossed {
+                agreeing = true;
+            }
+            continue;
+        }
+        break;
+    }
+    if found { Some(sum) } else { None }
 }
 
 /// Count the parts a sentence names, summing split groups: "3 красных и 2
@@ -960,20 +1026,7 @@ fn number_of(text: &str, words: &[&str]) -> usize {
             continue;
         }
         last = Some(i);
-        let mut sum = 0;
-        let mut i = i;
-        while i > 0 {
-            i -= 1;
-            let token = tokens[i];
-            if let Some(n) = number_word(token) {
-                sum += n;
-            } else if is_count_filler(token, false) {
-                continue;
-            } else {
-                break;
-            }
-        }
-        total += sum;
+        total += spoken_count_before(&tokens, i, false).unwrap_or(0);
     }
     total
 }
@@ -992,22 +1045,15 @@ fn count_of_inner(text: &str, words: &[&str], sensor: bool) -> usize {
     }
     let mut total = 0;
     for start in starts {
-        let mut sum = 0;
-        let mut found = false;
-        let mut i = start;
-        while i > 0 {
-            i -= 1;
-            let token = tokens[i];
-            if let Some(n) = number_word(token) {
-                sum += n;
-                found = true;
-            } else if is_count_filler(token, sensor) {
-                continue;
-            } else {
-                break;
-            }
+        // A second mention without its own number is a synonym or a model
+        // list, not another part: "BMP180, BMP280, BME280" names one
+        // barometer, just as "светодиод, LED" names one light. Only an
+        // explicit number adds to the count of an already counted part.
+        match spoken_count_before(&tokens, start, sensor) {
+            Some(n) => total += n,
+            None if total == 0 => total += 1,
+            None => {}
         }
-        total += if found { sum } else { 1 };
     }
     total
 }
@@ -1320,42 +1366,74 @@ fn names_clock(text: &str) -> bool {
     noun || chip
 }
 
-/// The Uno pin from "к пину 9", "на пин 9", "pin 9" or "D9". Only the
-/// number next to a pin word counts: "9 светодиодов" is a count, not a pin.
-fn named_pin(text: &str) -> Option<u8> {
+/// The Uno pins from "к пину 9", "на пины 12 и 13", "pin 9" or "D9". Only
+/// numbers next to a pin word count: "9 светодиодов" is a count, not a pin.
+/// A list after one pin word keeps going through "и", a comma or a dash.
+fn named_pins(text: &str) -> Vec<u8> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let number = |t: &str| -> Option<u8> {
         let t = t.trim_matches(|c: char| !c.is_alphanumeric());
         let t = t.strip_prefix('d').or_else(|| t.strip_prefix('D')).unwrap_or(t);
         t.parse::<u8>().ok().filter(|n| *n <= 19)
     };
-    for (i, token) in tokens.iter().enumerate() {
-        let clean = token.trim_matches(|c: char| !c.is_alphanumeric());
+    let connector = |t: &str| matches!(t, "и" | "," | "-" | "по");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let clean = tokens[i].trim_matches(|c: char| !c.is_alphanumeric());
         if clean.len() > 1 && (clean.starts_with('d') || clean.starts_with('D')) {
             if let Some(n) = number(clean) {
-                return Some(n);
+                out.push(n);
+                i += 1;
+                continue;
             }
         }
-        let is_pin = crate::words::mentions(clean, "пин")
-            || crate::words::mentions(clean, "pin")
-            || crate::words::mentions(clean, "вывод");
-        if is_pin {
-            if let Some(n) = tokens.get(i + 1).and_then(|t| number(t)) {
-                return Some(n);
+        if is_pin_word(clean) {
+            // "пины 12 и 13": one pin word can introduce a whole list.
+            let mut expect_number = true;
+            let mut j = i + 1;
+            while j < tokens.len() {
+                let t = tokens[j].trim_matches(|c: char| !c.is_alphanumeric());
+                if let Some(n) = number(t) {
+                    if !expect_number {
+                        break;
+                    }
+                    out.push(n);
+                    expect_number = false;
+                    j += 1;
+                    continue;
+                }
+                if connector(t) {
+                    expect_number = true;
+                    j += 1;
+                    continue;
+                }
+                break;
             }
-            if let Some(n) = i.checked_sub(1).and_then(|j| number(tokens[j])) {
-                return Some(n);
+            if j > i + 1 {
+                i = j;
+                continue;
             }
         }
-        // "к пину 9": the pin word is the previous token.
+        // "9 к пину": the pin word follows the number.
         if let Some(n) = number(clean) {
             let prev = i.checked_sub(1).and_then(|j| tokens.get(j));
-            if prev.is_some_and(|p| crate::words::mentions(p, "пин") || crate::words::mentions(p, "pin")) {
-                return Some(n);
+            if prev.is_some_and(|p| is_pin_word(p.trim_matches(|c: char| !c.is_alphanumeric()))) {
+                out.push(n);
             }
         }
+        i += 1;
     }
-    None
+    let mut seen = Vec::new();
+    out.retain(|n| {
+        if seen.contains(n) {
+            false
+        } else {
+            seen.push(*n);
+            true
+        }
+    });
+    out
 }
 
 /// Soil moisture is a different part, not a DHT reading. "Грунт" and
@@ -1382,15 +1460,16 @@ fn count_humidity(text: &str) -> usize {
 fn count_light(text: &str) -> usize {
     let named = count_sensors(
         text,
-        &["фоторезистор", "ldr", "освещ", "light", "photoresistor"],
+        &["фоторезистор", "ldr", "освещенност", "light", "photoresistor"],
     );
     if named > 0 {
         return named;
     }
     // "Датчик света" is a phrase: a bare "свет" in "выключатель света" is the
-    // lamp being switched, not a photoresistor.
-    if text.contains("датчик света") {
-        return count_sensors(text, &["света"]);
+    // lamp being switched, not a photoresistor. The words agree through
+    // cases ("два датчика света"), so the phrase is matched by stem.
+    if crate::words::mentions(text, "датчик свет") || crate::words::mentions(text, "свет датчик") {
+        return count_sensors(text, &["света"]).max(1);
     }
     0
 }
@@ -1417,6 +1496,7 @@ pub fn named_devices(raw: &str) -> NamedDevices {
     } else {
         0
     };
+    let pins = named_pins(&text);
     NamedDevices {
         screens: screens_in(raw),
         // Every synonym the sound group knows must also count: "два
@@ -1502,7 +1582,8 @@ pub fn named_devices(raw: &str) -> NamedDevices {
         segments: count_sensors(&text, &["семисегмент", "7seg", "tm1650", "tm1637"]),
         sound: count_sensors(&text, &["хлоп", "хлопк"]),
         clock: names_clock(&text),
-        pin: named_pin(&text),
+        pin: pins.first().copied(),
+        pins,
         radio_pair: radio_words
             && (text.contains("передатчик") || text.contains("transmitter"))
             && (text.contains("приемник")
@@ -2286,7 +2367,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     if let Some(a) = action {
         task.behaviors.push(a);
     }
-    task.named = named;
+    task.named = named.clone();
     task.lesson = lesson;
     task.recipe = recipe;
     task.text_screens = text_screens;
@@ -2298,6 +2379,36 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         .map(|s| s.kind);
     task.primary_control = input;
     task.sensors = sensor_slots(&named, raw, condition);
+    // One composition places one reading of each sensor: `SourceSpec` has a
+    // single pin set and one sample block. A sentence that asks for two of
+    // the same part, or for several different sensors, cannot be drawn yet.
+    // Saying so is honest; drawing one and failing the checklist is not.
+    let single_board = task.sensors.len() == 2
+        && task.sensors.iter().all(|s| {
+            matches!(
+                s.source,
+                crate::spec::SourceId::Temperature | crate::spec::SourceId::Humidity
+            )
+        });
+    let sensor_refusal = if !books {
+        // The book table answers a printed task with its own canned solution,
+        // whose lesson may deliberately be narrower than the words. Its
+        // fallback reading is allowed to build the closest circuit; the
+        // ordinary user sentence below is refused instead.
+        None
+    } else if task.sensors.iter().any(|s| s.count > 1) {
+        Some(L::new(
+            "Схема с несколькими одинаковыми датчиками пока не собирается: у каждого датчика на плате свой вход, а готовый шаблон ставит один. Назови один датчик или раздели задачу на части.",
+            "A circuit with several identical sensors is not built yet: every sensor needs its own pin, and the ready-made template places one. Name one sensor or split the task.",
+        ))
+    } else if task.sensors.len() > 1 && !single_board {
+        Some(L::new(
+            "Схема с несколькими разными датчиками пока не собирается: готовый шаблон читает один. Назови один датчик или раздели задачу на части.",
+            "A circuit with several different sensors is not built yet: the ready-made template reads one. Name one sensor or split the task.",
+        ))
+    } else {
+        None
+    };
     task.links = link_slots(&outputs, &named);
     task.counts.set(CountKind::Led, named.led);
     task.counts.set(CountKind::Lamp, named.lamp);
@@ -2350,7 +2461,9 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
     // night light. A knob that the plan would ignore is not a plan.
     let input_matters =
         input.is_some() && semantic != crate::templates::route(load, None);
-    let unsupported = if let Some(r) = refusal {
+    let unsupported = if let Some(r) = sensor_refusal {
+        Some(r)
+    } else if let Some(r) = refusal {
         Some(r)
     } else if lesson.is_some() || text_screens.is_some() || recipe.is_some() {
         None
@@ -2393,7 +2506,7 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
             load,
             input,
             task: reading,
-            named,
+            named: named.clone(),
             transistor,
             presses,
             lesson: None,
@@ -3102,6 +3215,53 @@ mod tests {
     /// become. It covers cases, synonyms, slang, typos, the wrong keyboard
     /// layout, English, refusals and ambiguity.
     #[test]
+    fn counts_corpus_matches_the_words() {
+        let corpus = include_str!("testdata/counts.txt");
+        for (n, raw) in corpus.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let at = n + 1;
+            let (phrase, want) = line
+                .split_once('|')
+                .unwrap_or_else(|| panic!("line {at}: no | in {line:?}"));
+            let phrase = phrase.trim();
+            let named = named_devices(phrase);
+            for pair in want.split(';') {
+                let (key, value) = pair
+                    .trim()
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("line {at}: no = in {pair:?}"));
+                let want: usize = value
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("line {at}: bad number in {pair:?}"));
+                let got = match key.trim() {
+                    "led" => named.led,
+                    "lamp" => named.lamp,
+                    "rgb" => named.rgb,
+                    "button" => named.button,
+                    "motor" => named.motor,
+                    "servo" => named.servo,
+                    "buzzer" => named.buzzer,
+                    "relay" => named.relay,
+                    "screens" => named.screens.map(|s| s.count).unwrap_or(0),
+                    "temperature" => named.temperature,
+                    "humidity" => named.humidity,
+                    "soil" => named.soil,
+                    "pressure" => named.pressure,
+                    "light" => named.light,
+                    "range" => named.range,
+                    "gas" => named.gas,
+                    other => panic!("line {at}: unknown field {other:?}"),
+                };
+                assert_eq!(got, want, "line {at}: {phrase:?}, field {key}");
+            }
+        }
+    }
+
+    #[test]
     fn corpus_phrases_parse_as_expected() {
         let corpus = include_str!("testdata/phrases.txt");
         let mut checked = 0;
@@ -3324,5 +3484,70 @@ mod tests {
         assert_eq!(screens_in("два экрана").unwrap().count, 2);
         assert_eq!(screens_in("три OLED").unwrap().count, 3);
         assert_eq!(screens_in("экран 16x2").unwrap().count, 1);
+    }
+
+    /// A pin number before "и" is not a count of the next part.
+    #[test]
+    fn a_pin_number_is_not_a_part_count() {
+        let n = named_devices("пин 13 и светодиод");
+        assert_eq!(n.led, 1);
+        assert_eq!(n.pin, Some(13));
+
+        let n = named_devices("порт 3 и кнопка");
+        assert_eq!(n.button, 1);
+
+        let n = named_devices("контакт 4 и реле");
+        assert_eq!(n.relay, 1);
+
+        let n = named_devices("вывод 2 и датчик температуры");
+        assert_eq!(n.temperature, 1);
+
+        let p = parse("датчик температуры на пин 13 и дисплей");
+        assert_eq!(p.intent.named.screens.map(|s| s.count), Some(1));
+        assert_eq!(p.intent.named.temperature, 1);
+    }
+
+    /// A circuit that would need two identical sensors or several different
+    /// ones is refused by name instead of being drawn as one and failing the
+    /// requirements checklist afterwards.
+    #[test]
+    fn an_undrawable_sensor_count_is_refused() {
+        for task in [
+            "два датчика температуры",
+            "два датчика света",
+            "четыре датчика давления",
+            "датчик температуры, влажности и давления",
+            "датчик света и температуры",
+        ] {
+            let p = parse(task);
+            assert!(p.unsupported.is_some(), "{task} should be refused");
+        }
+        // A single DHT covers temperature and humidity together: that pair is
+        // one board, not a multi-sensor circuit.
+        let p = parse("датчик температуры и влажности");
+        assert!(p.unsupported.is_none(), "{:?}", p.unsupported);
+    }
+
+    /// "Освещение" is what the circuit switches, not a light sensor.
+    #[test]
+    fn lighting_is_not_a_light_sensor() {
+        for task in [
+            "управление освещением",
+            "регулировать яркость освещения",
+            "включить освещение кнопкой",
+        ] {
+            let p = parse(task);
+            assert_eq!(p.intent.named.light, 0, "{task}: {:?}", p.intent.named.light);
+            assert!(
+                !p.intent.task.sensors.iter().any(|s| {
+                    s.source == crate::spec::SourceId::Light
+                }),
+                "{task}: a photoresistor was added"
+            );
+        }
+        let p = parse("датчик освещённости");
+        assert_eq!(p.intent.named.light, 1);
+        let p = parse("два датчика света");
+        assert_eq!(p.intent.named.light, 2);
     }
 }

@@ -357,7 +357,7 @@ pub const SOURCES: &[SourceSpec] = &[
         title: L::new("Фоторезистор GL5528", "The GL5528 photoresistor"),
         short: L::new("свет", "light"),
         lesson: 9,
-        keys: &["фоторезистор", "ldr", "люкс", "освещ", "датчик света", "темн", "light", "photoresistor", "brightness", "dark", "ночник", "night light"],
+        keys: &["фоторезистор", "ldr", "люкс", "освещенност", "датчик света", "темн", "light", "photoresistor", "brightness", "dark", "ночник", "night light"],
         period_ms: 100,
         place: Place::Ldr,
         summary: L::new(

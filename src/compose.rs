@@ -566,7 +566,7 @@ pub fn plan(c: Composition, lang: Lang) -> Option<Plan> {
 
 pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
     let plan = plan(c, lang)?;
-    let choice = choice.min(plan.choices.len() - 1);
+    let choice = choice.min(plan.choices.len().saturating_sub(1));
     let r = resolve(&c, choice)?;
     let circuit = circuit(&r, lang)?;
     let code = sketch(&r, lang);
@@ -646,8 +646,9 @@ pub fn build(c: Composition, choice: usize, lang: Lang) -> Option<Built> {
         circuit,
         code,
         choice,
-        summary: r.source.summary,
+        summary: r.source.summary.get(lang).to_string(),
         notes,
+        explained_pins: Vec::new(),
     })
 }
 
@@ -1012,7 +1013,7 @@ fn sketch(r: &Resolved, lang: Lang) -> String {
     );
     let mut s = String::from(
         r#"// <<C0>>
-<<INCLUDES>><<GLOBALS>><<PINS>>const uint16_t PERIOD_MS = <<PERIOD>>;
+<<INCLUDES>><<GLOBALS>><<PINS>>const uint32_t PERIOD_MS = <<PERIOD>>;
 uint32_t last = 0;
 <<EXTRA>>
 void setup() {
@@ -1238,7 +1239,7 @@ mod tests {
             assert!(
                 built
                     .code
-                    .contains(&format!("const uint16_t PERIOD_MS = {};", source.period_ms)),
+                    .contains(&format!("const uint32_t PERIOD_MS = {};", source.period_ms)),
                 "{}: period not {} ms\n{}",
                 source.title.ru,
                 source.period_ms,
@@ -1535,30 +1536,31 @@ mod tests {
         let p = parse("мигать каждые 200 мс");
         let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
         assert!(
-            built.code.contains("const uint16_t HALF_MS = 200;"),
+            built.code.contains("const uint32_t HALF_MS = 200;"),
             "{}",
             built.code
         );
     }
 
-    /// A pin named by the sentence is a requirement: wiring the LED to D9
-    /// does not answer "к пину 7".
+    /// A pin named by the sentence is a requirement: the build must move the
+    /// signal there, and the sketch must use the same number.
     #[test]
-    fn a_named_pin_is_checked() {
+    fn a_named_pin_is_honoured() {
         let p = parse("светодиод к пину 7");
         let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
-        let missing = crate::requirements::missing(&built, &p.intent);
         assert!(
-            missing
-                .iter()
-                .any(|m| m.extra.as_deref() == Some("D7")),
-            "{}",
-            missing
-                .iter()
-                .map(|m| m.name.ru)
-                .collect::<Vec<_>>()
-                .join(", ")
+            crate::requirements::pin_wired(&built.circuit, 7),
+            "the LED is not wired to D7"
         );
+        assert!(
+            built.code.contains("const uint8_t LED = 7;"),
+            "the sketch still points at another pin:\n{}",
+            built.code
+        );
+        assert!(crate::requirements::missing(&built, &p.intent).is_empty());
+
+        // The checker itself still notices a pin the drawing does not have.
+        assert!(!crate::requirements::pin_wired(&built.circuit, 8));
 
         let p = parse("светодиод к пину 9");
         let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");

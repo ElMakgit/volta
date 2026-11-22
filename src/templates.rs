@@ -106,8 +106,11 @@ pub struct Built {
     pub circuit: Circuit,
     pub code: String,
     pub choice: usize,
-    pub summary: L,
+    pub summary: String,
     pub notes: Vec<L>,
+    /// Pins the sentence named that this circuit genuinely has no place for.
+    /// A note explains each one, so the checklist does not call it missing.
+    pub explained_pins: Vec<u8>,
 }
 
 pub(crate) fn spec_line(num: &str, unit: L) -> (L, String) {
@@ -1761,7 +1764,6 @@ fn lesson_build(
     i: usize,
     screens: Option<crate::parse::Screens>,
     choice: usize,
-    spoken_pin: Option<u8>,
 ) -> (Circuit, String, L, Vec<L>) {
     use crate::lessons::{Extra, LoadKind};
 
@@ -1813,10 +1815,8 @@ fn lesson_build(
 
     // Signal wiring from the table. A board pin that the table names but the
     // module does not have is a data bug; skip it instead of panicking.
-    // A pin the sentence named ("к пину D5") moves the lesson's first digital
-    // signal there: the lesson is a starting point, not an excuse to ignore
-    // the wiring the user asked for.
-    let mut moved_pin = false;
+    // A pin the sentence named is moved after the build, where every route
+    // gets the same treatment.
     for (pin_name, target) in l.wires {
         let source = boards.iter().copied().find(|&p| {
             b.c.parts[p]
@@ -1826,18 +1826,7 @@ fn lesson_build(
         });
         let Some(part) = source else { continue };
         let a = b.mp(part, pin_name);
-        let is_digital = target
-            .strip_prefix('D')
-            .is_some_and(|n| n.parse::<u8>().is_ok());
-        let moved = spoken_pin.is_some() && is_digital && !moved_pin;
-        if moved {
-            moved_pin = true;
-        }
-        let z = if moved {
-            b.uno_pin(&format!("D{}", spoken_pin.unwrap()))
-        } else {
-            b.target(target)
-        };
+        let z = b.target(target);
         let class = match *target {
             "GND" => NetClass::Gnd,
             "5V" | "VCC" | "3V3" => NetClass::Vcc,
@@ -2046,7 +2035,7 @@ fn clock_segments_code(lang: Lang) -> String {
 #include <TM1650.h>
 RTC_DS3231 rtc;
 TM1650 display;
-const uint16_t PERIOD_MS = 1000;
+const uint32_t PERIOD_MS = 1000;
 uint32_t last = 0;
 
 void setup() {{
@@ -2717,7 +2706,7 @@ fn led_blink_sketch(lang: Lang, pin: u8, period: u16) -> String {
     fill(
         r#"// <<C0>>
 const uint8_t LED = <<PIN>>;
-const uint16_t HALF_MS = <<PERIOD>>;
+const uint32_t HALF_MS = <<PERIOD>>;
 
 bool on = false;
 uint32_t lastToggle = 0;
@@ -3119,6 +3108,9 @@ pub(crate) struct AddedPart {
 
 pub(crate) struct Added {
     pub parts: Vec<AddedPart>,
+    /// How many parts the sentence asked for, before the pin budget was
+    /// checked. When fewer are placed, the note says so instead of hiding it.
+    pub requested: usize,
 }
 
 fn pin_num(name: &str) -> u8 {
@@ -3213,14 +3205,28 @@ fn bench_diode(c: &mut Circuit, label: &str, value: &str, at: Pt) -> (usize, usi
 /// added twice: the template's own circuit is the better drawing of it.
 fn augment_devices(
     c: &mut Circuit,
-    named: crate::parse::NamedDevices,
+    named: &crate::parse::NamedDevices,
     ledger: &mut crate::resources::Resources,
 ) -> Added {
-    let mut added = Added { parts: Vec::new() };
+    let mut added = Added { parts: Vec::new(), requested: 0 };
     let Some(uno) = c.arduino else { return added };
     let gnd = c.pin(uno, "GND2");
     let vcc = c.pin(uno, "5V");
     let mut row = ExtraRow::below(c);
+    added.requested = named
+        .buzzer
+        .saturating_sub(count_kinds(c, &[Kind::Buzzer, Kind::Speaker]))
+        + named.relay.saturating_sub(count_kinds(c, &[Kind::Relay]))
+        + named.lamp.saturating_sub(count_kinds(c, &[Kind::Lamp]))
+        + named.led.saturating_sub(count_kinds(c, &[Kind::Led]))
+        + named.rgb.saturating_sub(
+            c.parts()
+                .filter(|p| p.kind == Kind::Led && p.value.to_lowercase().contains("rgb"))
+                .count(),
+        )
+        + named.servo.saturating_sub(count_kinds(c, &[Kind::Servo]))
+        + named.motor.saturating_sub(count_kinds(c, &[Kind::Motor]))
+        + named.button.saturating_sub(count_kinds(c, &[Kind::Button]));
 
     // Extras drive outputs, so they ask for digital pins only: `A0` is an
     // analog input number in a sketch, and pin 0 there would be D0.
@@ -3236,9 +3242,6 @@ fn augment_devices(
 
     for _ in 0..named.buzzer.saturating_sub(count_kinds(c, &[Kind::Buzzer, Kind::Speaker])) {
         let Some(pin) = ledger.claim_pin(&signals) else { break };
-        if !ledger.claim_current(15) {
-            break;
-        }
         let at = row.take(20.0, 18.0);
         let label = free_label(c, "BZ");
         let part = bench_part(c, Kind::Buzzer, &label, "пьезо", at);
@@ -3254,9 +3257,6 @@ fn augment_devices(
     // contacts instead of a second relay whose terminals hang in the air.
     for _ in 0..named.relay.saturating_sub(count_kinds(c, &[Kind::Relay])) {
         let Some(pin) = ledger.claim_pin(&signals) else { break };
-        if !ledger.claim_current(30) {
-            break;
-        }
         let at = row.take(44.0, 30.0);
         let label = free_label(c, "K");
         let part = bench_part(c, Kind::Relay, &label, "SRD-05VDC", at);
@@ -3290,9 +3290,6 @@ fn augment_devices(
     // and a load on the contact: another bare lamp would be an open circuit.
     for _ in 0..named.lamp.saturating_sub(count_kinds(c, &[Kind::Lamp])) {
         let Some(pin) = ledger.claim_pin(&signals) else { break };
-        if !ledger.claim_current(30) {
-            break;
-        }
         let mains = c
             .parts()
             .any(|p| p.kind == Kind::Lamp && p.value.contains("220"));
@@ -3328,9 +3325,6 @@ fn augment_devices(
 
     for _ in 0..named.led.saturating_sub(count_kinds(c, &[Kind::Led])) {
         let Some(pin) = ledger.claim_pin(&signals) else { break };
-        if !ledger.claim_current(15) {
-            break;
-        }
         let at = row.take(30.0, 16.0);
         let r_label = free_label(c, "R");
         let d_label = free_label(c, "D");
@@ -3356,7 +3350,7 @@ fn augment_devices(
             let Some(pin) = ledger.claim_pin(&signals) else { break };
             pins.push(pin);
         }
-        if pins.len() < 3 || !ledger.claim_current(45) {
+        if pins.len() < 3 {
             break;
         }
         let at = row.take(48.0, 20.0);
@@ -3388,9 +3382,6 @@ fn augment_devices(
 
     for _ in 0..named.servo.saturating_sub(count_kinds(c, &[Kind::Servo])) {
         let Some(pin) = ledger.claim_pin(&servo_pins) else { break };
-        if !ledger.claim_current(250) {
-            break;
-        }
         let at = row.take(28.0, 28.0);
         let label = free_label(c, "S");
         let part = bench_part(c, Kind::Servo, &label, "SG90", at);
@@ -3405,9 +3396,6 @@ fn augment_devices(
 
     for _ in 0..named.motor.saturating_sub(count_kinds(c, &[Kind::Motor])) {
         let Some(pin) = ledger.claim_pin(&pwm) else { break };
-        if !ledger.claim_current(250) {
-            break;
-        }
         let at = row.take(50.0, 44.0);
         let r1_label = free_label(c, "R");
         let r1 = bench_part(c, Kind::Resistor, &r1_label, "220 Ом", Pt::new(at.x, at.y + 18.0));
@@ -3450,28 +3438,80 @@ fn augment_devices(
     added
 }
 
-/// Apply the numbers the user actually said to a generated sketch.
-fn apply_spoken_numbers(code: &mut String, raw: &str) {
+/// Apply the numbers the user actually said to a generated sketch. Returns a
+/// note when a spoken number had to be brought into the range the sketch can
+/// safely use.
+fn apply_spoken_numbers(code: &mut String, raw: &str) -> Option<L> {
     let sem = crate::semantics::analyse(raw);
+    let mut note = None;
     if let Some(presses) = sem.after_presses {
-        *code = code.replace("STEPS = 6", &format!("STEPS = {}", presses.min(255)));
+        // The generated step code divides by `STEPS` and by `STEPS - 1`: a
+        // spoken 0 or 1 would crash the board, and a byte counter cannot hold
+        // more than 255. The plan keeps the spoken number visible, the sketch
+        // gets the nearest safe one, and the note says so instead of hiding it.
+        if code.contains("STEPS = 6") {
+            let steps = presses.clamp(2, 255);
+            if steps != presses {
+                note = Some(L::new(
+                    "Ступеней не может быть меньше 2 или больше 255: скетч делит на число ступеней и хранит счётчик в байте. В скетч записано ближайшее безопасное значение.",
+                    "The number of steps must be between 2 and 255: the sketch divides by it and keeps the counter in one byte. The nearest safe value is written into the sketch.",
+                ));
+            }
+            *code = code.replace("STEPS = 6", &format!("STEPS = {steps}"));
+        }
     }
     if let Some(ms) = sem.period_ms {
         // Lessons name the same interval differently: the first sketch uses
         // HALF_MS, a sensor loop uses PERIOD_MS. Both must follow the spoken
-        // number, or "каждые 200 мс" still blinks twice a second.
-        let ms = ms.min(65_535);
-        for constant in ["PERIOD_MS = 1000", "PERIOD_MS = 500", "HALF_MS = 500", "HALF_MS = 1000"] {
-            *code = code.replace(constant, &format!("{} = {ms}", constant.split(" = ").next().unwrap_or("PERIOD_MS")));
-        }
+        // number, or "каждые 200 мс" still blinks twice a second. The period
+        // is a uint32_t, so a spoken 70000 ms is written as is.
+        set_period_constants(code, ms);
     }
+    note
+}
+
+fn apply_numbers(built: &mut Built, raw: &str) {
+    if let Some(note) = apply_spoken_numbers(&mut built.code, raw) {
+        built.notes.push(note);
+    }
+}
+
+/// Replace the literal of `PERIOD_MS`/`HALF_MS` in generated code without
+/// caring which default the lesson or composition used.
+fn set_period_constants(code: &mut String, ms: u32) {
+    let mut out = String::with_capacity(code.len());
+    for (i, line) in code.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let starts = ["const uint32_t PERIOD_MS =", "const uint32_t HALF_MS ="];
+        let is_period = starts.iter().any(|s| line.trim_start().starts_with(s));
+        if is_period && let (Some(eq), Some(semi)) = (line.find('='), line.find(';')) {
+            out.push_str(&line[..=eq]);
+            out.push(' ');
+            out.push_str(&ms.to_string());
+            out.push_str(&line[semi..]);
+            continue;
+        }
+        out.push_str(line);
+    }
+    if code.ends_with('\n') {
+        out.push('\n');
+    }
+    *code = out;
 }
 
 /// Honour the parts the sentence named but the base circuit does not have.
 /// Shared by lessons, templates and compositions, so every route adds them.
-fn augment_built(built: &mut Built, named: crate::parse::NamedDevices, lang: Lang) {
+fn augment_built(built: &mut Built, named: &crate::parse::NamedDevices, lang: Lang) {
     let mut ledger = crate::resources::Resources::new(&built.circuit);
     let added = augment_devices(&mut built.circuit, named, &mut ledger);
+    if added.parts.len() < added.requested {
+        built.notes.push(L::new(
+            "Не все названные детали поместились на плату: свободных цифровых пинов не хватило. Остальные детали оставлены за схемой, их число видно в задаче.",
+            "Not every named part fit on the board: the free digital pins ran out. The rest are left out of the circuit; the required count stays visible in the task.",
+        ));
+    }
     if added.parts.is_empty() {
         return;
     }
@@ -3488,11 +3528,406 @@ fn augment_built(built: &mut Built, named: crate::parse::NamedDevices, lang: Lan
     ));
 }
 
+/// Honour the pins the sentence named. A ready-made lesson draws its signal
+/// on a default pin; when the sentence says "на пин 13", that signal moves
+/// there and the sketch constant follows, so the drawing and the code agree.
+///
+/// A circuit with no digital signal at all (an I2C clock, for example) has
+/// nowhere to put the pin. That is explained in a note instead of reported as
+/// a missing part: the user asked for a clock, and an extra dangling wire
+/// would be a different circuit.
+fn honour_named_pins(built: &mut Built, intent: &Intent) {
+    let Some(uno) = built.circuit.arduino else { return };
+    for &pin in intent.named.pins.iter() {
+        if crate::requirements::pin_wired(&built.circuit, pin) {
+            continue;
+        }
+        let Some(target) = built.circuit.parts[uno]
+            .pins
+            .iter()
+            .copied()
+            .find(|&p| built.circuit.pins[p].name == format!("D{pin}"))
+        else {
+            continue;
+        };
+        // Prefer the signal that belongs to the part the sentence named:
+        // "датчик температуры на пин 13" moves the sensor, not the screen's
+        // RS line, and "порт 3 и кнопка" moves the button, not the LED.
+        let mut old_pin: Option<(i32, usize, usize, u8)> = None;
+        for (idx, wire) in built.circuit.wires.iter().enumerate() {
+            if !wire.active || wire.class != NetClass::Signal {
+                continue;
+            }
+            // `end` is the Uno signal pin; `other` is the part it feeds and
+            // that part decides whether this is the signal the sentence meant.
+            let (end, other) = match (wire.a, wire.b) {
+                (End::Pin(a), b) if built.circuit.pins[a].part == uno => (a, b),
+                (a, End::Pin(b)) if built.circuit.pins[b].part == uno => (b, a),
+                _ => continue,
+            };
+            let name = built.circuit.pins[end].name;
+            let Some(n) = name.strip_prefix('D').and_then(|s| s.parse::<u8>().ok()) else {
+                continue;
+            };
+            // Never take a pin the sentence named for another part: that
+            // would move the previous request off its own pin.
+            if intent.named.pins.contains(&n) || !(2..=13).contains(&n) {
+                continue;
+            }
+            let score = match other {
+                End::Pin(p) => pin_move_score(&built.circuit, &intent.named, p),
+                _ => 1,
+            };
+            if old_pin.as_ref().map_or(true, |best| score > best.0) {
+                old_pin = Some((score, idx, end, n));
+            }
+        }
+        // A named sensor that only works on an analog pin has no digital
+        // signal to move. Do not borrow an unrelated LED just to satisfy the
+        // pin number: explain the free pin instead.
+        let named_any = intent.named.led
+            + intent.named.lamp
+            + intent.named.button
+            + intent.named.relay
+            + intent.named.buzzer
+            + intent.named.motor
+            + intent.named.servo
+            + intent.named.temperature
+            + intent.named.humidity
+            + intent.named.soil
+            + intent.named.pressure
+            + intent.named.light
+            + intent.named.range
+            + intent.named.gas
+            + intent.named.dht11
+            + intent.named.dht22
+            + usize::from(intent.named.clock)
+            > 0;
+        if named_any && old_pin.as_ref().is_some_and(|best| best.0 <= 1) {
+            old_pin = None;
+        }
+        let Some((_, wire_idx, old_end, old_num)) = old_pin else {
+            built.explained_pins.push(pin);
+            built.notes.push(L::new(
+                "Пин, названный в задаче, оставлен свободным: у её деталей нет цифрового вывода, который можно на него перенести.",
+                "The pin named in the task stays free: its parts have no digital line that could move to it.",
+            ));
+            continue;
+        };
+        if built.circuit.wires[wire_idx].a == End::Pin(old_end) {
+            built.circuit.wires[wire_idx].a = End::Pin(target);
+        } else {
+            built.circuit.wires[wire_idx].b = End::Pin(target);
+        }
+        built.circuit.touch();
+        rewrite_pin(&mut built.code, old_num, pin);
+        built.summary = built
+            .summary
+            .replace(&format!("D{old_num}"), &format!("D{pin}"));
+        built.notes.push(L::new(
+            "Вывод, названный в задаче, стоит в схеме: сигнал и константа скетча перенесены на него.",
+            "The pin named in the task is in the circuit: the signal and the sketch constant moved to it.",
+        ));
+    }
+}
+
+/// How well a signal on `end` answers the part the sentence named. A button
+/// wire beats an LED wire for "порт 3 и кнопка"; a sensor beats a screen for
+/// "датчик температуры на пин 13 и дисплей". Every signal keeps a base
+/// score, so a phrase that only names a pin still moves something real.
+fn pin_move_score(
+    c: &Circuit,
+    named: &crate::parse::NamedDevices,
+    end: usize,
+) -> i32 {
+    let part = &c.parts[c.pins[end].part];
+    let kind = part.kind;
+    let mut score = 1;
+    if named.button > 0 && kind == Kind::Button {
+        score = score.max(100);
+    }
+    if named.relay > 0 && kind == Kind::Relay {
+        score = score.max(100);
+    }
+    if named.buzzer > 0 && matches!(kind, Kind::Buzzer | Kind::Speaker) {
+        score = score.max(90);
+    }
+    if named.servo > 0 && kind == Kind::Servo {
+        score = score.max(90);
+    }
+    // An LED sits on the breadboard strip after its series resistor, so the
+    // Uno wire often reaches a resistor rather than the diode itself.
+    let led_like = kind == Kind::Led || kind == Kind::Resistor;
+    if named.led > 0 && led_like {
+        score = score.max(80);
+    }
+    if named.lamp > 0 && matches!(kind, Kind::Lamp | Kind::Relay) {
+        score = score.max(80);
+    }
+    if named.motor > 0 && leads_to_kind(c, c.pins[end].part, Kind::Motor) {
+        score = score.max(80);
+    }
+    let sensors = named.temperature
+        + named.humidity
+        + named.soil
+        + named.pressure
+        + named.light
+        + named.range
+        + named.gas
+        + named.dht11
+        + named.dht22
+        + usize::from(named.clock);
+    if sensors > 0 && is_sensor_part(part) {
+        score = score.max(90);
+    }
+    score
+}
+
+/// Does the signal chain from `start` reach a part of the wanted kind? A pin
+/// reaches an LED through its series resistor, and a motor through a gate
+/// resistor and a transistor, so the first part the Uno touches is not always
+/// the part the sentence named. Ground and supply rails are not followed;
+/// only signal wires join one stage to the next.
+fn leads_to_kind(c: &Circuit, start: usize, want: Kind) -> bool {
+    let mut seen = Vec::new();
+    let mut queue = vec![(start, 0usize)];
+    while let Some((part, depth)) = queue.pop() {
+        if c.parts[part].kind == want {
+            return true;
+        }
+        if depth >= 3 || seen.contains(&part) {
+            continue;
+        }
+        seen.push(part);
+        for wire in c.wires().filter(|w| w.class == NetClass::Signal) {
+            if let (End::Pin(a), End::Pin(b)) = (wire.a, wire.b) {
+                let (pa, pb) = (c.pins[a].part, c.pins[b].part);
+                if pa == part && !seen.contains(&pb) {
+                    queue.push((pb, depth + 1));
+                }
+                if pb == part && !seen.contains(&pa) {
+                    queue.push((pa, depth + 1));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Sensors are their own small boards, LDRs and thermistors are two-legged
+/// parts; a display on the same bus is not the sensor the sentence named.
+fn is_sensor_part(part: &Part) -> bool {
+    if matches!(
+        part.kind,
+        Kind::Ldr | Kind::Thermistor | Kind::Tmp36
+    ) {
+        return true;
+    }
+    if part.kind != Kind::Module {
+        return false;
+    }
+    !matches!(
+        crate::modules::find(&part.value).map(|m| m.look),
+        Some(
+            crate::modules::Look::Lcd
+                | crate::modules::Look::Display
+                | crate::modules::Look::Segments
+                | crate::modules::Look::Matrix
+                | crate::modules::Look::Panel
+        )
+    )
+}
+
+/// Rename a pin in the generated sketch: a named constant such as `LED` or
+/// `ONE_WIRE`, either flavour of `#define`, or a literal first argument of
+/// `pinMode`/`digitalWrite`. Without this the picture and the sketch would
+/// disagree about which pin carries the signal.
+fn rewrite_pin(code: &mut String, old: u8, new: u8) -> bool {
+    let snapshot = code.clone();
+    let mut changed = false;
+    let mut out = String::with_capacity(code.len());
+    for (i, line) in code.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&rewrite_pin_line(line, old, new, &snapshot, &mut changed));
+    }
+    if changed {
+        *code = out;
+    }
+    changed
+}
+
+fn rewrite_pin_line(line: &str, old: u8, new: u8, code: &str, changed: &mut bool) -> String {
+    let mut out = line.to_string();
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    if let Some(name) = pin_constant(line)
+        && (pin_like(&name) || uses_as_pin(code, &name))
+        && let Some(span) = pin_value_span(line, old)
+    {
+        edits.push(span);
+    }
+    for call in [
+        "pinMode",
+        "digitalWrite",
+        "digitalRead",
+        "analogWrite",
+        "analogRead",
+        "attach",
+    ] {
+        let needle = format!("{call}(");
+        let mut from = 0;
+        while let Some(at) = line[from..].find(&needle) {
+            let start = from + at + needle.len();
+            let after = &line[start..];
+            let trimmed = after.trim_start();
+            let lead = after.len() - trimmed.len();
+            let digits: String = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() && digits.parse::<u8>() == Ok(old) {
+                let end = start + lead + digits.len();
+                let next = line[end..].chars().next().unwrap_or(',');
+                if next == ',' || next == ')' {
+                    edits.push((start + lead, end));
+                }
+            }
+            from = start + 1;
+            if from >= line.len() {
+                break;
+            }
+        }
+    }
+    edits.sort_unstable_by_key(|e| e.0);
+    edits.dedup();
+    for (start, end) in edits.into_iter().rev() {
+        out.replace_range(start..end, &new.to_string());
+        *changed = true;
+    }
+    out
+}
+
+/// The variable being declared on a `const` or `#define` line.
+fn pin_constant(line: &str) -> Option<String> {
+    let text = line.trim_start();
+    if let Some(rest) = text.strip_prefix("#define") {
+        let rest = rest.trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        return (!name.is_empty()).then_some(name);
+    }
+    if text.starts_with("const ") {
+        let eq = text.find('=')?;
+        let left = text[..eq].trim_end();
+        let name: String = left
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        return (!name.is_empty()).then_some(name);
+    }
+    None
+}
+
+/// The span of an integer literal equal to `old` in a declaration.
+fn pin_value_span(line: &str, old: u8) -> Option<(usize, usize)> {
+    let text = line.trim_start();
+    let mut start = if text.starts_with("#define") {
+        let mut parts = text.split_whitespace();
+        parts.next();
+        let name = parts.next()?;
+        line.find(name)? + name.len()
+    } else {
+        line.find('=')? + 1
+    };
+    let bytes = line.as_bytes();
+    while start < bytes.len() && !bytes[start].is_ascii_digit() {
+        if bytes[start] == b';' || bytes[start] == b'\n' {
+            return None;
+        }
+        start += 1;
+    }
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == start || line[start..end].parse::<u8>().ok() != Some(old) {
+        return None;
+    }
+    if end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Names that hold a pin number even when the sketch never calls `pinMode`
+/// directly (OneWire and some libraries take the number as an argument).
+fn pin_like(name: &str) -> bool {
+    name.contains("PIN")
+        || name.ends_with("LED")
+        || name.contains("WIRE")
+        || matches!(
+            name,
+            "BTN"
+                | "BUTTON"
+                | "RELAY"
+                | "BUZZER"
+                | "SPEAKER"
+                | "LAMP"
+                | "MOTOR"
+                | "TRIG"
+                | "ECHO"
+                | "SENSE"
+                | "DATA"
+                | "IR_LED"
+        )
+}
+
+/// Is `name` the first argument of a pin call anywhere in the sketch?
+fn uses_as_pin(code: &str, name: &str) -> bool {
+    [
+        "pinMode(",
+        "digitalWrite(",
+        "digitalRead(",
+        "analogWrite(",
+        "analogRead(",
+        "attach(",
+    ]
+    .iter()
+    .any(|call| {
+        let mut rest = code;
+        while let Some(at) = rest.find(call) {
+            let arg = rest[at + call.len()..].trim_start();
+            let ident: String = arg
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if ident == name {
+                return true;
+            }
+            rest = &rest[at + call.len()..];
+        }
+        false
+    })
+}
+
 // new build body, spliced into templates.rs
 pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
+    let mut built = build_route(intent, choice, lang)?;
+    honour_named_pins(&mut built, intent);
+    Some(built)
+}
+
+fn build_route(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
     if let Some(screens) = intent.text_screens {
         let plan = text_screen_plan(&intent.raw, screens, lang);
-        let choice = choice.min(plan.choices.len() - 1);
+        let choice = choice.min(plan.choices.len().saturating_sub(1));
         let (circuit, code, summary, notes) = text_screen_build(lang, screens, choice);
         let mut built = Built {
             tid: Tid::TextScreens,
@@ -3500,36 +3935,38 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             circuit,
             code,
             choice,
-            summary,
+            summary: summary.get(lang).to_string(),
             notes,
+            explained_pins: Vec::new(),
         };
-        augment_built(&mut built, intent.named, lang);
-        apply_spoken_numbers(&mut built.code, &intent.raw);
+        augment_built(&mut built, &intent.named, lang);
+        apply_numbers(&mut built, &intent.raw);
         return Some(built);
     }
     if let Some(recipe) = intent.recipe {
         let mut built = crate::compose::build(recipe, choice, lang)?;
-        augment_built(&mut built, intent.named, lang);
-        apply_spoken_numbers(&mut built.code, &intent.raw);
+        augment_built(&mut built, &intent.named, lang);
+        apply_numbers(&mut built, &intent.raw);
         return Some(built);
     }
     if let Some(i) = intent.lesson {
         let screens = intent.named.screens;
         let plan = display_lesson_plan(i, screens, lang);
-        let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len() - 1) };
+        let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len().saturating_sub(1)) };
         let (circuit, code, summary, notes) =
-            lesson_build(lang, i, screens, choice, intent.named.pin);
+            lesson_build(lang, i, screens, choice);
         let mut built = Built {
             tid: Tid::Lesson(i),
             title: plan.title_text(lang),
             circuit,
             code,
             choice: 0,
-            summary,
+            summary: summary.get(lang).to_string(),
             notes,
+            explained_pins: Vec::new(),
         };
-        augment_built(&mut built, intent.named, lang);
-        apply_spoken_numbers(&mut built.code, &intent.raw);
+        augment_built(&mut built, &intent.named, lang);
+        apply_numbers(&mut built, &intent.raw);
         return Some(built);
     }
     // A screen with only buttons is its own honest circuit: count the presses
@@ -3542,7 +3979,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             segments: false,
         });
         let plan = buttons_screen_plan(screens, lang);
-        let choice = choice.min(plan.choices.len() - 1);
+        let choice = choice.min(plan.choices.len().saturating_sub(1));
         let (circuit, code, summary, notes) =
             buttons_screen_build(lang, screens, intent.named.button, choice);
         let mut built = Built {
@@ -3551,10 +3988,11 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
             circuit,
             code,
             choice,
-            summary,
+            summary: summary.get(lang).to_string(),
             notes,
+            explained_pins: Vec::new(),
         };
-        augment_built(&mut built, intent.named, lang);
+        augment_built(&mut built, &intent.named, lang);
         return Some(built);
     }
     // Most routes left here are LEDs, buzzers and buttons and cannot host a
@@ -3569,7 +4007,7 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         return None;
     }
     let plan = plan(intent, lang)?;
-    let choice = choice.min(plan.choices.len() - 1);
+    let choice = choice.min(plan.choices.len().saturating_sub(1));
     let mut notes = Vec::new();
     if intent.presses {
         notes.push(L::new(
@@ -3605,14 +4043,15 @@ pub fn build(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         circuit,
         code,
         choice,
-        summary,
+        summary: summary.get(lang).to_string(),
         notes,
+        explained_pins: Vec::new(),
     };
     built.notes.extend(extra);
     // Named parts the template did not draw are added here, so a sentence
     // like "RFID + светодиод" keeps both halves.
-    augment_built(&mut built, intent.named, lang);
-    apply_spoken_numbers(&mut built.code, &intent.raw);
+    augment_built(&mut built, &intent.named, lang);
+    apply_numbers(&mut built, &intent.raw);
     Some(built)
 }
 
@@ -4253,14 +4692,30 @@ fn buzzer_tone(lang: Lang, choice: usize) -> (Circuit, String, L, Vec<L>) {
     }
 }
 
+/// The same electrical value written two ways: "220 Ω" and "220 Ом", "10 кОм"
+/// and "10 кΩ". The bill of materials groups by this key so one resistor does
+/// not appear as two lines with different letters.
+fn value_key(kind: Kind, value: &str) -> String {
+    if !matches!(kind, Kind::Resistor | Kind::Pot | Kind::Thermistor) {
+        return value.to_string();
+    }
+    value
+        .replace(" кОм", " кΩ")
+        .replace(" МОм", " МΩ")
+        .replace(" Ом", " Ω")
+}
+
 /// Bill of materials, grouped by component kind and value.
 pub fn bom(c: &Circuit, lang: Lang) -> Vec<(String, String, usize)> {
     let mut out: Vec<(String, String, usize)> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
     for p in &c.parts {
         let kind = kind_name(p.kind, lang).to_string();
-        if let Some(slot) = out.iter_mut().find(|(v, k, _)| *v == p.value && *k == kind) {
-            slot.2 += 1;
+        let key = format!("{}\u{1}{}", kind, value_key(p.kind, &p.value));
+        if let Some(i) = keys.iter().position(|k| *k == key) {
+            out[i].2 += 1;
         } else {
+            keys.push(key);
             out.push((p.value.clone(), kind, 1));
         }
     }
@@ -4281,10 +4736,11 @@ pub fn component_rows(c: &Circuit, lang: Lang) -> Vec<ComponentRow> {
     let mut out: Vec<ComponentRow> = Vec::new();
     for p in &c.parts {
         let kind = kind_name(p.kind, lang);
-        let component = if p.value.is_empty() {
+        let value = value_key(p.kind, &p.value);
+        let component = if value.is_empty() {
             kind.to_string()
         } else {
-            format!("{kind} {}", p.value)
+            format!("{kind} {value}")
         };
         if let Some(slot) = out.iter_mut().find(|r| r.component == component) {
             slot.names.push(p.label.clone());
@@ -5024,7 +5480,7 @@ fn radio433_link_sketch(lang: Lang) -> String {
 #include <DHT.h>
 
 #define SENDER 1              // 1 — плата с передатчиком, 0 — плата с приёмником
-const uint16_t PERIOD_MS = 2000;
+const uint32_t PERIOD_MS = 2000;
 
 // Структура, которой обмениваются платы.
 struct Reading {{
@@ -6252,7 +6708,7 @@ mod tests {
                 .filter(|p| kinds.contains(&p.kind))
                 .count();
             assert_eq!(got, want, "{task}: {got} parts, want {want}");
-            let report = crate::checks::run(&built, Lang::Ru);
+            let report = crate::checks::run_with(&built, Lang::Ru, &parsed.intent);
             assert_eq!(
                 report.failed(),
                 0,
@@ -6278,7 +6734,7 @@ mod tests {
         use crate::text::Lang;
         let parsed = parse("два реле");
         let built = build(&parsed.intent, 0, Lang::Ru).expect("builds");
-        let report = crate::checks::run(&built, Lang::Ru);
+        let report = crate::checks::run_with(&built, Lang::Ru, &parsed.intent);
         assert_eq!(report.failed(), 0);
         assert!(
             report
@@ -6539,6 +6995,192 @@ mod tests {
         assert!(built.code.contains("PERIOD_MS = 5000"), "{}", built.code);
     }
 
+    /// A step counter of 0 or 1 makes the generated code divide by zero, and
+    /// a spoken period above 65535 used to be silently clamped. The sketch
+    /// now keeps a safe value and says so; the period is a uint32_t.
+    #[test]
+    fn dangerous_spoken_numbers_are_made_safe_and_explained() {
+        use crate::text::Lang;
+        for (task, want) in [
+            ("мотор и кнопка, после 0 нажатий", "STEPS = 2"),
+            ("мотор и кнопка, после 1 нажатия", "STEPS = 2"),
+            ("мотор и кнопка, после 300 нажатий", "STEPS = 255"),
+        ] {
+            let parsed = crate::parse::parse(task);
+            let plan = plan(&parsed.intent, Lang::Ru)
+                .unwrap_or_else(|| panic!("{task}: no plan"));
+            let built = build(&parsed.intent, plan.recommended, Lang::Ru)
+                .unwrap_or_else(|| panic!("{task}: does not build"));
+            assert!(built.code.contains(want), "{task}: {}", built.code);
+            assert!(
+                built.notes.iter().any(|n| n.ru.contains("Ступеней")),
+                "{task}: no note about the safe step count"
+            );
+            let report = crate::checks::run_with(&built, Lang::Ru, &parsed.intent);
+            assert_eq!(report.failed(), 0, "{task}");
+        }
+
+        let parsed = crate::parse::parse("светодиод мигает каждые 70000 мс");
+        let chosen = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let built = build(&parsed.intent, chosen.recommended, Lang::Ru).expect("builds");
+        assert!(
+            built.code.contains("HALF_MS = 70000"),
+            "the spoken period is clamped: {}",
+            built.code
+        );
+        assert!(!built.code.contains("65535"), "{}", built.code);
+    }
+
+    /// The 400 mA budget is advice, not a reason to throw away a part the
+    /// sentence named. Pins can still run out; that is said in a note.
+    #[test]
+    fn named_parts_are_not_dropped_to_fit_the_power_budget() {
+        use crate::model::Kind;
+        use crate::text::Lang;
+        let parsed = crate::parse::parse("три сервопривода");
+        let chosen = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let built = build(&parsed.intent, chosen.recommended, Lang::Ru).expect("builds");
+        let servos = built
+            .circuit
+            .parts()
+            .filter(|p| p.kind == Kind::Servo)
+            .count();
+        assert_eq!(servos, 3, "the power budget still drops a named servo");
+        let report = crate::checks::run_with(&built, Lang::Ru, &parsed.intent);
+        assert_eq!(report.failed(), 0);
+
+        let parsed = crate::parse::parse("двадцать светодиодов");
+        let chosen = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let built = build(&parsed.intent, chosen.recommended, Lang::Ru).expect("builds");
+        assert!(
+            built.notes.iter().any(|n| n.ru.contains("Не все названные детали")),
+            "the pin limit is silent: {:?}",
+            built.notes
+        );
+    }
+
+    /// One table of the phrases that used to build a wrong but confident
+    /// circuit: a pin number swallowed as a count, "освещение" read as a
+    /// photoresistor, a spoken period clamped, or a division by zero in the
+    /// sketch. Every one must either be honestly refused or pass its checks.
+    #[test]
+    fn bug_table_phrases_never_end_in_a_false_failure() {
+        use crate::text::Lang;
+        for task in [
+            "пин 13 и светодиод",
+            "кнопка на пин 2 и светодиод",
+            "порт 3 и кнопка",
+            "контакт 4 и реле",
+            "вывод 2 и датчик температуры",
+            "датчик температуры на пин 13 и дисплей",
+            "пин 13 и экран часов",
+            "3 красных и 2 зелёных светодиода",
+            "два светодиода на пины 12 и 13",
+            "управление освещением",
+            "регулировать яркость освещения",
+            "включить освещение кнопкой",
+            "светодиод мигает каждые 70000 мс",
+            "мотор и кнопка, после 0 нажатий",
+            "мотор и кнопка, после 1 нажатия",
+            "мотор и кнопка, после 300 нажатий",
+            "три сервопривода",
+            "два датчика температуры",
+            "два датчика света",
+            "датчик температуры, влажности и давления",
+        ] {
+            let parsed = crate::parse::parse(task);
+            if parsed.unsupported.is_some() {
+                continue;
+            }
+            let chosen = plan(&parsed.intent, Lang::Ru)
+                .unwrap_or_else(|| panic!("{task}: no plan"));
+            let built = build(&parsed.intent, chosen.recommended, Lang::Ru)
+                .unwrap_or_else(|| panic!("{task}: does not build"));
+            let report = crate::checks::run_with(&built, Lang::Ru, &parsed.intent);
+            let failures: Vec<_> = report
+                .checks
+                .iter()
+                .filter(|c| c.sev == crate::checks::Sev::Fail)
+                .collect();
+            assert!(
+                failures.is_empty(),
+                "{task}: {}",
+                failures
+                    .iter()
+                    .map(|c| format!("{}: {}", c.name.ru, c.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+    }
+
+    /// "на пины 12 и 13" names two pins, and both reach the drawing. The
+    /// parser keeps the list, and the build moves one signal to each.
+    #[test]
+    fn every_named_pin_reaches_the_drawing() {
+        use crate::text::Lang;
+        let parsed = crate::parse::parse("два светодиода на пины 12 и 13");
+        assert_eq!(parsed.intent.named.pins, vec![12, 13]);
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let built = build(&parsed.intent, plan.recommended, Lang::Ru).expect("builds");
+        for pin in [12, 13] {
+            assert!(
+                crate::requirements::pin_wired(&built.circuit, pin),
+                "D{pin} is not in the circuit"
+            );
+        }
+        assert!(
+            built.code.contains("= 12;") && built.code.contains("= 13;"),
+            "the sketch did not follow both pins:\n{}",
+            built.code
+        );
+    }
+
+    /// A clock and its display speak I2C, so a named digital pin has nothing
+    /// to switch. The build explains the free pin instead of inventing an LED
+    /// or reporting a part the user never asked for.
+    #[test]
+    fn a_pin_with_no_digital_part_is_explained() {
+        use crate::text::Lang;
+        let parsed = crate::parse::parse("пин 13 и экран часов");
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let built = build(&parsed.intent, plan.recommended, Lang::Ru).expect("builds");
+        assert!(built.explained_pins.contains(&13));
+        assert!(
+            built
+                .notes
+                .iter()
+                .any(|n| n.ru.contains("оставлен свободным")),
+            "no note explains the free pin"
+        );
+        assert!(
+            crate::requirements::missing(&built, &parsed.intent)
+                .iter()
+                .all(|m| m.extra.as_deref() != Some("D13"))
+        );
+    }
+
+    /// One resistor is one line in the bill, however its value is spelled.
+    #[test]
+    fn one_resistor_is_one_bill_line() {
+        use crate::text::Lang;
+        let parsed = crate::parse::parse("два светодиода");
+        let plan = plan(&parsed.intent, Lang::Ru).expect("plans");
+        let built = build(&parsed.intent, plan.recommended, Lang::Ru).expect("builds");
+        let rows = component_rows(&built.circuit, Lang::Ru);
+        let resistors: Vec<&ComponentRow> = rows
+            .iter()
+            .filter(|r| r.component.contains("220"))
+            .collect();
+        assert_eq!(
+            resistors.len(),
+            1,
+            "one resistor is listed twice: {:?}",
+            rows.iter().map(|r| &r.component).collect::<Vec<_>>()
+        );
+        assert!(resistors[0].quantity >= 2, "{:?}", resistors[0].quantity);
+    }
+
     #[test]
     fn auto_assembly_from_dumb_to_precise() {
         use crate::text::Lang;
@@ -6625,7 +7267,7 @@ mod tests {
                 assert!(built.circuit.wires.len() >= 3);
                 assert_eq!(built.choice, choice);
                 assert!(built.circuit.arduino.is_some());
-                assert!(!built.summary.ru.is_empty() && !built.summary.en.is_empty());
+                assert!(!built.summary.is_empty());
                 signatures.push((
                     built.circuit.parts.len(),
                     built.circuit.wires.len(),
@@ -6993,7 +7635,7 @@ mod tests {
         );
         for choice in 0..3 {
             let built = build(&parsed.intent, choice, Lang::Ru).expect("builds");
-            let report = crate::checks::run(&built, Lang::Ru);
+            let report = crate::checks::run_with(&built, Lang::Ru, &parsed.intent);
             assert_eq!(
                 report.failed(),
                 0,

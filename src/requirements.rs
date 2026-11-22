@@ -95,7 +95,7 @@ fn count_screens(c: &Circuit, screens: crate::parse::Screens) -> usize {
 
 /// Whether the named Uno pin is actually part of the drawing. A pin the
 /// sentence asked for and the build ignored is a missing part, not a detail.
-fn pin_wired(c: &Circuit, n: u8) -> bool {
+pub(crate) fn pin_wired(c: &Circuit, n: u8) -> bool {
     let Some(uno) = c.arduino else { return false };
     let name = format!("D{n}");
     let Some(pin) = c.parts[uno]
@@ -125,15 +125,21 @@ pub fn missing(built: &Built, intent: &crate::parse::Intent) -> Vec<Missing> {
     let text = crate::words::normalize(raw);
     let mut out = Vec::new();
 
-    if let Some(pin) = named.pin {
-        if !pin_wired(c, pin) {
-            out.push(Missing {
-                name: L::new("пин", "pin"),
-                want: 1,
-                got: 0,
-                extra: Some(format!("D{pin}")),
-            });
+    let pins: Vec<u8> = if named.pins.is_empty() {
+        named.pin.into_iter().collect()
+    } else {
+        named.pins.clone()
+    };
+    for pin in pins {
+        if pin_wired(c, pin) || built.explained_pins.contains(&pin) {
+            continue;
         }
+        out.push(Missing {
+            name: L::new("пин", "pin"),
+            want: 1,
+            got: 0,
+            extra: Some(format!("D{pin}")),
+        });
     }
 
     let mut need = |name: L, want: usize, got: usize| {

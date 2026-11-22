@@ -924,6 +924,13 @@ impl App {
         };
         let p = self.project_snapshot(&name);
         let path = project::dir().join(project::file_name(&name));
+        // Re-saving the project that is already open is normal. Writing a
+        // different, existing project under the same name is not: the user
+        // must open it or pick another name instead of losing it silently.
+        if self.project_path.as_deref() != Some(path.as_path()) && path.exists() {
+            self.project_error = Some(self.t("projects.exists"));
+            return;
+        }
         match project::save(&path, &p) {
             Ok(()) => {
                 self.project_name = name;
@@ -2228,7 +2235,7 @@ impl App {
             Mode::Ai => self.built.as_ref().map(|b| {
                 (
                     b.title.clone(),
-                    b.summary.get(self.lang).to_string(),
+                    b.summary.clone(),
                     b.notes.iter().map(|l| l.get(self.lang).to_string()).collect::<Vec<_>>(),
                 )
             }),

@@ -190,7 +190,7 @@ pub fn clear_draft_at(path: &Path) -> std::io::Result<()> {
     }
     let mut body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
     body.push('\n');
-    std::fs::write(path, body)
+    crate::paths::write_atomic(path, &body)
 }
 
 fn read(path: &Path) -> serde_json::Value {
@@ -213,7 +213,7 @@ fn put(path: &Path, key: &str, value: serde_json::Value) -> std::io::Result<()> 
     }
     let mut body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
     body.push('\n');
-    std::fs::write(path, body)
+    crate::paths::write_atomic(path, &body)
 }
 
 #[cfg(test)]
