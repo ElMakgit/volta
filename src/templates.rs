@@ -420,9 +420,27 @@ fn recipe_why(recipe: crate::spec::Composition, lang: Lang) -> String {
     )
 }
 
+/// The DHT board the sentence named, if it named one. The humidity source
+/// covers DHT11 and DHT22, and the drawing must show the board the checklist
+/// counts.
+fn humidity_model(named: &crate::parse::NamedDevices) -> Option<&'static str> {
+    if named.dht22 > 0 {
+        Some("DHT22")
+    } else if named.dht11 > 0 {
+        Some("DHT11")
+    } else {
+        None
+    }
+}
+
 pub fn plan(intent: &Intent, lang: Lang) -> Option<Plan> {
     if let Some(screens) = intent.text_screens {
         return Some(text_screen_plan(&intent.raw, screens, lang));
+    }
+    // Several sensors are their own plan: the single-source composer and the
+    // book lesson both answer with one reading, which would lose the others.
+    if let Some(multi) = crate::compose::multi_request(&intent.task) {
+        return crate::compose::multi_plan(&multi, humidity_model(&intent.named), lang);
     }
     if let Some(recipe) = intent.recipe {
         let mut p = crate::compose::plan(recipe, lang)?;
@@ -1764,10 +1782,18 @@ fn lesson_build(
     i: usize,
     screens: Option<crate::parse::Screens>,
     choice: usize,
+    humidity_model: Option<&'static str>,
 ) -> (Circuit, String, L, Vec<L>) {
     use crate::lessons::{Extra, LoadKind};
 
     let l = &crate::lessons::ALL[i];
+    // The DHT lesson covers both boards; the sentence may name the model.
+    // The drawing and the sketch must show the one the checklist counts.
+    let dht_model = if l.boards.iter().any(|s| s.name == "DHT11") {
+        humidity_model
+    } else {
+        None
+    };
     let mut b = B::new(lang);
     let mut boards = Vec::new();
     let mut placed: Vec<(Pt, f32)> = Vec::new();
@@ -1775,9 +1801,14 @@ fn lesson_build(
     for spec in l.boards {
         let name = format!("U{label}");
         label += 1;
+        let spec_name = if spec.name == "DHT11" {
+            dht_model.unwrap_or(spec.name)
+        } else {
+            spec.name
+        };
         // A wide board would run into the Uno at x = 96, so it moves one
         // row down instead of being drawn on top of the controller.
-        let (w, h) = crate::modules::find(spec.name)
+        let (w, h) = crate::modules::find(spec_name)
             .map(|m| (m.w, m.h))
             .unwrap_or((40.0, 30.0));
         let mut at = Pt::new(spec.at.0, spec.at.1);
@@ -1789,8 +1820,8 @@ fn lesson_build(
                 .fold(66.0f32, f32::max);
             at = Pt::new(2.0, below);
         }
-        let p = b.breakout(&name, spec.name, at);
-        if let Some(m) = crate::modules::find(spec.name) {
+        let p = b.breakout(&name, spec_name, at);
+        if let Some(m) = crate::modules::find(spec_name) {
             for (pin, dx, _) in m.pins.iter().copied() {
                 match pin {
                     "GND" => {
@@ -1999,11 +2030,39 @@ fn lesson_build(
     }
 
     feeds(&mut b);
-    let mut notes = l.notes.to_vec();
-    if let Some(m) = l.boards.first().and_then(|s| crate::modules::note(s.name)) {
+    let (summary, mut notes) = if dht_model == Some("DHT22") {
+        (
+            L::new(
+                "DHT22 на D2: оба значения читаются одной линией не чаще раза в 2 секунды.",
+                "A DHT22 on D2: both readings come over one wire, at most every two seconds.",
+            ),
+            vec![L::new(
+                "DHT22 опрашивают не чаще раза в 2 секунды: между чтениями проходит не меньше 2 с.",
+                "The DHT22 is read at most every 2 seconds: at least 2 s pass between readings.",
+            )],
+        )
+    } else {
+        (l.summary, l.notes.to_vec())
+    };
+    let first_board = l
+        .boards
+        .first()
+        .map(|s| {
+            if s.name == "DHT11" {
+                dht_model.unwrap_or(s.name)
+            } else {
+                s.name
+            }
+        });
+    if let Some(m) = first_board.and_then(crate::modules::note) {
         notes.push(m);
     }
-    let base_code = l.code.render(l.title.get(lang));
+    let mut base_code = l.code.render(l.title.get(lang));
+    if dht_model == Some("DHT22") {
+        base_code = base_code
+            .replace("DHT11/DHT22", "DHT22")
+            .replace("DHT11", "DHT22");
+    }
     let code = if added_segments {
         clock_segments_code(lang)
     } else if i == 31
@@ -2015,7 +2074,7 @@ fn lesson_build(
     } else {
         base_code
     };
-    (b.finish(), code, l.summary, notes)
+    (b.finish(), code, summary, notes)
 }
 
 /// The clock lesson with four seven-segment digits on a TM1650, both devices
@@ -3943,6 +4002,15 @@ fn build_route(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         apply_numbers(&mut built, &intent.raw);
         return Some(built);
     }
+    if let Some(multi) = crate::compose::multi_request(&intent.task) {
+        // The humidity source covers both DHT boards; place the one whose
+        // name the sentence (and the checklist) actually uses.
+        let mut built =
+            crate::compose::multi_build(&multi, humidity_model(&intent.named), lang)?;
+        augment_built(&mut built, &intent.named, lang);
+        apply_numbers(&mut built, &intent.raw);
+        return Some(built);
+    }
     if let Some(recipe) = intent.recipe {
         let mut built = crate::compose::build(recipe, choice, lang)?;
         augment_built(&mut built, &intent.named, lang);
@@ -3954,7 +4022,7 @@ fn build_route(intent: &Intent, choice: usize, lang: Lang) -> Option<Built> {
         let plan = display_lesson_plan(i, screens, lang);
         let choice = if plan.choices.is_empty() { 0 } else { choice.min(plan.choices.len().saturating_sub(1)) };
         let (circuit, code, summary, notes) =
-            lesson_build(lang, i, screens, choice);
+            lesson_build(lang, i, screens, choice, humidity_model(&intent.named));
         let mut built = Built {
             tid: Tid::Lesson(i),
             title: plan.title_text(lang),
@@ -7086,6 +7154,11 @@ mod tests {
             "три сервопривода",
             "два датчика температуры",
             "два датчика света",
+            "два DHT22",
+            "два DHT11",
+            "два датчика влажности DHT11",
+            "два DS18B20",
+            "датчик температуры DHT22",
             "датчик температуры, влажности и давления",
         ] {
             let parsed = crate::parse::parse(task);

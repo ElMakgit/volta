@@ -666,7 +666,10 @@ fn sensor_slots(
     } else if named.temperature > 0 {
         add(SourceId::Temperature, named.temperature, vec!["температура".into()]);
     }
-    add(SourceId::Humidity, named.humidity, vec!["влажность".into()]);
+    // "Два DHT22" names the humidity board without the word "влажность":
+    // the model is the sensor, and its count is the count of the reading.
+    let humidity = named.humidity.max(named.dht22).max(named.dht11);
+    add(SourceId::Humidity, humidity, vec!["влажность".into()]);
     add(SourceId::Soil, named.soil, vec!["почва".into()]);
     add(SourceId::Pressure, named.pressure, vec!["давление".into()]);
     add(SourceId::Light, named.light, vec!["свет".into()]);
@@ -1332,6 +1335,8 @@ fn count_temperature(text: &str) -> usize {
     if !text.contains("символ") {
         n += count_sensors(text, &["термометр"]);
     }
+    // "Два DS18B20" names the part directly, without the word "датчик".
+    n += count_sensors(text, &["ds18b20", "18b20"]);
     n
 }
 
@@ -2379,10 +2384,11 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         .map(|s| s.kind);
     task.primary_control = input;
     task.sensors = sensor_slots(&named, raw, condition);
-    // One composition places one reading of each sensor: `SourceSpec` has a
-    // single pin set and one sample block. A sentence that asks for two of
-    // the same part, or for several different sensors, cannot be drawn yet.
-    // Saying so is honest; drawing one and failing the checklist is not.
+    // The multi-sensor builder can place several instances and read each one.
+    // When it can, the sentence stops being a refusal; when it cannot, the
+    // honest refusal below still stands rather than drawing one sensor and
+    // failing the checklist.
+    let multi = crate::compose::multi_request(&task);
     let single_board = task.sensors.len() == 2
         && task.sensors.iter().all(|s| {
             matches!(
@@ -2395,6 +2401,8 @@ fn parse_inner(raw: &str, books: bool) -> Parse {
         // whose lesson may deliberately be narrower than the words. Its
         // fallback reading is allowed to build the closest circuit; the
         // ordinary user sentence below is refused instead.
+        None
+    } else if multi.is_some() {
         None
     } else if task.sensors.iter().any(|s| s.count > 1) {
         Some(L::new(
@@ -3507,25 +3515,35 @@ mod tests {
         assert_eq!(p.intent.named.temperature, 1);
     }
 
-    /// A circuit that would need two identical sensors or several different
-    /// ones is refused by name instead of being drawn as one and failing the
+    /// The multi-sensor builder handles several named sensors; a part it
+    /// cannot read twice (or a count beyond the pins and addresses available)
+    /// is still refused by name instead of being drawn as one and failing the
     /// requirements checklist afterwards.
     #[test]
     fn an_undrawable_sensor_count_is_refused() {
+        for task in ["пять датчиков температуры", "четыре датчика давления"] {
+            let p = parse(task);
+            assert!(p.unsupported.is_some(), "{task} should be refused");
+        }
+        // The builder places each of these and reads every one.
         for task in [
             "два датчика температуры",
             "два датчика света",
-            "четыре датчика давления",
             "датчик температуры, влажности и давления",
             "датчик света и температуры",
         ] {
             let p = parse(task);
-            assert!(p.unsupported.is_some(), "{task} should be refused");
+            assert!(p.unsupported.is_none(), "{task}: {:?}", p.unsupported);
+            assert!(
+                crate::compose::multi_request(&p.intent.task).is_some(),
+                "{task} should take the multi-sensor route"
+            );
         }
         // A single DHT covers temperature and humidity together: that pair is
         // one board, not a multi-sensor circuit.
         let p = parse("датчик температуры и влажности");
         assert!(p.unsupported.is_none(), "{:?}", p.unsupported);
+        assert!(crate::compose::multi_request(&p.intent.task).is_none());
     }
 
     /// "Освещение" is what the circuit switches, not a light sensor.

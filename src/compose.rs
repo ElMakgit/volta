@@ -1051,6 +1051,583 @@ void loop() {
     s
 }
 
+// ------------------------------------------------------- several sensors
+
+/// One sensor on the bench: the table entry and the Uno pins this build gave
+/// it. Several instances of the same source are separate slots, so a drawing
+/// can show two DHT22 boards and a sketch can read both.
+struct MultiSlot {
+    source: &'static SourceSpec,
+    /// Uno pins in the order of the variant's `signals`; for an LDR the one
+    /// analogue input of its divider.
+    pins: Vec<&'static str>,
+    /// A board the sentence named instead of the source's default: the DHT
+    /// source covers both DHT11 and DHT22, and the drawing must show the one
+    /// whose name is in the requirement list.
+    model: Option<&'static str>,
+}
+
+/// Sources whose several instances this build can both wire and read. A
+/// source outside the list keeps the honest refusal: drawing it twice while
+/// the sketch reads one board would be a false answer.
+fn multi_supported(id: SourceId) -> bool {
+    matches!(
+        id,
+        SourceId::Temperature
+            | SourceId::Humidity
+            | SourceId::Pressure
+            | SourceId::Gas
+            | SourceId::Soil
+            | SourceId::Light
+            | SourceId::Range
+            | SourceId::Motion
+    )
+}
+
+/// A DHT22 reads temperature and humidity from one board: that pair is one
+/// sensor, not a multi-sensor build.
+fn multi_needed(sensors: &[(SourceId, usize)]) -> bool {
+    let total: usize = sensors.iter().map(|(_, n)| *n).sum();
+    if total < 2 {
+        return false;
+    }
+    let dht_pair = sensors.len() == 2
+        && sensors
+            .iter()
+            .all(|(id, n)| *n == 1 && matches!(id, SourceId::Temperature | SourceId::Humidity));
+    !dht_pair
+}
+
+fn take_pin(pool: &[&'static str], used: &mut Vec<&'static str>) -> Option<&'static str> {
+    let pin = pool.iter().copied().find(|p| !used.contains(p))?;
+    used.push(pin);
+    Some(pin)
+}
+
+/// Give every sensor instance its own input. Analogue sensors share nothing,
+/// two DS18B20 share the OneWire bus and BMP280 boards share I2C but answer
+/// on different addresses.
+fn multi_pins(sensors: &[(SourceId, usize)]) -> Option<Vec<MultiSlot>> {
+    const DIGITAL: &[&str] = &[
+        "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12", "D13",
+    ];
+    const ANALOG: &[&str] = &["A0", "A1", "A2", "A3"];
+    let mut used_digital: Vec<&'static str> = Vec::new();
+    let mut used_analog: Vec<&'static str> = Vec::new();
+    // Reserve the OneWire bus before anything else can take D2.
+    if sensors.iter().any(|(id, _)| *id == SourceId::Temperature) {
+        used_digital.push("D2");
+    }
+    let mut out = Vec::new();
+    for &(id, count) in sensors {
+        if count == 0 || !multi_supported(id) {
+            return None;
+        }
+        let source = source(id);
+        for _ in 0..count {
+            let pins = match id {
+                SourceId::Temperature => vec!["D2"],
+                SourceId::Pressure => vec!["A4", "A5"],
+                SourceId::Humidity | SourceId::Motion => {
+                    vec![take_pin(DIGITAL, &mut used_digital)?]
+                }
+                SourceId::Range => vec![
+                    take_pin(DIGITAL, &mut used_digital)?,
+                    take_pin(DIGITAL, &mut used_digital)?,
+                ],
+                SourceId::Gas | SourceId::Soil | SourceId::Light => {
+                    vec![take_pin(ANALOG, &mut used_analog)?]
+                }
+                _ => return None,
+            };
+            out.push(MultiSlot {
+                source,
+                pins,
+                model: None,
+            });
+        }
+    }
+    Some(out)
+}
+
+/// The parser asks before it refuses a multi-sensor sentence, and the builder
+/// asks the same question. The predicate therefore lives in one place: a
+/// sentence is a plain measurement of the sensors it named, not a threshold
+/// or an output that would need its own circuit.
+pub fn multi_request(task: &crate::task::Task) -> Option<Vec<(SourceId, usize)>> {
+    if !task.outputs.is_empty()
+        || !task.screens.is_empty()
+        || !task.conditions.is_empty()
+        || !task.behaviors.is_empty()
+        || task.text_screens.is_some()
+        || task.transistor
+        || task.presses
+    {
+        return None;
+    }
+    if task
+        .controls
+        .iter()
+        .any(|c| c.kind != crate::parse::Input::Ldr)
+    {
+        return None;
+    }
+    let n = &task.named;
+    if n.screens.is_some()
+        || n.led > 0
+        || n.lamp > 0
+        || n.rgb > 0
+        || n.buzzer > 0
+        || n.relay > 0
+        || n.motor > 0
+        || n.servo > 0
+        || n.button > 0
+        || n.pin.is_some()
+        || !n.pins.is_empty()
+    {
+        return None;
+    }
+    let sensors: Vec<(SourceId, usize)> = task
+        .sensors
+        .iter()
+        .map(|s| (s.source, s.count))
+        .collect();
+    if !multi_needed(&sensors) {
+        return None;
+    }
+    // Two BMP280 boards are the most the I2C bus can address by SDO.
+    if sensors
+        .iter()
+        .any(|(id, count)| *count > 4 || (*id == SourceId::Pressure && *count > 2))
+    {
+        return None;
+    }
+    multi_pins(&sensors)?;
+    Some(sensors)
+}
+
+fn multi_choice(sensors: &[(SourceId, usize)], lang: Lang) -> Choice {
+    let total: usize = sensors.iter().map(|(_, n)| *n).sum();
+    let lines: Vec<String> = sensors
+        .iter()
+        .map(|(id, n)| format!("{} ×{}", source(*id).title.get(lang), n))
+        .collect();
+    Choice {
+        name: L::new("Несколько датчиков", "Several sensors"),
+        blurb: L::new(
+            "Каждый датчик на своём входе; значения по очереди идут в монитор порта.",
+            "Every sensor gets its own input; the readings go to the serial monitor.",
+        ),
+        pros: vec![
+            L::new(
+                "Все названные датчики есть в схеме и в скетче",
+                "Every named sensor is in the drawing and in the sketch",
+            ),
+            L::new(
+                "Числа видно в мониторе порта на 9600 бод",
+                "The numbers show in the serial monitor at 9600 baud",
+            ),
+        ],
+        cons: Vec::new(),
+        specs: vec![
+            crate::templates::spec_line(&total.to_string(), L::new("Датчиков", "Sensors")),
+            crate::templates::spec_line(&lines.join(", "), L::new("Состав", "Parts")),
+        ],
+        level: 2,
+    }
+}
+
+pub fn multi_plan(
+    sensors: &[(SourceId, usize)],
+    humidity_model: Option<&'static str>,
+    lang: Lang,
+) -> Option<Plan> {
+    multi_pins(sensors)?;
+    let lines: Vec<String> = sensors
+        .iter()
+        .map(|(id, n)| {
+            let name = if *id == SourceId::Humidity {
+                humidity_model.unwrap_or("DHT22")
+            } else {
+                source(*id).title.get(lang)
+            };
+            format!("{name} ×{n}")
+        })
+        .collect();
+    Some(Plan {
+        tid: Tid::Composed,
+        title: L::new("Схема по описанию", "A composed circuit"),
+        headline: Some(format!(
+            "{}: {}",
+            tr(lang, "несколько датчиков", "several sensors"),
+            lines.join(", ")
+        )),
+        choices: vec![multi_choice(sensors, lang)],
+        recommended: 0,
+        why: None,
+    })
+}
+
+pub fn multi_build(
+    sensors: &[(SourceId, usize)],
+    humidity_model: Option<&'static str>,
+    lang: Lang,
+) -> Option<Built> {
+    let mut slots = multi_pins(sensors)?;
+    for slot in &mut slots {
+        if slot.source.id == SourceId::Humidity {
+            slot.model = humidity_model;
+        }
+    }
+    let circuit = multi_circuit(&slots, lang);
+    let (code, notes) = multi_sketch(&slots, lang);
+    let lines: Vec<String> = sensors
+        .iter()
+        .map(|(id, n)| {
+            let name = if *id == SourceId::Humidity {
+                humidity_model.unwrap_or("DHT22")
+            } else {
+                source(*id).title.get(lang)
+            };
+            format!("{name} ×{n}")
+        })
+        .collect();
+    Some(Built {
+        tid: Tid::Composed,
+        title: format!(
+            "{}: {}",
+            tr(lang, "несколько датчиков", "several sensors"),
+            lines.join(", ")
+        ),
+        circuit,
+        code,
+        choice: 0,
+        summary: format!(
+            "{}: {}.",
+            tr(lang, "Датчики на схеме", "Sensors on the bench"),
+            lines.join(", ")
+        ),
+        notes,
+        explained_pins: Vec::new(),
+    })
+}
+
+fn multi_circuit(slots: &[MultiSlot], lang: Lang) -> Circuit {
+    let mut b = B::new(lang);
+    let mut label = 2u8;
+    let (mut x, mut y, mut row_h) = (2.0f32, 54.0f32, 0.0f32);
+    let mut ldr = 0u8;
+    for slot in slots {
+        if matches!(slot.source.place, Place::Ldr) {
+            // Each photoresistor gets its own divider: LDR to 5 V, a 10 kΩ
+            // resistor to ground, and the middle to its analogue input.
+            // Seven columns per divider: the next LDR must not land on the
+            // column where the previous resistor meets ground.
+            let c = 2 + ldr * 7;
+            let (la, lz) = b.axial(
+                Kind::Ldr,
+                &format!("LDR{}", ldr + 1),
+                "GL5528",
+                c,
+                Row::C,
+                1,
+            );
+            let (ra, rb) = b.res(&format!("R{}", ldr + 1), "10 кОм", c + 3, Row::E, 3);
+            let vcc = b.vcc(8.0 + f32::from(ldr) * 12.0);
+            let gnd = b.gnd(16.0 + f32::from(ldr) * 12.0);
+            b.w(vcc, la, NetClass::Vcc);
+            b.w(lz, ra, NetClass::Analog);
+            b.w(rb, gnd, NetClass::Gnd);
+            b.w(lz, b.uno_pin(slot.pins[0]), NetClass::Analog);
+            ldr += 1;
+            continue;
+        }
+        let Place::Board { name, .. } = slot.source.place else {
+            continue;
+        };
+        let name = slot.model.unwrap_or(name);
+        let (w, h) = crate::modules::find(name)
+            .map(|m| (m.w, m.h))
+            .unwrap_or((30.0, 24.0));
+        if x > 2.0 && x + w > 78.0 {
+            x = 2.0;
+            y += row_h + 6.0;
+            row_h = 0.0;
+        }
+        let part = place_board(&mut b, &format!("U{label}"), name, (x, y));
+        label += 1;
+        for ((pin, _), target) in slot.source.variants[0]
+            .signals
+            .iter()
+            .zip(slot.pins.iter())
+        {
+            if b.c.parts[part]
+                .pins
+                .iter()
+                .any(|&p| b.c.pins[p].name == *pin)
+            {
+                let class = if target.starts_with('A') {
+                    NetClass::Analog
+                } else {
+                    NetClass::Signal
+                };
+                b.w(b.mp(part, pin), b.uno_pin(target), class);
+            }
+        }
+        x += w + 6.0;
+        row_h = row_h.max(h);
+    }
+    templates::feeds(&mut b);
+    b.finish()
+}
+
+fn slots_of<'a>(slots: &'a [MultiSlot], id: SourceId) -> Vec<&'a MultiSlot> {
+    slots.iter().filter(|s| s.source.id == id).collect()
+}
+
+fn add_include(out: &mut String, line: &str) {
+    if !out.lines().any(|seen| seen == line) {
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+fn multi_sketch(slots: &[MultiSlot], lang: Lang) -> (String, Vec<L>) {
+    let mut includes = String::new();
+    let mut globals = String::new();
+    let mut setup = String::new();
+    let mut sample = String::new();
+    let mut print = String::new();
+    let mut notes = vec![L::new(
+        "Каждый датчик занял свой вход; числа по очереди идут в монитор порта на 9600 бод.",
+        "Every sensor has its own input; the readings go to the serial monitor at 9600 baud.",
+    )];
+    let mut period = 100u32;
+    let mut note = |l: L| {
+        if !notes.iter().any(|seen| seen.ru == l.ru) {
+            notes.push(l);
+        }
+    };
+
+    let temperatures = slots_of(slots, SourceId::Temperature);
+    if !temperatures.is_empty() {
+        add_include(&mut includes, "#include <OneWire.h>");
+        add_include(&mut includes, "#include <DallasTemperature.h>");
+        let bus = temperatures[0].pins[0].trim_start_matches('D');
+        globals.push_str(&format!(
+            "const uint8_t ONE_WIRE = {bus};\nOneWire wire(ONE_WIRE);\nDallasTemperature sensors(&wire);\n"
+        ));
+        setup.push_str("  sensors.begin();\n");
+        sample.push_str("  sensors.requestTemperatures();\n");
+        for (i, _) in temperatures.iter().enumerate() {
+            sample.push_str(&format!(
+                "  float temp{} = sensors.getTempCByIndex({i});\n",
+                i + 1
+            ));
+            print.push_str(&format!(
+                "  Serial.print(F(\"temp{} \"));\n  Serial.println(temp{}, 1);\n",
+                i + 1,
+                i + 1
+            ));
+        }
+        period = period.max(1000);
+        if temperatures.len() > 1 {
+            note(L::new(
+                "Несколько DS18B20 висят на одной шине OneWire: у каждого свой адрес, скетч читает их по индексу.",
+                "Several DS18B20 share one OneWire bus: each has its own address and the sketch reads them by index.",
+            ));
+        }
+    }
+
+    let humidities = slots_of(slots, SourceId::Humidity);
+    if !humidities.is_empty() {
+        add_include(&mut includes, "#include <DHT.h>");
+        let model = humidities[0].model.unwrap_or("DHT22");
+        for (i, slot) in humidities.iter().enumerate() {
+            let n = i + 1;
+            let pin = slot.pins[0].trim_start_matches('D');
+            globals.push_str(&format!(
+                "const uint8_t DHT{n}_PIN = {pin};\nDHT dht{n}(DHT{n}_PIN, {model});\n"
+            ));
+            setup.push_str(&format!("  dht{n}.begin();\n"));
+            sample.push_str(&format!("  float hum{n} = dht{n}.readHumidity();\n"));
+            print.push_str(&format!(
+                "  Serial.print(F(\"hum{n} \"));\n  Serial.println(hum{n}, 1);\n"
+            ));
+        }
+        period = period.max(2000);
+        if humidities.len() > 1 {
+            note(L::new(
+                "У каждого датчика влажности свой DATA-пин; опрос не чаще раза в две секунды.",
+                "Every humidity sensor has its own DATA pin; poll no more than once every two seconds.",
+            ));
+        }
+    }
+
+    let pressures = slots_of(slots, SourceId::Pressure);
+    if !pressures.is_empty() {
+        add_include(&mut includes, "#include <Wire.h>");
+        add_include(&mut includes, "#include <Adafruit_BMP280.h>");
+        for (i, _) in pressures.iter().enumerate() {
+            globals.push_str(&format!("Adafruit_BMP280 bmp{};\n", i + 1));
+        }
+        setup.push_str("  Wire.begin();\n");
+        for (i, _) in pressures.iter().enumerate() {
+            let n = i + 1;
+            let addr = if i == 0 { 0x76 } else { 0x77 };
+            setup.push_str(&format!(
+                "  if (!bmp{n}.begin(0x{addr:02X})) Serial.println(F(\"no bmp{n}\"));\n"
+            ));
+            sample.push_str(&format!(
+                "  float press{n} = bmp{n}.readPressure() / 100.0;\n"
+            ));
+            print.push_str(&format!(
+                "  Serial.print(F(\"press{n} \"));\n  Serial.println(press{n}, 2);\n"
+            ));
+        }
+        period = period.max(1000);
+        if pressures.len() > 1 {
+            note(L::new(
+                "Два BMP280 на одной шине I2C: адреса 0x76 и 0x77 задаёт перемычка SDO на плате.",
+                "Two BMP280 boards share I2C: the SDO jumper on each sets 0x76 and 0x77.",
+            ));
+        }
+    }
+
+    let gases = slots_of(slots, SourceId::Gas);
+    if !gases.is_empty() {
+        for (i, slot) in gases.iter().enumerate() {
+            let n = i + 1;
+            globals.push_str(&format!(
+                "const uint8_t GAS{n}_PIN = {};\n",
+                slot.pins[0]
+            ));
+            sample.push_str(&format!("  float gas{n} = analogRead(GAS{n}_PIN);\n"));
+            print.push_str(&format!(
+                "  Serial.print(F(\"gas{n} \"));\n  Serial.println(gas{n}, 0);\n"
+            ));
+            note(slot.source.variants[0].note);
+        }
+        period = period.max(u32::from(source(SourceId::Gas).period_ms));
+    }
+
+    let soils = slots_of(slots, SourceId::Soil);
+    if !soils.is_empty() {
+        for (i, slot) in soils.iter().enumerate() {
+            let n = i + 1;
+            globals.push_str(&format!(
+                "const uint8_t SOIL{n}_PIN = {};\n",
+                slot.pins[0]
+            ));
+            sample.push_str(&format!(
+                "  float soil{n} = map(analogRead(SOIL{n}_PIN), 1023, 0, 0, 100);\n"
+            ));
+            print.push_str(&format!(
+                "  Serial.print(F(\"soil{n} \"));\n  Serial.println(soil{n}, 0);\n"
+            ));
+            note(slot.source.variants[0].note);
+        }
+        period = period.max(u32::from(source(SourceId::Soil).period_ms));
+    }
+
+    let lights = slots_of(slots, SourceId::Light);
+    if !lights.is_empty() {
+        for (i, slot) in lights.iter().enumerate() {
+            let n = i + 1;
+            globals.push_str(&format!(
+                "const uint8_t LDR{n}_PIN = {};\n",
+                slot.pins[0]
+            ));
+            sample.push_str(&format!("  float ldr{n} = analogRead(LDR{n}_PIN);\n"));
+            print.push_str(&format!(
+                "  Serial.print(F(\"ldr{n} \"));\n  Serial.println(ldr{n}, 0);\n"
+            ));
+            note(slot.source.variants[0].note);
+        }
+        period = period.max(u32::from(source(SourceId::Light).period_ms));
+    }
+
+    let ranges = slots_of(slots, SourceId::Range);
+    if !ranges.is_empty() {
+        for (i, slot) in ranges.iter().enumerate() {
+            let n = i + 1;
+            let trig = slot.pins[0].trim_start_matches('D');
+            let echo = slot.pins[1].trim_start_matches('D');
+            globals.push_str(&format!(
+                "const uint8_t TRIG{n} = {trig};\nconst uint8_t ECHO{n} = {echo};\n"
+            ));
+            setup.push_str(&format!(
+                "  pinMode(TRIG{n}, OUTPUT);\n  pinMode(ECHO{n}, INPUT);\n"
+            ));
+            sample.push_str(&format!(
+                "  digitalWrite(TRIG{n}, LOW);\n  delayMicroseconds(2);\n  digitalWrite(TRIG{n}, HIGH);\n  delayMicroseconds(10);\n  digitalWrite(TRIG{n}, LOW);\n  unsigned long us{n} = pulseIn(ECHO{n}, HIGH, 30000UL);\n  float dist{n} = us{n} / 58.0;\n"
+            ));
+            print.push_str(&format!(
+                "  Serial.print(F(\"dist{n} \"));\n  Serial.println(dist{n}, 1);\n"
+            ));
+            note(slot.source.variants[0].note);
+        }
+        period = period.max(u32::from(source(SourceId::Range).period_ms));
+    }
+
+    let motions = slots_of(slots, SourceId::Motion);
+    if !motions.is_empty() {
+        for (i, slot) in motions.iter().enumerate() {
+            let n = i + 1;
+            let pin = slot.pins[0].trim_start_matches('D');
+            globals.push_str(&format!(
+                "const uint8_t MOTION{n}_PIN = {pin};\n"
+            ));
+            setup.push_str(&format!("  pinMode(MOTION{n}_PIN, INPUT);\n"));
+            sample.push_str(&format!(
+                "  float motion{n} = digitalRead(MOTION{n}_PIN) ? 1.0 : 0.0;\n"
+            ));
+            print.push_str(&format!(
+                "  Serial.print(F(\"motion{n} \"));\n  Serial.println(motion{n}, 0);\n"
+            ));
+            note(slot.source.variants[0].note);
+        }
+        period = period.max(u32::from(source(SourceId::Motion).period_ms));
+    }
+
+    let mut code = String::from(
+        r#"// <<C0>>
+<<INCLUDES>><<GLOBALS>>const uint32_t PERIOD_MS = <<PERIOD>>;
+uint32_t last = 0;
+
+void setup() {
+<<SETUP>>  Serial.begin(9600);
+}
+
+void loop() {
+  if (millis() - last < PERIOD_MS) return;
+  last = millis();
+<<SAMPLE>><<PRINT>>}
+"#,
+    );
+    let title = format!(
+        "{}: {}",
+        tr(lang, "несколько датчиков", "several sensors"),
+        slots
+            .iter()
+            .map(|s| s.source.short.get(lang))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (k, v) in [
+        ("C0", title.as_str()),
+        ("INCLUDES", includes.as_str()),
+        ("GLOBALS", globals.as_str()),
+        ("SETUP", setup.as_str()),
+        ("SAMPLE", sample.as_str()),
+        ("PRINT", print.as_str()),
+    ] {
+        code = code.replace(&format!("<<{k}>>"), v);
+    }
+    code = code.replace("<<PERIOD>>", &period.to_string());
+    (code, notes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,5 +2142,109 @@ mod tests {
         let p = parse("светодиод к пину 9");
         let built = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
         assert!(crate::requirements::missing(&built, &p.intent).is_empty());
+    }
+
+    /// Every sensor the bug table names must be in the drawing as many times
+    /// as it was asked for, and the sketch must read each instance. A single
+    /// board for "два датчика" used to pass the picture and fail the checklist.
+    #[test]
+    fn several_sensors_are_all_drawn_and_read() {
+        use crate::model::Kind;
+
+        fn boards(built: &Built, value: &str) -> usize {
+            built
+                .circuit
+                .parts
+                .iter()
+                .filter(|p| p.kind == Kind::Module && p.value == value)
+                .count()
+        }
+        fn ldrs(built: &Built) -> usize {
+            built.circuit.parts.iter().filter(|p| p.kind == Kind::Ldr).count()
+        }
+
+        let cases: &[(&str, &str, usize)] = &[
+            ("два датчика температуры", "DS18B20", 2),
+            ("два DS18B20", "DS18B20", 2),
+            ("два датчика влажности", "DHT22", 2),
+            ("два DHT22", "DHT22", 2),
+            ("два DHT11", "DHT11", 2),
+            ("два датчика влажности DHT11", "DHT11", 2),
+            ("два датчика газа", "MQ-2", 2),
+            ("два датчика давления", "BMP280", 2),
+            ("два датчика почвы", "SOIL", 2),
+            ("два датчика расстояния", "HC-SR04", 2),
+        ];
+        for &(phrase, value, want) in cases {
+            let p = parse(phrase);
+            assert!(
+                p.unsupported.is_none(),
+                "{phrase}: unexpectedly refused: {:?}",
+                p.unsupported
+            );
+            let built = crate::templates::build(&p.intent, 0, Lang::Ru)
+                .unwrap_or_else(|| panic!("{phrase}: does not build"));
+            assert_eq!(boards(&built, value), want, "{phrase}: {value} count");
+            assert!(!unfilled(&built.code), "{phrase}: unfilled token");
+            let report = crate::checks::run_with(&built, Lang::Ru, &p.intent);
+            assert_eq!(
+                report.failed(),
+                0,
+                "{phrase}: {:?}",
+                report
+                    .checks
+                    .iter()
+                    .filter(|c| c.sev == crate::checks::Sev::Fail)
+                    .map(|c| format!("{}: {}", c.name.get(Lang::Ru), c.detail))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let p = parse("два датчика света");
+        let light = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert_eq!(ldrs(&light), 2, "two photoresistors");
+        assert!(light.code.contains("ldr1") && light.code.contains("ldr2"));
+        assert_eq!(
+            crate::checks::run_with(&light, Lang::Ru, &p.intent).failed(),
+            0
+        );
+
+        let p = parse("датчик температуры, влажности и давления");
+        let mixed = crate::templates::build(&p.intent, 0, Lang::Ru).expect("builds");
+        assert_eq!(boards(&mixed, "DS18B20"), 1);
+        assert_eq!(boards(&mixed, "DHT22"), 1);
+        assert_eq!(boards(&mixed, "BMP280"), 1);
+        assert!(
+            mixed.code.contains("temp1")
+                && mixed.code.contains("hum1")
+                && mixed.code.contains("press1")
+        );
+        assert_eq!(
+            crate::checks::run_with(&mixed, Lang::Ru, &p.intent).failed(),
+            0
+        );
+
+        // A DHT reads temperature and humidity from one board: the pair is
+        // not a multi-sensor build, but the sentence may still name DHT22.
+        // The lesson used to draw DHT11 and fail the checklist for DHT22.
+        for (phrase, model) in [
+            ("датчик температуры DHT22", "DHT22"),
+            ("датчик температуры DHT11", "DHT11"),
+        ] {
+            let p = parse(phrase);
+            let dht = crate::templates::build(&p.intent, 0, Lang::Ru)
+                .unwrap_or_else(|| panic!("{phrase}: does not build"));
+            assert_eq!(boards(&dht, model), 1, "{phrase}: the {model} board");
+            assert!(
+                dht.code.contains(&format!("DHT dht(DATA_PIN, {model});")),
+                "{phrase}: the sketch uses another model:\n{}",
+                dht.code
+            );
+            assert_eq!(
+                crate::checks::run_with(&dht, Lang::Ru, &p.intent).failed(),
+                0,
+                "{phrase}: the checklist fails the named model"
+            );
+        }
     }
 }
