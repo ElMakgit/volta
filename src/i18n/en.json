@@ -211,5 +211,16 @@
   "help.language": "Interface language",
   "help.bench": "Light / dark bench",
   "wire.colour": "Wire colour",
-  "wire.auto": "Auto"
+  "wire.auto": "Auto",
+  "update.title": "An update is available",
+  "update.body": "Version {current} is installed; the release has {latest}.",
+  "update.open": "Open release",
+  "update.later": "Later",
+  "update.skip": "Skip this version",
+  "update.check": "Check for updates",
+  "update.checking": "Checking for updates…",
+  "update.latest": "This is the latest version.",
+  "update.failed": "Could not check for updates.",
+  "update.auto": "Check for updates at startup",
+  "update.hint": "The only network request: the latest GitHub release. Task solving stays offline."
 }

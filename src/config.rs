@@ -111,6 +111,66 @@ pub fn save_export_kind_at(path: &Path, key: &str) -> std::io::Result<()> {
     put(path, "export_kind", serde_json::Value::from(key))
 }
 
+/// Whether the window may ask GitHub for a new release on start. The check is
+/// the app's only network request, so the user can turn it off for good.
+pub fn load_update_enabled() -> bool {
+    load_update_enabled_at(&config_path())
+}
+
+pub fn load_update_enabled_at(path: &Path) -> bool {
+    read(path)
+        .get("update_auto")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+pub fn save_update_enabled(enabled: bool) {
+    let _ = save_update_enabled_at(&config_path(), enabled);
+}
+
+pub fn save_update_enabled_at(path: &Path, enabled: bool) -> std::io::Result<()> {
+    put(path, "update_auto", serde_json::Value::from(enabled))
+}
+
+/// When the last automatic check finished, as a Unix timestamp. A failed
+/// check counts too: an offline laptop must not retry on every launch.
+pub fn load_update_checked() -> Option<u64> {
+    load_update_checked_at(&config_path())
+}
+
+pub fn load_update_checked_at(path: &Path) -> Option<u64> {
+    read(path).get("update_checked").and_then(|v| v.as_u64())
+}
+
+pub fn save_update_checked(secs: u64) {
+    let _ = save_update_checked_at(&config_path(), secs);
+}
+
+pub fn save_update_checked_at(path: &Path, secs: u64) -> std::io::Result<()> {
+    put(path, "update_checked", serde_json::Value::from(secs))
+}
+
+/// A version the user asked not to hear about again. A later release has a
+/// different number and is offered normally.
+pub fn load_update_skipped() -> Option<String> {
+    load_update_skipped_at(&config_path())
+}
+
+pub fn load_update_skipped_at(path: &Path) -> Option<String> {
+    read(path)
+        .get("update_skip")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+pub fn save_update_skipped(version: &str) {
+    let _ = save_update_skipped_at(&config_path(), version);
+}
+
+pub fn save_update_skipped_at(path: &Path, version: &str) -> std::io::Result<()> {
+    put(path, "update_skip", serde_json::Value::from(version))
+}
+
 /// The language the user picked by hand, if any. `None` means the app has
 /// never been switched and should follow the desktop's own language.
 pub fn load_lang() -> Option<String> {
@@ -301,6 +361,24 @@ mod tests {
         // One key does not forget the others.
         save_wire_style_at(&path, WireStyle::Arc).unwrap();
         assert_eq!(load_lang_at(&path).as_deref(), Some("en"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_update_check_remembers_its_schedule() {
+        let path = scratch("update");
+        assert!(load_update_enabled_at(&path), "automatic checks are on by default");
+        assert!(load_update_checked_at(&path).is_none());
+        assert!(load_update_skipped_at(&path).is_none());
+        save_update_enabled_at(&path, false).unwrap();
+        save_update_checked_at(&path, 1_700_000_000).unwrap();
+        save_update_skipped_at(&path, "0.9.0").unwrap();
+        assert!(!load_update_enabled_at(&path));
+        assert_eq!(load_update_checked_at(&path), Some(1_700_000_000));
+        assert_eq!(load_update_skipped_at(&path).as_deref(), Some("0.9.0"));
+        // The other preferences live in the same file and stay put.
+        save_lang_at(&path, "en").unwrap();
+        assert_eq!(load_update_skipped_at(&path).as_deref(), Some("0.9.0"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

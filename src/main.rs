@@ -40,6 +40,7 @@ mod templates;
 mod text;
 mod theme;
 mod ui;
+mod update;
 mod words;
 
 use std::path::PathBuf;

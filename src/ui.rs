@@ -41,6 +41,17 @@ enum Tab {
     Checks,
 }
 
+/// The state of the release check shown in About and, on Linux, in the
+/// in-window card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateStatus {
+    Idle,
+    Checking,
+    Latest,
+    Failed,
+    Available,
+}
+
 /// What the save window is about to write. Each kind picks its own default
 /// name and its own writer, but the folder part is shared.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -366,6 +377,18 @@ pub struct App {
     project_error: Option<String>,
     /// A project the user asked to delete, waiting for a second click.
     project_delete: Option<PathBuf>,
+    /// The release check runs on a thread; its result arrives here.
+    update_rx: Option<std::sync::mpsc::Receiver<crate::update::Outcome>>,
+    /// A newer release the desktop card is offering. Windows shows the same
+    /// release as a system notification instead.
+    update_offer: Option<crate::update::Release>,
+    /// The newest version the last check found, kept for the About status
+    /// even after a Windows toast or a dismissed card.
+    update_latest: Option<String>,
+    update_status: UpdateStatus,
+    /// Whether starting the window may ask GitHub. A manual check from About
+    /// still works when this is off.
+    update_enabled: bool,
 }
 
 impl App {
@@ -375,7 +398,7 @@ impl App {
         let lang = crate::config::lang();
         let lang_pinned = crate::config::load_lang().is_some();
         let draft = Draft::new();
-        Self {
+        let mut app = Self {
             lang,
             lang_pinned,
             tr: Tr::new(lang),
@@ -433,6 +456,93 @@ impl App {
             project_list: Vec::new(),
             project_error: None,
             project_delete: None,
+            update_rx: None,
+            update_offer: None,
+            update_latest: None,
+            update_status: UpdateStatus::Idle,
+            update_enabled: crate::config::load_update_enabled(),
+        };
+        app.maybe_check_updates();
+        app
+    }
+
+    /// Start the automatic check if the previous one is old enough. Called at
+    /// startup and when the About switch is turned back on.
+    fn maybe_check_updates(&mut self) {
+        if !self.update_enabled || self.update_rx.is_some() {
+            return;
+        }
+        let now = crate::update::now_secs();
+        if crate::config::load_update_checked().is_some_and(|last| {
+            now.saturating_sub(last) < crate::update::CHECK_INTERVAL_SECS
+        }) {
+            return;
+        }
+        self.start_update_check();
+    }
+
+    fn start_update_check(&mut self) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        self.update_rx = Some(crate::update::spawn());
+    }
+
+    /// A finished background check becomes a card (Linux) or a system
+    /// notification (Windows). A failure stays quiet on the bench; About can
+    /// still show that the check did not succeed.
+    fn poll_update(&mut self) {
+        let Some(rx) = self.update_rx.as_ref() else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_rx = None;
+                self.update_status = UpdateStatus::Failed;
+                return;
+            }
+        };
+        self.update_rx = None;
+        crate::config::save_update_checked(crate::update::now_secs());
+        match outcome {
+            crate::update::Outcome::Latest => self.update_status = UpdateStatus::Latest,
+            crate::update::Outcome::Failed(_) => self.update_status = UpdateStatus::Failed,
+            crate::update::Outcome::Newer(release) => {
+                self.update_latest = Some(release.version.clone());
+                if crate::config::load_update_skipped().as_deref()
+                    == Some(release.version.as_str())
+                {
+                    self.update_status = UpdateStatus::Latest;
+                    return;
+                }
+                self.update_status = UpdateStatus::Available;
+                #[cfg(windows)]
+                if crate::update::notify_windows(&release, self.lang) {
+                    return;
+                }
+                self.update_offer = Some(release);
+            }
+        }
+    }
+
+    fn update_status_text(&self) -> String {
+        match self.update_status {
+            UpdateStatus::Idle => String::new(),
+            UpdateStatus::Checking => self.t("update.checking"),
+            UpdateStatus::Latest => self.t("update.latest"),
+            UpdateStatus::Failed => self.t("update.failed"),
+            UpdateStatus::Available => {
+                let latest = self
+                    .update_latest
+                    .clone()
+                    .unwrap_or_else(|| crate::update::current().to_string());
+                self.t("update.body")
+                    .replace("{current}", crate::update::current())
+                    .replace("{latest}", &latest)
+            }
         }
     }
 
@@ -1452,6 +1562,7 @@ impl eframe::App for App {
                 Mode::Manual => self.refresh_manual(),
             }
         }
+        self.poll_update();
         if let Some(lang) = desktop_lang(self.lang_pinned, &crate::theme::language_tag(), self.lang)
         {
             self.set_lang(lang, false);
@@ -1729,6 +1840,7 @@ impl eframe::App for App {
         self.save_window(ctx, accent, fg, muted, panel, radius);
         self.recipe_window(ctx, accent, fg, muted, panel, radius);
         self.projects_window(ctx, accent, fg, muted, panel, radius);
+        self.update_card(ctx, accent, fg, muted, panel, radius);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -4051,6 +4163,90 @@ impl App {
         }
     }
 
+    /// The update card on desktops without a system notification. It sits
+    /// inside the main window, above the status bar, and never blocks work.
+    /// Windows normally uses a toast; if the toast cannot be shown, the same
+    /// card is the fallback so the release is never lost.
+    fn update_card(
+        &mut self,
+        ctx: &egui::Context,
+        accent: Color32,
+        fg: Color32,
+        muted: Color32,
+        panel: Color32,
+        radius: CornerRadius,
+    ) {
+        let Some(release) = self.update_offer.clone() else {
+            return;
+        };
+        let title = self.t("update.title");
+        let body = self
+            .t("update.body")
+            .replace("{current}", crate::update::current())
+            .replace("{latest}", &release.version);
+        let open = self.t("update.open");
+        let later = self.t("update.later");
+        let skip = self.t("update.skip");
+        let mut open_clicked = false;
+        let mut later_clicked = false;
+        let mut skip_clicked = false;
+        egui::Window::new(title.clone())
+            .anchor(Align2::RIGHT_BOTTOM, [-18.0, -46.0])
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .frame(
+                Frame::NONE
+                    .fill(panel)
+                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.7)))
+                    .corner_radius(radius)
+                    .inner_margin(Margin::same(crate::style::PAD as i8)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(330.0);
+                ui.label(RichText::new(&title).size(15.0).strong().color(accent));
+                ui.add_space(4.0);
+                ui.label(RichText::new(&body).size(12.0).color(fg));
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    let go = Button::new(RichText::new(&open).strong().size(12.5))
+                        .fill(accent)
+                        .corner_radius(radius);
+                    if ui.add(go).clicked() {
+                        open_clicked = true;
+                    }
+                    if ui
+                        .add(Button::new(RichText::new(&later).size(12.0)).corner_radius(radius))
+                        .clicked()
+                    {
+                        later_clicked = true;
+                    }
+                    if ui
+                        .add(
+                            Button::new(RichText::new(&skip).size(12.0).color(muted))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(radius),
+                        )
+                        .clicked()
+                    {
+                        skip_clicked = true;
+                    }
+                });
+            });
+        if open_clicked {
+            crate::update::open_url(&release.url);
+            self.update_offer = None;
+        } else if skip_clicked {
+            crate::config::save_update_skipped(&release.version);
+            self.update_offer = None;
+            self.update_latest = None;
+            self.update_status = UpdateStatus::Latest;
+        } else if later_clicked {
+            self.update_offer = None;
+        }
+    }
+
     /// The easter egg: a small flat button next to "?" opens the photo with
     /// the author's nick. The JPEG is compiled in and stripped of every tag,
     /// so it carries no address, date or camera model.
@@ -4085,6 +4281,13 @@ impl App {
             env!("CARGO_PKG_VERSION")
         );
         let close = self.t("about.close");
+        let update_check = self.t("update.check");
+        let update_auto = self.t("update.auto");
+        let update_hint = self.t("update.hint");
+        let update_status = self.update_status_text();
+        let mut auto = self.update_enabled;
+        let mut auto_changed = false;
+        let mut check_clicked = false;
         let tex = self.about_tex.clone();
         let mut open = true;
         let mut close_clicked = false;
@@ -4113,6 +4316,27 @@ impl App {
                 ui.label(RichText::new("ElMak").size(20.0).strong().color(fg));
                 ui.label(RichText::new(&version).size(12.0).color(muted));
                 ui.label(RichText::new(line).size(12.0).color(muted));
+                ui.add_space(10.0);
+                if ui
+                    .add(
+                        Button::new(RichText::new(&update_check).size(11.5))
+                            .min_size(vec2(ui.available_width(), 26.0))
+                            .corner_radius(radius),
+                    )
+                    .clicked()
+                {
+                    check_clicked = true;
+                }
+                if !update_status.is_empty() {
+                    ui.label(RichText::new(&update_status).size(11.0).color(muted));
+                }
+                if ui
+                    .checkbox(&mut auto, RichText::new(&update_auto).size(11.0).color(muted))
+                    .changed()
+                {
+                    auto_changed = true;
+                }
+                ui.label(RichText::new(&update_hint).size(10.5).color(muted));
                 ui.add_space(12.0);
                 if ui
                     .add(
@@ -4125,6 +4349,16 @@ impl App {
                     close_clicked = true;
                 }
             });
+        if auto_changed {
+            self.update_enabled = auto;
+            crate::config::save_update_enabled(auto);
+            if auto {
+                self.maybe_check_updates();
+            }
+        }
+        if check_clicked {
+            self.start_update_check();
+        }
         if close_clicked || !open {
             self.about = false;
         }
